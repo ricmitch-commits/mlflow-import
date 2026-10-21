@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Temporary artifacts
+*.log
+.tmp/
+
+# Local MLflow stores
+mlruns/
+mlartifacts/
+
+# Generated SQLite databases
+*.db
+*-wal
+*-shm
+
+# Session working files
+.superpowers/

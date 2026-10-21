@@ -1,0 +1,26 @@
+# Pinned MLflow compatibility profile for the opencode-mlflow importer.
+#
+# The importer plan referenced mlflow==3.17.2.dev0, which is not published on
+# PyPI. Per the controller ruling recorded 2026-10-21, the profile pins
+# mlflow==3.17.2: the exact stable release of the same API line. Both the
+# client used by the tests and the disposable tracking server are launched
+# from this same installed distribution.
+#
+# Install with the project's dev tooling:
+#   uv pip install -r tests/integration/constraints.txt -e ".[dev]"
+# or equivalently:
+#   python -m pip install -r tests/integration/constraints.txt -e ".[dev]"
+#
+# The MLflow gateway boundary (src/opencode_mlflow/mlflow/gateway.py and
+# capabilities.py) is unit/contract tested against in-memory fakes that
+# mirror this profile; this pin remains the live, behavioral evidence that
+# authorizes the writer, and the gateway's pinned constants are
+# contract-tested against it (tests/contract/test_gateway_contract.py).
+#
+# Task 14's live-server integration suite (tests/integration/
+# test_mlflow_trace_contract.py and test_mlflow_reconciliation.py) runs the
+# COMPLETE production pipeline against a server launched from this same
+# installed distribution (or one named by MLFLOW_TRACKING_URI), consuming
+# this pin as its tested compatibility profile; see
+# tests/integration/README.md for the full recipe.
+mlflow==3.17.2

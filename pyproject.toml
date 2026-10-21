@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-mlflow"
+version = "0.1.0"
+description = "One-shot CLI that imports OpenCode SQLite sessions into MLflow as traces."
+requires-python = ">=3.11"
+dependencies = [
+    "mlflow==3.17.2",
+]
+
+[project.scripts]
+opencode-mlflow = "opencode_mlflow.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-bdd>=7.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    # The build backend must be importable for `python -m build --no-isolation`.
+    "setuptools>=68",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers -ra"
+markers = [
+    "unit: fast, isolated unit tests (no network, no live MLflow, no real database)",
+    "contract: contract tests over public interfaces and pinned compatibility profiles",
+    "bdd: Gherkin acceptance scenarios driven through the public CLI/importer boundary",
+    "integration: tests that require a real WAL snapshot or a live MLflow tracking server",
+    "profile: tests pinning the exact MLflow client/server compatibility profile",
+    "slow: tests too slow to run in the default selection",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["opencode_mlflow", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# The scaffold smoke test body is kept byte-identical to the plan's Step 1
+# code, including its ungrouped in-function imports.
+"tests/unit/test_package_scaffold.py" = ["I001"]
+# The configuration test keeps the plan's Step 1 example test verbatim,
+# including its ungrouped in-function imports and its use of the
+# timezone.utc alias instead of datetime.UTC.
+"tests/unit/test_config.py" = ["I001", "UP017"]
+# The selection test keeps the plan's Step 1 example test verbatim,
+# including its use of the timezone.utc alias instead of datetime.UTC.
+"tests/unit/source/test_selection.py" = ["UP017"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[[tool.mypy.overrides]]
+# The pinned mlflow 3.17.2 exposes documented public API (for example
+# mlflow.artifacts.get_artifact_repository) through plain re-exports without
+# __all__; allow that re-export style for the dependency without weakening
+# the importer's own strictness.
+module = "mlflow.*"
+implicit_reexport = true

@@ -1,0 +1,358 @@
+{
+  "contract": "redaction-positive-v1",
+  "description": "Positive detector cases: inputs that MUST redact. Each case's 'input' is materialized to a Python value (kind 'text' is a plain string scanned by redact_text; kind 'value' is a JSON value — possibly containing $$bytes_b64 / $$latin1 marker objects standing for byte strings — redacted by redact_value with the optional 'protected' paths). 'expected' is the exact redacted value, 'expected_counts' the exact per-category detector counts, and 'expected_affected_fields' the exact masked value-position count. The secret_key_spellings table lists every key spelling the secret-key detector must mask (both separator spellings the brief requires plus the concatenated spellings the design's optional-separator pattern also matches).",
+  "secret_key_spellings": [
+    "api-key", "api_key", "apikey",
+    "api-token", "api_token", "apitoken",
+    "access-token", "access_token", "accesstoken",
+    "refresh-token", "refresh_token", "refreshtoken",
+    "auth-token", "auth_token", "authtoken",
+    "session-token", "session_token", "sessiontoken",
+    "token",
+    "access-key", "access_key", "accesskey",
+    "client-secret", "client_secret", "clientsecret",
+    "secret",
+    "credential",
+    "password",
+    "passwd",
+    "private-key", "private_key", "privatekey",
+    "bearer"
+  ],
+  "cases": [
+    {
+      "name": "pem-private-key-block",
+      "kind": "text",
+      "input": "attached key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0w3JkQrQxw==\n-----END RSA PRIVATE KEY-----\nuse tls",
+      "expected": "attached key:\n[REDACTED]\nuse tls",
+      "expected_counts": {"pem_private_key": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "authorization-bearer-header",
+      "kind": "text",
+      "input": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.signature",
+      "expected": "Authorization: Bearer [REDACTED]",
+      "expected_counts": {"auth_header": 1},
+      "expected_affected_fields": 1,
+      "note": "The header name, separator, and scheme are preserved; only the credentials are masked."
+    },
+    {
+      "name": "proxy-authorization-basic-header",
+      "kind": "text",
+      "input": "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "expected": "Proxy-Authorization: Basic [REDACTED]",
+      "expected_counts": {"auth_header": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "authorization-header-lowercase",
+      "kind": "text",
+      "input": "authorization: bearer abcdefghijklmnop123",
+      "expected": "authorization: bearer [REDACTED]",
+      "expected_counts": {"auth_header": 1},
+      "expected_affected_fields": 1,
+      "note": "Header detection is case-insensitive and has no minimum credential length."
+    },
+    {
+      "name": "standalone-bearer-value",
+      "kind": "text",
+      "input": "use Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 to authenticate",
+      "expected": "use Bearer [REDACTED] to authenticate",
+      "expected_counts": {"auth_header": 1},
+      "expected_affected_fields": 1,
+      "note": "Standalone bearer values count under the auth_header category and keep the scheme."
+    },
+    {
+      "name": "structured-authorization-bearer-field",
+      "kind": "value",
+      "input": {"Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.token"},
+      "expected": {"Authorization": "Bearer [REDACTED]"},
+      "expected_counts": {"structured_auth_field": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "structured-proxy-authorization-basic-nested",
+      "kind": "value",
+      "input": {"headers": {"Proxy-Authorization": "Basic dXNlcjpwYXNz"}},
+      "expected": {"headers": {"Proxy-Authorization": "Basic [REDACTED]"}},
+      "expected_counts": {"structured_auth_field": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "structured-authorization-case-insensitive",
+      "kind": "value",
+      "input": {"AUTHORIZATION": "bearer abcdefghij123456"},
+      "expected": {"AUTHORIZATION": "bearer [REDACTED]"},
+      "expected_counts": {"structured_auth_field": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "nested-secret-key",
+      "kind": "value",
+      "input": {"auth": {"password": "hunter2"}, "role": "user"},
+      "expected": {"auth": {"password": "[REDACTED]"}, "role": "user"},
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "Field names are preserved; only the assigned value is masked, at any depth."
+    },
+    {
+      "name": "secret-key-with-structured-value",
+      "kind": "value",
+      "input": {"credential": {"username": "u", "note": "s"}},
+      "expected": {"credential": "[REDACTED]"},
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "The whole value assigned to a secret key is masked; it is never scanned as leaves."
+    },
+    {
+      "name": "textual-password-assignment",
+      "kind": "text",
+      "input": "connection password=hunter2 retry",
+      "expected": "connection password=[REDACTED] retry",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "An unquoted textual value ends at whitespace; the key and separator are preserved."
+    },
+    {
+      "name": "textual-json-style-quoted-assignment",
+      "kind": "text",
+      "input": "{\"api_key\": \"sk-1234567890123456\", \"note\": \"keep\"",
+      "expected": "{\"api_key\": \"[REDACTED]\", \"note\": \"keep\"",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "Malformed JSON text: quoted keys and quoted values keep their quotes; the key assignment masks the whole value before token detectors run."
+    },
+    {
+      "name": "textual-colon-assignment-unquoted",
+      "kind": "text",
+      "input": "password: hunter2; host=db.example",
+      "expected": "password: [REDACTED]; host=db.example",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "An unquoted value ends at semicolon as well as whitespace."
+    },
+    {
+      "name": "textual-single-quoted-assignment",
+      "kind": "text",
+      "input": "passwd: 'hunter two'",
+      "expected": "passwd: '[REDACTED]'",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "A single-quoted value may contain spaces and keeps its quote style."
+    },
+    {
+      "name": "textual-empty-quoted-assignment",
+      "kind": "text",
+      "input": "password=\"\"",
+      "expected": "password=\"[REDACTED]\"",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "Any quoted value — empty included — is a value; masking has no non-empty guard."
+    },
+    {
+      "name": "textual-uppercase-key-assignment",
+      "kind": "text",
+      "input": "API_KEY=value123",
+      "expected": "API_KEY=[REDACTED]",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "Key-spelling matching is case-insensitive; the original key spelling is preserved."
+    },
+    {
+      "name": "textual-suffix-key-assignment",
+      "kind": "text",
+      "input": "x-api-key: hunter2",
+      "expected": "x-api-key: [REDACTED]",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "A spelling appearing as the tail of a larger unquoted key still masks its value; the unmatched key prefix survives outside the match."
+    },
+    {
+      "name": "textual-quoted-compound-key-assignment",
+      "kind": "text",
+      "input": "{\"x-api-key\": \"hunter2\"}",
+      "expected": "{\"x-api-key\": \"[REDACTED]\"}",
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "Quoted keys tolerate a spelling suffix; surrounding quotes and delimiters are preserved."
+    },
+    {
+      "name": "textual-mixed-header-and-assignment",
+      "kind": "text",
+      "input": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.z then password=hunter2",
+      "expected": "Authorization: Bearer [REDACTED] then password=[REDACTED]",
+      "expected_counts": {"secret_key_value": 1, "auth_header": 1},
+      "expected_affected_fields": 1,
+      "note": "Two spans masked in one text value count two detections but one affected field."
+    },
+    {
+      "name": "connection-string-password",
+      "kind": "text",
+      "input": "postgres://app_user:hunter2@db.internal:5432/prod",
+      "expected": "postgres://app_user:[REDACTED]@db.internal:5432/prod",
+      "expected_counts": {"connection_secret": 1},
+      "expected_affected_fields": 1,
+      "note": "Scheme, user, and host are preserved; only the password is masked."
+    },
+    {
+      "name": "structured-connection-string",
+      "kind": "value",
+      "input": {"dsn": "redis://admin:s3cr3t@cache.internal:6379"},
+      "expected": {"dsn": "redis://admin:[REDACTED]@cache.internal:6379"},
+      "expected_counts": {"connection_secret": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "connection-string-empty-user-password",
+      "kind": "text",
+      "input": "redis://:hunter2@cache.internal:6379",
+      "expected": "redis://:[REDACTED]@cache.internal:6379",
+      "expected_counts": {"connection_secret": 1},
+      "expected_affected_fields": 1,
+      "note": "Empty-user userinfo (redis://:password@host) still carries a credential; the user part is optional."
+    },
+    {
+      "name": "unterminated-pem-block",
+      "kind": "text",
+      "input": "truncated key:\n-----BEGIN PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtruncated",
+      "expected": "truncated key:\n[REDACTED]",
+      "expected_counts": {"pem_private_key": 1},
+      "expected_affected_fields": 1,
+      "note": "A BEGIN marker without its matching END is a private-key fragment; it masks through the end of the text."
+    },
+    {
+      "name": "openai-sk-token",
+      "kind": "text",
+      "input": "key sk-1234567890123456 end",
+      "expected": "key [REDACTED] end",
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "sk- requires at least 16 trailing characters."
+    },
+    {
+      "name": "github-classic-token",
+      "kind": "text",
+      "input": "ghp_1234567890abcdefghij",
+      "expected": "[REDACTED]",
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "ghp_ requires at least 20 alphanumeric characters."
+    },
+    {
+      "name": "github-fine-grained-token",
+      "kind": "text",
+      "input": "github_pat_1234567890abcdefghij",
+      "expected": "[REDACTED]",
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "github_pat_ requires at least 20 alphanumeric/underscore characters."
+    },
+    {
+      "name": "slack-bot-token",
+      "kind": "text",
+      "input": "xoxb-1234567890abcdefghi",
+      "expected": "[REDACTED]",
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "xox[baprs]- requires at least 10 trailing characters."
+    },
+    {
+      "name": "aws-access-key-id",
+      "kind": "text",
+      "input": "AKIA1234567890ABCDEF",
+      "expected": "[REDACTED]",
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "AKIA requires exactly 16 uppercase-alphanumeric characters."
+    },
+    {
+      "name": "structured-token-in-note",
+      "kind": "value",
+      "input": {"note": "leaked sk-1234567890123456 here"},
+      "expected": {"note": "leaked [REDACTED] here"},
+      "expected_counts": {"known_token_prefix": 1},
+      "expected_affected_fields": 1,
+      "note": "Non-secret string leaves are scanned textually."
+    },
+    {
+      "name": "opaque-bytes-root",
+      "kind": "value",
+      "input": {"$$bytes_b64": "AAECAwQ="},
+      "expected": "[REDACTED_BINARY]",
+      "expected_counts": {"opaque_binary": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "invalid-utf8-bytes-root",
+      "kind": "value",
+      "input": {"$$latin1": "café rouge"},
+      "expected": "[REDACTED_BINARY]",
+      "expected_counts": {"opaque_binary": 1},
+      "expected_affected_fields": 1,
+      "note": "Latin-1 described bytes that are not valid UTF-8 use the binary marker."
+    },
+    {
+      "name": "opaque-bytes-field",
+      "kind": "value",
+      "input": {"payload": {"$$bytes_b64": "3q2+7w=="}},
+      "expected": {"payload": "[REDACTED_BINARY]"},
+      "expected_counts": {"opaque_binary": 1},
+      "expected_affected_fields": 1
+    },
+    {
+      "name": "secret-keyed-bytes",
+      "kind": "value",
+      "input": {"password": {"$$bytes_b64": "cGFzcw=="}},
+      "expected": {"password": "[REDACTED_BINARY]"},
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "The key detector fires; the marker reflects the byte-string value kind."
+    },
+    {
+      "name": "multiple-token-spans",
+      "kind": "text",
+      "input": "sk-1234567890123456 and sk-6543210987654321",
+      "expected": "[REDACTED] and [REDACTED]",
+      "expected_counts": {"known_token_prefix": 2},
+      "expected_affected_fields": 1,
+      "note": "Matches count per detection; affected fields count per changed value position."
+    },
+    {
+      "name": "protected-dotted-path-partial",
+      "kind": "value",
+      "input": {"config": {"token": "sk-1234567890123456"}, "other": {"token": "sk-1234567890123456"}},
+      "expected": {"config": {"token": "sk-1234567890123456"}, "other": {"token": "[REDACTED]"}},
+      "protected": ["config.token"],
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1,
+      "note": "A dotted path protects exactly that location; the same field name elsewhere is still masked."
+    },
+    {
+      "name": "comprehensive-structured-with-protection",
+      "kind": "value",
+      "input": {
+        "session_id": "ses-1",
+        "part_id": "part-7",
+        "password": "hunter2",
+        "note": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x"
+      },
+      "expected": {
+        "session_id": "ses-1",
+        "part_id": "part-7",
+        "password": "[REDACTED]",
+        "note": "Authorization: Bearer [REDACTED]"
+      },
+      "protected": ["session_id", "part_id"],
+      "expected_counts": {"secret_key_value": 1, "auth_header": 1},
+      "expected_affected_fields": 2
+    },
+    {
+      "name": "structured-sequence-recursion",
+      "kind": "value",
+      "input": {"parts": [{"password": "hunter2"}, {"note": "clean"}]},
+      "expected": {"parts": [{"password": "[REDACTED]"}, {"note": "clean"}]},
+      "expected_counts": {"secret_key_value": 1},
+      "expected_affected_fields": 1
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Default job: unit, contract, and BDD checks plus lint and type checks.
+    # This job is never gated on external configuration.
+    name: test (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Run default test selection
+        run: python -m pytest -m '(unit or contract or bdd) and not integration'
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type check
+        run: mypy src
+
+  integration:
+    # Job-level `if` cannot access secrets. Enable through the repository
+    # variable MLFLOW_INTEGRATION_ENABLED=true (for a secret URI), or through
+    # a credential-free vars.MLFLOW_INTEGRATION_URI. The URI secret is read
+    # only inside the job. It stays skipped otherwise.
+    # The configured URI is exported as MLFLOW_TRACKING_URI — the variable
+    # every live-server fixture consumes — so the profile contract test and
+    # the Task 14 real-server integration modules run against the configured
+    # server; a configured server that cannot satisfy the behavioral gateway
+    # contract fails these tests loudly (they never silently skip).
+    name: integration (gated on MLflow configuration)
+    runs-on: ubuntu-latest
+    if: ${{ vars.MLFLOW_INTEGRATION_ENABLED == 'true' || vars.MLFLOW_INTEGRATION_URI != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install package with dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Run MLflow integration and profile selection
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_INTEGRATION_URI || vars.MLFLOW_INTEGRATION_URI }}
+        run: python -m pytest -m '(integration or profile)' -q

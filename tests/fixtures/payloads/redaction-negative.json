@@ -1,0 +1,196 @@
+{
+  "contract": "redaction-negative-v1",
+  "description": "Negative detector cases: near misses that MUST redact nothing. Each case's 'input' is materialized like the positive table (kind 'text' is a plain string; kind 'value' is a JSON value with optional $$bytes_b64 / $$latin1 byte-string markers). Every case asserts the value passes through unchanged with zero detector counts, zero affected fields, and zero affected records. 'protected' entries name paths that shield their value from masking by design.",
+  "cases": [
+    {
+      "name": "sk-token-one-below-threshold",
+      "kind": "text",
+      "input": "sk-123456789012345",
+      "note": "15 trailing characters; sk- requires at least 16."
+    },
+    {
+      "name": "ghp-token-one-below-threshold",
+      "kind": "text",
+      "input": "ghp_1234567890abcdefghi",
+      "note": "19 trailing characters; ghp_ requires at least 20."
+    },
+    {
+      "name": "github-pat-one-below-threshold",
+      "kind": "text",
+      "input": "github_pat_1234567890abcdefghi",
+      "note": "19 trailing characters; github_pat_ requires at least 20."
+    },
+    {
+      "name": "slack-token-one-below-threshold",
+      "kind": "text",
+      "input": "xoxb-123456789",
+      "note": "9 trailing characters; xox[baprs]- requires at least 10."
+    },
+    {
+      "name": "aws-key-one-below-threshold",
+      "kind": "text",
+      "input": "AKIA1234567890ABCDE",
+      "note": "15 trailing characters; AKIA requires exactly 16."
+    },
+    {
+      "name": "aws-key-one-above-exact-length",
+      "kind": "text",
+      "input": "AKIA1234567890ABCDEF1",
+      "note": "17 trailing characters leave no word boundary after the required 16."
+    },
+    {
+      "name": "token-count-field",
+      "kind": "value",
+      "input": {"token_count": 42},
+      "note": "Key spellings match whole field names only."
+    },
+    {
+      "name": "tokens-field",
+      "kind": "value",
+      "input": {"tokens": ["a", "b"]}
+    },
+    {
+      "name": "password-hint-field",
+      "kind": "value",
+      "input": {"password_hint": "your first pet"}
+    },
+    {
+      "name": "api-key-id-field",
+      "kind": "value",
+      "input": {"api_key_id": "key-123"},
+      "note": "An identifier referring to a key is not a key spelling."
+    },
+    {
+      "name": "secrets-plural-field",
+      "kind": "value",
+      "input": {"secrets": "not-a-secret"}
+    },
+    {
+      "name": "mypassword-compound-key",
+      "kind": "value",
+      "input": {"MyPassword": "nope"},
+      "note": "Case-insensitivity still requires the whole key to be exactly one spelling."
+    },
+    {
+      "name": "passwordless-word",
+      "kind": "text",
+      "input": "the passwordless mode was enabled",
+      "note": "Ordinary words containing 'password' as a substring of a larger word."
+    },
+    {
+      "name": "secretive-word",
+      "kind": "text",
+      "input": "a secretive but harmless note"
+    },
+    {
+      "name": "secret-word-in-prose",
+      "kind": "text",
+      "input": "my secret is that I like trains",
+      "note": "A secret-key word in prose without an adjacent ':' or '=' is not an assignment."
+    },
+    {
+      "name": "password-word-in-prose",
+      "kind": "text",
+      "input": "the password is hunter2 said no one"
+    },
+    {
+      "name": "uri-without-password",
+      "kind": "text",
+      "input": "postgres://app_user@db.internal:5432/prod",
+      "note": "No user:password userinfo means no connection secret."
+    },
+    {
+      "name": "connection-string-empty-user-no-password",
+      "kind": "text",
+      "input": "redis://@cache.internal:6379",
+      "note": "Empty user with no password carries no credential; the password requires at least one character."
+    },
+    {
+      "name": "public-key-block",
+      "kind": "text",
+      "input": "-----BEGIN PUBLIC KEY-----\nMIIBoDANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----",
+      "note": "Public key blocks are not private-key material."
+    },
+    {
+      "name": "private-key-words-without-begin-marker",
+      "kind": "text",
+      "input": "the docs mention a PRIVATE KEY without any block markers",
+      "note": "Prose without a BEGIN marker is not a PEM fragment."
+    },
+    {
+      "name": "plain-url",
+      "kind": "text",
+      "input": "see https://example.com/docs for details"
+    },
+    {
+      "name": "digest-authorization-structured",
+      "kind": "value",
+      "input": {"Authorization": "Digest dXNlcjpwYXNz"},
+      "note": "Structured auth fields cover bearer/basic schemes only, per the version-one contract."
+    },
+    {
+      "name": "short-bearer-word",
+      "kind": "text",
+      "input": "Bearer short",
+      "note": "Standalone bearer values require at least 16 credential characters."
+    },
+    {
+      "name": "empty-assignment-value",
+      "kind": "text",
+      "input": "settings password: ",
+      "note": "An assignment with no value after the separator masks nothing."
+    },
+    {
+      "name": "malformed-clean-json",
+      "kind": "text",
+      "input": "{\"model\": \"gpt-4o\", \"count\": 2",
+      "note": "Malformed text without secret assignments passes through unchanged."
+    },
+    {
+      "name": "tokenize-word",
+      "kind": "text",
+      "input": "tokenize the input"
+    },
+    {
+      "name": "protected-secret-key",
+      "kind": "value",
+      "input": {"token": "sk-1234567890123456"},
+      "protected": ["token"],
+      "note": "Protected paths copy their value through unchanged, detection included."
+    },
+    {
+      "name": "protected-dotted-path",
+      "kind": "value",
+      "input": {"config": {"password": "hunter2"}},
+      "protected": ["config.password"]
+    },
+    {
+      "name": "protected-bytes-field",
+      "kind": "value",
+      "input": {"hash": {"$$bytes_b64": "AAEC"}},
+      "protected": ["hash"],
+      "note": "Protected byte values keep their bytes; the binary marker applies only to unprotected values."
+    },
+    {
+      "name": "non-secret-structured-fields",
+      "kind": "value",
+      "input": {"model": "gpt-4o", "usage": {"input": 10, "output": 5}, "type": "text", "role": "user"}
+    },
+    {
+      "name": "plain-scalars",
+      "kind": "value",
+      "input": {"count": 3, "ratio": 0.5, "ok": true, "missing": null}
+    },
+    {
+      "name": "reconciliation-identifiers",
+      "kind": "value",
+      "input": {"schema": "current", "turn_key": "turn-1", "part_id": "part-7", "seq": 4},
+      "note": "Identity and sequence field names are not secret-key spellings."
+    },
+    {
+      "name": "empty-string",
+      "kind": "text",
+      "input": ""
+    }
+  ]
+}

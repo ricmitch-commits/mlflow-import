@@ -1,0 +1,198 @@
+{
+  "contract": "canonical-json-v1",
+  "description": "Golden vectors for the canonical-json-v1 serializer. Each vector's 'input' is materialized to a Python value (JSON numbers parse to int/float exactly as written; '$$'-prefixed marker objects stand for values JSON cannot express: $$nonfinite, $$bytes_hex, $$duplicate_keys + $$raw_text) and 'expected' is the exact canonical output text, compared as UTF-8 bytes. Keys sort by UTF-8 byte sequence; strings keep their original code points with minimal escaping; separators are fixed; finite floats use RFC 8785 (ECMAScript Number::toString) shortest-round-trip formatting; non-finite floats, byte strings, and duplicate-key objects use the fixed typed wrappers.",
+  "vectors": [
+    {"name": "null", "input": null, "expected": "null"},
+    {"name": "true", "input": true, "expected": "true"},
+    {"name": "false", "input": false, "expected": "false"},
+    {"name": "integer-zero", "input": 0, "expected": "0"},
+    {"name": "integer-negative", "input": -42, "expected": "-42"},
+    {
+      "name": "integer-arbitrary-precision",
+      "input": 123456789012345678901234567890,
+      "expected": "123456789012345678901234567890",
+      "note": "Python int values serialize as exact integer literals and never route through double formatting."
+    },
+    {
+      "name": "integer-negative-zero-json",
+      "input": -0,
+      "expected": "0",
+      "note": "JSON -0 parses to integer 0; there is no negative integer zero."
+    },
+    {
+      "name": "float-negative-zero",
+      "input": -0.0,
+      "expected": "0",
+      "note": "RFC 8785: -0 normalizes to 0."
+    },
+    {"name": "float-integral", "input": 3.0, "expected": "3", "note": "Integral floats render without a decimal point."},
+    {"name": "float-integral-large", "input": 100.0, "expected": "100"},
+    {"name": "float-fraction", "input": 1.5, "expected": "1.5"},
+    {"name": "float-fraction-negative", "input": -1.5, "expected": "-1.5"},
+    {"name": "float-half", "input": 0.5, "expected": "0.5"},
+    {"name": "float-tenth", "input": 0.1, "expected": "0.1"},
+    {"name": "float-shortest-round-trip-digits", "input": 0.3333333333333333, "expected": "0.3333333333333333"},
+    {"name": "float-three-decimal-places", "input": 123.456, "expected": "123.456"},
+    {
+      "name": "float-decimal-threshold-1e16",
+      "input": 1e16,
+      "expected": "10000000000000000"
+    },
+    {
+      "name": "float-decimal-threshold-1e20",
+      "input": 1e20,
+      "expected": "100000000000000000000",
+      "note": "ECMAScript keeps decimal notation below 1e21."
+    },
+    {
+      "name": "float-scientific-threshold-1e21",
+      "input": 1e21,
+      "expected": "1e+21",
+      "note": "ECMAScript switches to scientific notation at 1e21; the exponent carries an explicit +."
+    },
+    {"name": "float-decimal-1e-5", "input": 1e-5, "expected": "0.00001"},
+    {
+      "name": "float-decimal-threshold-1e-6",
+      "input": 1e-6,
+      "expected": "0.000001",
+      "note": "ECMAScript keeps decimal notation down to 1e-6."
+    },
+    {
+      "name": "float-scientific-threshold-1e-7",
+      "input": 1e-7,
+      "expected": "1e-7",
+      "note": "ECMAScript switches to scientific notation below 1e-6; exponents never carry leading zeros."
+    },
+    {"name": "float-scientific-fraction-mantissa", "input": 2.5e-10, "expected": "2.5e-10"},
+    {
+      "name": "float-smallest-subnormal",
+      "input": 5e-324,
+      "expected": "5e-324"
+    },
+    {
+      "name": "float-largest-finite",
+      "input": 1.7976931348623157e308,
+      "expected": "1.7976931348623157e+308"
+    },
+    {
+      "name": "float-shortest-digits-at-decimal-threshold",
+      "input": 1.2345678901234568e20,
+      "expected": "123456789012345680000",
+      "note": "Shortest round-trip digits expanded to decimal notation below 1e21."
+    },
+    {
+      "name": "nonfinite-nan",
+      "input": {"$$nonfinite": "NaN"},
+      "expected": "{\"$nonfinite\":\"NaN\"}"
+    },
+    {
+      "name": "nonfinite-infinity",
+      "input": {"$$nonfinite": "Infinity"},
+      "expected": "{\"$nonfinite\":\"Infinity\"}"
+    },
+    {
+      "name": "nonfinite-negative-infinity",
+      "input": {"$$nonfinite": "-Infinity"},
+      "expected": "{\"$nonfinite\":\"-Infinity\"}"
+    },
+    {"name": "string-plain", "input": "hello", "expected": "\"hello\""},
+    {
+      "name": "string-escapes",
+      "input": "a\"b\\c\n\t\r\b\f",
+      "expected": "\"a\\\"b\\\\c\\n\\t\\r\\b\\f\"",
+      "note": "Quote, backslash, and the C0 short forms escape as in JSON."
+    },
+    {
+      "name": "string-control-nul",
+      "input": "\u0000",
+      "expected": "\"\\u0000\"",
+      "note": "Controls without a short form escape as \\u00xx with lowercase hex."
+    },
+    {"name": "string-control-unit-separator", "input": "\u001f", "expected": "\"\\u001f\""},
+    {
+      "name": "string-unicode-preserved",
+      "input": "café \ud83d\ude00\u2028",
+      "expected": "\"café \ud83d\ude00\u2028\"",
+      "note": "Original code points pass through unescaped as UTF-8; U+2028/U+2029 are not escaped."
+    },
+    {
+      "name": "string-lone-surrogate-escaped",
+      "input": "\ud800",
+      "expected": "\"\\ud800\"",
+      "note": "Lone surrogates escape (lowercase hex) so the output stays valid UTF-8."
+    },
+    {
+      "name": "bytes-blob",
+      "input": {"$$bytes_hex": "fffe80"},
+      "expected": "{\"$bytes\":\"//6A\"}",
+      "note": "SQLite BLOBs and invalid UTF-8 wrap as standard base64 under $bytes."
+    },
+    {"name": "bytes-empty", "input": {"$$bytes_hex": ""}, "expected": "{\"$bytes\":\"\"}"},
+    {
+      "name": "bytes-valid-utf8-still-wrapped",
+      "input": {"$$bytes_hex": "6869"},
+      "expected": "{\"$bytes\":\"aGk=\"}",
+      "note": "Byte strings stay wrapped even when they happen to decode as UTF-8."
+    },
+    {
+      "name": "duplicate-keys-ordered-pairs-with-raw-text",
+      "input": {
+        "$$duplicate_keys": [["text", "first"], ["text", "second"]],
+        "$$raw_text": "{\"text\":\"first\",\"text\":\"second\"}"
+      },
+      "expected": "{\"$duplicate_keys\":[[\"text\",\"first\"],[\"text\",\"second\"]],\"$raw_text\":\"{\\\"text\\\":\\\"first\\\",\\\"text\\\":\\\"second\\\"}\"}",
+      "note": "Every occurrence is retained in original order alongside the original raw text."
+    },
+    {"name": "object-keys-sorted", "input": {"b": 1, "a": 2}, "expected": "{\"a\":2,\"b\":1}"},
+    {
+      "name": "object-key-order-utf8-bytes-z-before-é",
+      "input": {"é": 1, "z": 2},
+      "expected": "{\"z\":2,\"é\":1}",
+      "note": "Keys sort by UTF-8 byte sequence: 'z' (0x7A) sorts before 'é' (U+00E9, bytes C3 A9)."
+    },
+    {
+      "name": "object-key-order-utf8-bytes-not-utf16-units",
+      "input": {"\uffff": 1, "\ud83d\ude00": 2},
+      "expected": "{\"\uffff\":1,\"😀\":2}",
+      "note": "UTF-8 byte order puts U+FFFF (EF BF BF) before U+1F600 (F0 9F 98 80); a UTF-16 code-unit sort would diverge here."
+    },
+    {"name": "object-empty-string-key", "input": {"": 1, "a": 2}, "expected": "{\"\":1,\"a\":2}"},
+    {
+      "name": "object-null-value",
+      "input": {"a": null, "b": 1},
+      "expected": "{\"a\":null,\"b\":1}",
+      "note": "SQLite NULL is JSON null; absent columns are omitted entirely (compare object-empty)."
+    },
+    {"name": "object-empty", "input": {}, "expected": "{}"},
+    {
+      "name": "object-marker-key-passthrough",
+      "input": {"$bytes": "aGk="},
+      "expected": "{\"$bytes\":\"aGk=\"}",
+      "note": "Ordinary data whose keys collide with a wrapper marker serializes identically to the wrapper; markers are self-describing, not unambiguous."
+    },
+    {"name": "array-empty", "input": [], "expected": "[]"},
+    {"name": "array-scalars", "input": [1, "two", null, true, false], "expected": "[1,\"two\",null,true,false]"},
+    {
+      "name": "separators-fixed",
+      "input": {"a": [1, 2], "b": {"c": true}},
+      "expected": "{\"a\":[1,2],\"b\":{\"c\":true}}",
+      "note": "No whitespace: ',' between members, ':' after keys."
+    },
+    {
+      "name": "nested-objects-and-arrays",
+      "input": {"b": [{"d": null, "c": true}], "a": {"z": 1, "é": 2}},
+      "expected": "{\"a\":{\"z\":1,\"é\":2},\"b\":[{\"c\":true,\"d\":null}]}"
+    },
+    {"name": "deeply-nested-array", "input": [[[[1]]]], "expected": "[[[[1]]]]"},
+    {
+      "name": "numbers-inside-structure",
+      "input": {"x": [1e21, 1e-7, -0.0], "y": 3.0},
+      "expected": "{\"x\":[1e+21,1e-7,0],\"y\":3}"
+    },
+    {
+      "name": "wrappers-inside-structure",
+      "input": {"a": [{"$$nonfinite": "NaN"}, {"$$bytes_hex": "00"}], "b": {"$$nonfinite": "Infinity"}},
+      "expected": "{\"a\":[{\"$nonfinite\":\"NaN\"},{\"$bytes\":\"AA==\"}],\"b\":{\"$nonfinite\":\"Infinity\"}}"
+    }
+  ]
+}
