@@ -36,16 +36,15 @@ an index):
 
 ```bash
 cd /path/to/mlflow-import
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install .
+uv venv
+uv pip install .
 ```
 
 This installs the `opencode-mlflow` console script and its single runtime
 dependency, `mlflow==3.17.2`. For development (tests, Ruff, mypy, pytest-bdd):
 
 ```bash
-.venv/bin/python -m pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
 
 ## Quick start
