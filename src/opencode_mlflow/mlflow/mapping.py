@@ -23,13 +23,11 @@ Boundaries fixed here:
   converts structurally and lazily. Events ride spans typed
   ``event`` (:data:`EVENT_SPAN_TYPE`) because the public trace API has
   no separate event mutation.
-- **Children.** :func:`map_turn_to_trace` yields children lazily: every
-  turn record EXCEPT the first-user prompt (which is the root input)
-  maps through :func:`map_source_record`, keyed by its stable source
-  identity, parented under its source parent when that parent is among
-  this trace's earlier children and under the trace root otherwise
-  (parts of the root-input prompt therefore attach to the root). Each
-  ``child_specs()`` call opens a fresh replay cursor.
+- **Children.** :func:`map_turn_to_trace` yields children lazily. Current
+  schema rows map every turn record except the first-user prompt through
+  :func:`map_source_record`; legacy rows project only native LLM/tool spans
+  while preserving all other records in the turn artifact. Each
+  ``child_specs()`` call opens fresh replay cursors.
 - **Typed children.** Message containers carrying model-call metadata
   map to LLM spans (model identity, provider, typed input/output,
   tokens, cost, finish state); other message containers map to agent
@@ -632,16 +630,28 @@ def _map_tool_part(
         source_outcome = "error"
     if source_outcome is not None:
         attributes["opencode.source_outcome"] = source_outcome
+    if identity.source_table == "part" and isinstance(tool_name, str) and tool_name:
+        attributes["tool_name"] = tool_name
+    if identity.source_table == "part" and call_id is not None:
+        attributes["tool_id"] = call_id
+    if identity.source_table == "part" and tool_status is not None:
+        attributes["status"] = tool_status
     return SpanSpec(
         source_key=identity.key,
-        name=f"tool {tool_name}" if isinstance(tool_name, str) and tool_name else "tool call",
+        name=(f"tool_{tool_name}" if isinstance(tool_name, str) and tool_name else "tool")
+        if identity.source_table == "part"
+        else (f"tool {tool_name}" if isinstance(tool_name, str) and tool_name else "tool call"),
         span_type=_TOOL_SPAN_TYPE,
         parent_source_key=parent_source_key,
         inputs=state_map.get("input"),
         attributes=MappingProxyType(attributes),
         tags={},
         start_time_ns=timestamp_ns,
-        outputs=state_map.get("output"),
+        outputs=(
+            {"result": state_map.get("output")}
+            if identity.source_table == "part" and "output" in state_map
+            else state_map.get("output")
+        ),
         status=_tool_status(source_outcome, error),
         end_time_ns=completion_timestamp_ns,
     )
@@ -705,11 +715,30 @@ def _map_message_container(
     # A persisted model-call envelope carries its typed request/response
     # components; a message whose data rides alongside its content parts
     # keeps the complete decoded value as the request payload.
-    inputs = decoded["input"] if "input" in decoded else record.decoded_value
-    outputs = decoded["output"] if "output" in decoded else None
+    if record.source_table != "message":
+        inputs = decoded["input"] if "input" in decoded else record.decoded_value
+        outputs = decoded["output"] if "output" in decoded else None
+        return SpanSpec(
+            source_key=identity.key,
+            name=f"model {model_identity}",
+            span_type=_LLM_SPAN_TYPE,
+            parent_source_key=parent_source_key,
+            inputs=inputs,
+            attributes=MappingProxyType(attributes),
+            tags={},
+            start_time_ns=timestamp_ns,
+            outputs=outputs,
+            status=classify_decoded(decoded),
+            end_time_ns=completion_timestamp_ns,
+        )
+    inputs = {"model": model_identity, "messages": []}
+    outputs = {"choices": [{"message": {"role": "assistant", "content": None}}]}
+    provider, _, model = model_identity.partition("/")
+    attributes["model"] = model or model_identity
+    attributes["provider"] = provider
     return SpanSpec(
         source_key=identity.key,
-        name=f"model {model_identity}",
+        name="llm_call",
         span_type=_LLM_SPAN_TYPE,
         parent_source_key=parent_source_key,
         inputs=inputs,
@@ -906,10 +935,22 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     return TraceSpec(
         client_request_id=operation,
         experiment_id=context.experiment_id,
-        name=f"{_TRACE_NAME_PREFIX} {summary.turn_index}",
+        name=(
+            "opencode_conversation"
+            if context.source_schema == "legacy"
+            else f"{_TRACE_NAME_PREFIX} {summary.turn_index}"
+        ),
         native_session_id=header.session_id,
-        root_inputs=root_values.root_input,
-        root_outputs=root_values.root_output,
+        root_inputs=(
+            _native_root_input(root_values.root_input)
+            if context.source_schema == "legacy"
+            else root_values.root_input
+        ),
+        root_outputs=(
+            _native_root_output(root_values.root_output)
+            if context.source_schema == "legacy"
+            else root_values.root_output
+        ),
         root_attributes=MappingProxyType(root_attributes),
         # The artifact's exact relative path rides a trace TAG at root
         # creation (crash-survivable): candidate verification reads this
@@ -1063,16 +1104,88 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
     is yielded.
     """
     emitted: set[str] = set()
+    first_record = next(iter(turn.iter_records()), None)
+    if first_record is not None and first_record.source_table != "message":
+        first = True
+        for record in turn.iter_records():
+            if first:
+                first = False
+                continue
+            parent_key = _qualified_parent_source_key(record)
+            parent = parent_key if parent_key in emitted else None
+            spec = map_source_record(record, parent)
+            emitted.add(spec.source_key)
+            yield _bound_child(spec, inline_limit)
+        for record in turn.iter_session_records():
+            if record.source_table not in _SESSION_EVENT_TABLES:
+                continue
+            if record.timestamp is None and record.completion_timestamp is None:
+                continue
+            spec = map_source_record(record, None)
+            if spec.source_key in emitted:
+                continue
+            emitted.add(spec.source_key)
+            yield _bound_child(spec, inline_limit)
+        return
+
+    records = tuple(turn.iter_records())
+    if not records:
+        return
+
+    prompt = _native_root_input(turn.load_root_input(inline_limit))
+    history: list[dict[str, object]] = []
+    if isinstance(prompt, Mapping):
+        history.append({"role": "user", "content": prompt.get("prompt", "")})
+
     first = True
-    for record in turn.iter_records():
+    index = 0
+    while index < len(records):
+        record = records[index]
         if first:
             first = False
+            index += 1
             continue
-        parent_key = _qualified_parent_source_key(record)
-        parent = parent_key if parent_key in emitted else None
-        spec = map_source_record(record, parent)
-        emitted.add(spec.source_key)
-        yield _bound_child(spec, inline_limit)
+
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        if _is_message_container(record) and extract_model_identity(decoded) is not None:
+            children = []
+            next_index = index + 1
+            while next_index < len(records):
+                child = records[next_index]
+                if child.parent_source_id != record.source_id:
+                    break
+                children.append(child)
+                next_index += 1
+            spec = _native_model_spec(record, children, history)
+            emitted.add(spec.source_key)
+            yield _bound_child(spec, inline_limit)
+            for child in children:
+                if child.source_table == "part" and isinstance(child.decoded_value, Mapping):
+                    child_value = child.decoded_value
+                    if child_value.get("type") == "tool":
+                        tool_spec = map_source_record(child, None)
+                        emitted.add(tool_spec.source_key)
+                        yield _bound_child(tool_spec, inline_limit)
+                        state = child_value.get("state")
+                        if isinstance(state, Mapping):
+                            call_id = child_value.get("callID") or child_value.get("call_id")
+                            history.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": state.get("output"),
+                                }
+                            )
+            index = next_index
+            continue
+
+        # Native OpenCode traces expose tool calls and model calls only. The
+        # complete text, reasoning, and lifecycle records remain in artifacts.
+        if record.source_table == "part" and isinstance(decoded, Mapping) and decoded.get("type") == "tool":
+            spec = map_source_record(record, None)
+            emitted.add(spec.source_key)
+            yield _bound_child(spec, inline_limit)
+        index += 1
     # Session-scoped lifecycle rows are not turn boundaries and are retained
     # in the artifact's session-record section. Timestamped lifecycle rows
     # still belong in the trace mapping, exactly once per mapped trace, as
@@ -1088,6 +1201,108 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
             continue
         emitted.add(spec.source_key)
         yield _bound_child(spec, inline_limit)
+
+
+def _native_model_spec(record: SourceRecord, children: list[SourceRecord], history: list[dict[str, object]]) -> SpanSpec:
+    """Project one persisted model message to MLflow's native LLM shape."""
+    identity = SourceIdentity.of(record)
+    decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+    attributes = _common_attributes(record)
+    model_identity = extract_model_identity(decoded) or ""
+    provider, _, model = model_identity.partition("/")
+    attributes.update({"opencode.model": model_identity, "model": model or model_identity, "provider": provider})
+    source_outcome = decoded_source_outcome(decoded)
+    if source_outcome is not None:
+        attributes["opencode.source_outcome"] = source_outcome
+    _apply_token_attributes(attributes, decoded.get("tokens"))
+    if isinstance(decoded.get("cost"), (int, float)) and not isinstance(decoded.get("cost"), bool):
+        attributes["opencode.cost"] = decoded["cost"]
+    finish = _optional_str(decoded.get("finish"))
+    if finish is not None:
+        attributes["opencode.finish"] = finish
+
+    message: dict[str, object] = {"role": "assistant", "content": None}
+    text_parts = [
+        value.get("text")
+        for child in children
+        if isinstance(child.decoded_value, Mapping)
+        for value in [child.decoded_value]
+        if value.get("type") == "text" and isinstance(value.get("text"), str)
+    ]
+    reasoning_parts = [
+        value.get("text")
+        for child in children
+        if isinstance(child.decoded_value, Mapping)
+        for value in [child.decoded_value]
+        if value.get("type") == "reasoning" and isinstance(value.get("text"), str) and value.get("text")
+    ]
+    if text_parts:
+        message["content"] = "".join(text_parts)
+    if reasoning_parts:
+        message["reasoning"] = "\n\n".join(reasoning_parts)
+    tool_calls = []
+    for child in children:
+        value = child.decoded_value
+        if not isinstance(value, Mapping) or value.get("type") != "tool":
+            continue
+        tool_name = value.get("tool")
+        call_id = value.get("callID") or value.get("call_id")
+        state = value.get("state")
+        tool_input = state.get("input") if isinstance(state, Mapping) else None
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": tool_name, "arguments": canonical_json(tool_input).decode("utf-8")},
+            }
+        )
+    if tool_calls:
+        message["content"] = None
+        message["tool_calls"] = tool_calls
+    outputs = {"choices": [{"message": message}]}
+    return SpanSpec(
+        source_key=identity.key,
+        name="llm_call",
+        span_type=_LLM_SPAN_TYPE,
+        parent_source_key=None,
+        inputs={"model": model_identity, "messages": list(history)},
+        attributes=MappingProxyType(attributes),
+        tags={},
+        start_time_ns=record.timestamp.nanoseconds if record.timestamp is not None else None,
+        outputs=outputs,
+        status=classify_decoded(decoded),
+        end_time_ns=(
+            record.completion_timestamp.nanoseconds
+            if record.completion_timestamp is not None
+            else record.timestamp.nanoseconds
+            if record.timestamp is not None
+            else None
+        ),
+    )
+
+
+def _native_root_input(value: object | None) -> object | None:
+    """Convert a source prompt payload to the native conversation shape."""
+    text = _text_from_parts(value)
+    return {"prompt": text} if text is not None else value
+
+
+def _native_root_output(value: object | None) -> object | None:
+    """Convert a source response payload to the native conversation shape."""
+    text = _text_from_parts(value)
+    return {"response": text, "status": "completed"} if text is not None else value
+
+
+def _text_from_parts(value: object | None) -> str | None:
+    if isinstance(value, Mapping):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        content = value.get("content")
+        return _text_from_parts(content)
+    if isinstance(value, list):
+        texts = [item.get("text") for item in value if isinstance(item, Mapping) and isinstance(item.get("text"), str)]
+        return "".join(texts) if texts else None
+    return value if isinstance(value, str) else None
 
 
 def _qualified_parent_source_key(record: SourceRecord) -> str | None:

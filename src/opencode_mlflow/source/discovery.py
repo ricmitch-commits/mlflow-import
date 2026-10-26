@@ -119,7 +119,7 @@ DISCOVERY_PLAN_SCHEMA_VERSION = "opencode-mlflow-discovery-plan-v1"
 ARTIFACT_SCHEMA_VERSION = "artifact-v2"
 """Artifact schema version recorded as a render-contract input in the plan."""
 
-MAPPING_VERSION = "mapping-v3"
+MAPPING_VERSION = "mapping-v4"
 """Turn-to-trace mapping version recorded as a render-contract input in the plan."""
 
 PLANNED_ACTION_IMPORT = "import"

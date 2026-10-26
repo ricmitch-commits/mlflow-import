@@ -190,7 +190,8 @@ DEFAULT_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 VERIFY_CHUNK_BYTES = 65_536
 
 #: The root span type for every created trace (the profile's root spans).
-_ROOT_SPAN_TYPE = "CHAIN"
+_ROOT_SPAN_TYPE = "AGENT"
+_LEGACY_ROOT_SPAN_TYPE = "CHAIN"
 
 #: How a root span status the gateway APPLIED surfaces as the trace's
 #: ``state``: ``OK``/``ERROR`` map directly, and a root ended ``UNSET``
@@ -806,7 +807,7 @@ class MlflowGateway:
         with self._pinned_tracking_uri():
             root = self._trace_api.start_span_no_context(
                 name=spec.name,
-                span_type=_ROOT_SPAN_TYPE,
+                span_type=_ROOT_SPAN_TYPE if spec.name == "opencode_conversation" else _LEGACY_ROOT_SPAN_TYPE,
                 parent_span=None,
                 inputs=spec.root_inputs,
                 attributes=dict(spec.root_attributes),

@@ -1594,6 +1594,60 @@ def test_six_turn_root_values_follow_prompts_and_results(six_turn_session) -> No
     assert specs[3].root_outputs == [{"type": "text", "text": "synthetic partial answer four"}]
 
 
+def test_legacy_mapping_matches_native_conversation_trace_shape() -> None:
+    """Legacy OpenCode rows project to the native MLflow trace vocabulary."""
+    user = replace(_message("msg-u1", "user", 1, _user_payload()), source_table="message")
+    user_part = replace(
+        _part("msg-u1#content-0", "msg-u1", {"type": "text", "text": "howdy"}),
+        source_table="part",
+        parent_source_table="message",
+    )
+    assistant = replace(
+        _message(
+            "msg-a1",
+            "assistant",
+            2,
+            {"modelID": "gpt-5.6-luna", "providerID": "openai", "finish": "tool-calls"},
+        ),
+        source_table="message",
+    )
+    tool = replace(
+        _part(
+            "msg-a1#content-0",
+            "msg-a1",
+            {
+                "type": "tool",
+                "tool": "skill",
+                "callID": "call-1",
+                "state": {"status": "completed", "input": {"name": "using-superpowers"}, "output": "result"},
+            },
+        ),
+        source_table="part",
+        parent_source_table="message",
+    )
+    turn = _replay_turn(
+        [user, user_part, assistant, tool],
+        summary=_summary(root_result_source_id="msg-a1"),
+        root_input=[{"type": "text", "text": "howdy"}],
+        root_output=[{"type": "text", "text": "Howdy."}],
+    )
+    spec = map_turn_to_trace(turn, _context(source_schema="legacy"))
+    children = list(spec.child_specs())
+
+    assert spec.name == "opencode_conversation"
+    assert spec.root_inputs == {"prompt": "howdy"}
+    assert spec.root_outputs == {"response": "Howdy.", "status": "completed"}
+    assert [child.name for child in children] == ["llm_call", "tool_skill"]
+    assert children[0].parent_source_key is None
+    assert children[0].inputs == {
+        "model": "openai/gpt-5.6-luna",
+        "messages": [{"role": "user", "content": "howdy"}],
+    }
+    assert children[1].parent_source_key is None
+    assert children[1].inputs == {"name": "using-superpowers"}
+    assert children[1].outputs == {"result": "result"}
+
+
 def test_six_turn_statuses_follow_source_outcomes(six_turn_session) -> None:
     specs = [map_turn_to_trace(turn, six_turn_session.context) for turn in six_turn_session.turns]
 
