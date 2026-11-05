@@ -33,45 +33,45 @@ from pathlib import Path
 import pytest
 from pytest_bdd import given, parsers, scenarios, then, when
 
-from opencode_mlflow.cli import main
-from opencode_mlflow.config import normalize_path, parse_timestamp
-from opencode_mlflow.content.canonical import canonical_json
-from opencode_mlflow.content.fingerprint import artifact_snapshot_fingerprint
-from opencode_mlflow.content.redaction import DeterministicRedactor, redact_record
-from opencode_mlflow.contracts import RedactionMode, Redactor
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.gateway import TRACE_SESSION_METADATA_KEY
-from opencode_mlflow.mlflow.mapping import (
+from mlflow_import.cli import main
+from mlflow_import.config import normalize_path, parse_timestamp
+from mlflow_import.content.canonical import canonical_json
+from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
+from mlflow_import.content.redaction import DeterministicRedactor, redact_record
+from mlflow_import.contracts import RedactionMode, Redactor
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.gateway import TRACE_SESSION_METADATA_KEY
+from mlflow_import.mlflow.mapping import (
     MappingContext,
     bind_mlflow_identity_map,
     map_turn_to_trace,
 )
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.mlflow.reconciliation import (
     OwnedTraceCandidate,
     ReconciliationDependencies,
     apply_reconciliation,
     plan_reconciliation,
 )
-from opencode_mlflow.mlflow.reconciliation import upload_artifact as upload_reconciliation_artifact
-from opencode_mlflow.retry import RetryPolicy
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.discovery import (
+from mlflow_import.mlflow.reconciliation import upload_artifact as upload_reconciliation_artifact
+from mlflow_import.retry import RetryPolicy
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.discovery import (
     ARTIFACT_SCHEMA_VERSION,
     MAPPING_VERSION,
     DiscoveryPlanReader,
     discover_sessions,
 )
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import SourceRecord, TurnSummary
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.selection import SelectionEvidenceEvaluator, SelectionFilters, matches_model
-from opencode_mlflow.source.snapshot import (
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import SourceRecord, TurnSummary
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.selection import SelectionEvidenceEvaluator, SelectionFilters, matches_model
+from mlflow_import.source.snapshot import (
     SourceExporter,
     SourceSnapshot,
     create_normalized_snapshot,
 )
-from opencode_mlflow.source.turns import build_replay_turn, iter_turn_records, iter_turn_summaries
+from mlflow_import.source.turns import build_replay_turn, iter_turn_records, iter_turn_summaries
 from tests.fixtures.six_turn_session import build_six_turn_source_db
 from tests.support.fake_gateway import FakeMlflowGateway, trace_spec
 from tests.support.fake_source import identity_redaction
@@ -140,7 +140,7 @@ def session_is_selected(scenario_context: dict[str, object]) -> None:
     """The scenario's session is selected.
 
     Model-identity scenarios assert the authoritative
-    :func:`opencode_mlflow.source.selection.matches_model` seam;
+    :func:`mlflow_import.source.selection.matches_model` seam;
     discovery scenarios assert the selection recorded in the discovery
     plan.
     """
@@ -734,7 +734,7 @@ def turn_records_warning(scenario_context: dict[str, object], index: int, warnin
 # Privacy scenarios (privacy_and_reporting.feature)
 #
 # The steps drive the public redaction seam available now —
-# :func:`opencode_mlflow.content.redaction.redact_record` over a turn's
+# :func:`mlflow_import.content.redaction.redact_record` over a turn's
 # records, with the deterministic redactor the importer wires into the
 # snapshot and effective-turn pipelines in Task 12 — so the same step
 # names stay reusable once the full import pipeline exists.
@@ -838,7 +838,7 @@ def _mapped_specs(scenario_context: dict[str, object]) -> list:
 def _children_by_source(scenario_context: dict[str, object], index: int) -> dict[str, object]:
     specs = _mapped_specs(scenario_context)
     return {
-        str(child.attributes.get("opencode.source_id", child.source_key)): child
+        str(child.attributes.get("mlflow_import.source_id", child.source_key)): child
         for child in specs[index - 1].child_specs()
     }
 
@@ -1088,7 +1088,7 @@ def _recon_discover(snapshot: SourceSnapshot, plan_path: Path) -> tuple[list, li
 
 def _recon_context(experiment_id: str, snapshot: SourceSnapshot, source_schema: str) -> MappingContext:
     """The mapping context the scenario's turns are mapped under."""
-    from opencode_mlflow import __version__ as importer_version
+    from mlflow_import import __version__ as importer_version
 
     return MappingContext(
         importer_version=importer_version,
@@ -2257,7 +2257,7 @@ def the_redacted_identifiers_survive(scenario_context: dict[str, object], bdd_ga
     """Redaction masked content but preserved reconciliation identifiers."""
     stored = _latest_stored_trace(scenario_context, bdd_gateway)
     assert stored.metadata["opencode.session_id"] == BDD_SESSION_ID
-    assert stored.metadata["opencode.importer"] == "opencode-mlflow"
+    assert stored.metadata["opencode.importer"] == "mlflow-import"
     relative_path = stored.tags["opencode.artifact_path"]
     artifact = bdd_gateway.stored_artifact(stored.trace_id, relative_path).decode("utf-8")
     assert "ses-bdd-cli-user-1" in artifact, "the artifact must preserve the record source ids"

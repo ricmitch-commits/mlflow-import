@@ -16,14 +16,14 @@ from __future__ import annotations
 
 import pytest
 
-from opencode_mlflow.errors import (
+from mlflow_import.errors import (
     CapabilityError,
     ConfigurationError,
     ImporterError,
     ItemImportError,
     ReconciliationConflict,
 )
-from opencode_mlflow.retry import (
+from mlflow_import.retry import (
     RetryPolicy,
     is_transient_error,
     retry_call,

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from opencode_mlflow.reporting import ACTION_SET, RESULT_SCHEMA
+from mlflow_import.reporting import ACTION_SET, RESULT_SCHEMA
 
 RESULT_ACTIONS = ACTION_SET
 """The normative action enum for ``SessionResult.action`` and ``TurnResult.action``."""

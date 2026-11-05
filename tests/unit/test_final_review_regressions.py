@@ -13,24 +13,24 @@ from pathlib import Path
 import pytest
 import yaml
 
-from opencode_mlflow.config import ImportConfig
-from opencode_mlflow.content.artifacts import stream_turn_artifact
-from opencode_mlflow.content.redaction import DeterministicRedactor
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.importer import _record_normal_results, exit_status, run_import
-from opencode_mlflow.mlflow.mapping import MappingContext, map_turn_to_trace
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.config import ImportConfig
+from mlflow_import.content.artifacts import stream_turn_artifact
+from mlflow_import.content.redaction import DeterministicRedactor
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.importer import _record_normal_results, exit_status, run_import
+from mlflow_import.mlflow.mapping import MappingContext, map_turn_to_trace
+from mlflow_import.mlflow.reconciliation import (
     OwnedTraceCandidate,
     ReconciliationAction,
     ReconciliationPlan,
 )
-from opencode_mlflow.reporting import ReportBuilder, TurnResult, render_human, render_json
-from opencode_mlflow.source.discovery import DiscoveryTurnEntry, extract_model_identity
-from opencode_mlflow.source.probe import probe_schema
-from opencode_mlflow.source.registry import build_live_exporter
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.snapshot import create_normalized_snapshot
-from opencode_mlflow.source.turns import build_replay_turn, iter_turn_summaries
+from mlflow_import.reporting import ReportBuilder, TurnResult, render_human, render_json
+from mlflow_import.source.discovery import DiscoveryTurnEntry, extract_model_identity
+from mlflow_import.source.probe import probe_schema
+from mlflow_import.source.registry import build_live_exporter
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.snapshot import create_normalized_snapshot
+from mlflow_import.source.turns import build_replay_turn, iter_turn_summaries
 from tests.support.import_fakes import LEGACY_DDL, build_current_source_db, build_import_fakes
 from tests.support.sqlite_builder import build_fixture_db, fixture_script
 
@@ -310,7 +310,7 @@ def test_missing_id_structural_identity_is_stable_when_only_secret_changes(tmp_p
         trace = dependencies.gateway.stored_trace(turn["trace_id"])
         return (
             turn["turn_key"],
-            trace.metadata["opencode.source_fingerprint"],
+            trace.metadata["mlflow_import.source_fingerprint"],
             trace.tags["opencode.artifact_path"],
         )
 
@@ -582,8 +582,8 @@ def test_legacy_merge_order_keeps_later_assistant_parts_and_complete_prompt(tmp_
     result = run_import(ImportConfig("legacy", path), dependencies)
     assert exit_status(result) == 0
     trace = dependencies.gateway.stored_trace(result.report["sessions"][0]["turns"][-1]["trace_id"])
-    assert trace.metadata["opencode.source_message_count"] == "3"
-    assert trace.metadata["opencode.source_part_count"] == "3"
+    assert trace.metadata["mlflow_import.source_message_count"] == "3"
+    assert trace.metadata["mlflow_import.source_part_count"] == "3"
 
 
 def test_missing_id_part_ownership_is_session_scoped(tmp_path):

@@ -24,17 +24,17 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from opencode_mlflow.contracts import CanonicalRecordEnvelope
-from opencode_mlflow.source.catalog import SCHEMA_CATALOG_VERSION
-from opencode_mlflow.source.model import (
+from mlflow_import.contracts import CanonicalRecordEnvelope
+from mlflow_import.source.catalog import SCHEMA_CATALOG_VERSION
+from mlflow_import.source.model import (
     SchemaDescription,
     SchemaGeneration,
     SessionHeader,
     SourceRecord,
     normalize_timestamp,
 )
-from opencode_mlflow.source.probe import probe_schema
-from opencode_mlflow.source.snapshot import ExportStats, SnapshotWriter
+from mlflow_import.source.probe import probe_schema
+from mlflow_import.source.snapshot import ExportStats, SnapshotWriter
 
 
 def identity_redaction(value: object, protected_paths: Collection[str]) -> object:

@@ -50,9 +50,9 @@ from mlflow import MlflowClient
 from mlflow.artifacts import get_artifact_repository
 from mlflow.utils.mlflow_tags import MLFLOW_ARTIFACT_LOCATION
 
-from opencode_mlflow.importer import ImportResult
-from opencode_mlflow.mlflow.gateway import DEFAULT_UPLOAD_CHUNK_BYTES, MlflowGateway, TraceCreateRequest
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.importer import ImportResult
+from mlflow_import.mlflow.gateway import DEFAULT_UPLOAD_CHUNK_BYTES, MlflowGateway, TraceCreateRequest
+from mlflow_import.mlflow.reconciliation import (
     ARTIFACT_PATH_TAG,
     ARTIFACT_SHA256_TAG,
     ARTIFACT_SIZE_TAG,
@@ -257,7 +257,7 @@ class Baseline:
             locations=[self.experiment_id], max_results=100, include_spans=False, flush=True
         )
         return {
-            trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "opencode-mlflow"
+            trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "mlflow-import"
         }
 
 
@@ -461,7 +461,7 @@ def test_unchanged_rerun_creates_no_duplicates_and_tampered_digest_replaces(base
     recorded_size = int(replacement.info.tags[ARTIFACT_SIZE_TAG])
     recorded_path = replacement.info.tags[ARTIFACT_PATH_TAG]
     assert len(recorded_sha) == 64 and recorded_sha != "0" * 64
-    with TemporaryDirectory(prefix="opencode-mlflow-recon-") as dst:
+    with TemporaryDirectory(prefix="mlflow-import-recon-") as dst:
         repo = get_artifact_repository(
             replacement.info.tags[MLFLOW_ARTIFACT_LOCATION], tracking_uri=baseline.client.tracking_uri
         )
@@ -536,7 +536,7 @@ def test_changed_turn_replacement_follows_create_verify_upload_verify_retire_ord
     assert "synthetic changed part one" in str(root.outputs)
     new_path = replacement.info.tags[ARTIFACT_PATH_TAG]
     assert new_path != old_path
-    assert new_path.startswith("opencode-mlflow/v1/sessions/ses-synthetic-1/turns/")
+    assert new_path.startswith("mlflow-import/v1/sessions/ses-synthetic-1/turns/")
 
     baseline.trace_ids_by_key[changed_key] = new_id
 
@@ -657,9 +657,7 @@ def test_stale_retirement_is_scoped_and_foreign_traces_remain_untouched(
     assert foreign_after.info.tags == foreign_before.info.tags
     assert foreign_after.info.trace_metadata == foreign_before.info.trace_metadata
     page = client.search_traces(locations=[experiment.experiment_id], max_results=100, include_spans=False, flush=True)
-    owned = {
-        trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "opencode-mlflow"
-    }
+    owned = {trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "mlflow-import"}
     assert dropped_id not in owned
     assert foreign_id not in owned
     assert len(owned) == _TURNS - 1

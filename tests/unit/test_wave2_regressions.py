@@ -17,28 +17,28 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.config import ImportConfig
-from opencode_mlflow.content.artifacts import ArtifactProvenance, stream_turn_artifact
-from opencode_mlflow.content.canonical import canonical_json
-from opencode_mlflow.contracts import DuplicateKeyObject, RedactionMode
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.importer import run_import
-from opencode_mlflow.mlflow.mapping import MappingContext, map_turn_to_trace
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1, SCHEMA_CATALOG_VERSION
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.discovery import (
+from mlflow_import.config import ImportConfig
+from mlflow_import.content.artifacts import ArtifactProvenance, stream_turn_artifact
+from mlflow_import.content.canonical import canonical_json
+from mlflow_import.contracts import DuplicateKeyObject, RedactionMode
+from mlflow_import.errors import ItemImportError
+from mlflow_import.importer import run_import
+from mlflow_import.mlflow.mapping import MappingContext, map_turn_to_trace
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1, SCHEMA_CATALOG_VERSION
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.discovery import (
     ARTIFACT_SCHEMA_VERSION,
     MAPPING_VERSION,
     DiscoveryPlanReader,
     discover_sessions,
 )
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import normalize_timestamp
-from opencode_mlflow.source.normalize import normalize_epoch_ms, unknown_json_field_warning
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.selection import SelectionFilters
-from opencode_mlflow.source.snapshot import create_normalized_snapshot
-from opencode_mlflow.source.turns import build_replay_turn, iter_turn_summaries
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import normalize_timestamp
+from mlflow_import.source.normalize import normalize_epoch_ms, unknown_json_field_warning
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.selection import SelectionFilters
+from mlflow_import.source.snapshot import create_normalized_snapshot
+from mlflow_import.source.turns import build_replay_turn, iter_turn_summaries
 from tests.support.fake_gateway import FakeMlflowClient, FakeMlflowGateway, child_spec, trace_spec
 from tests.support.fake_source import identity_redaction
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
@@ -211,7 +211,7 @@ def test_catalog_version_changes_artifact_snapshot_identity_but_not_database_pro
             (summary,) = iter_turn_summaries(adapter.iter_records("ses-wave2"))
             turn = build_replay_turn(snapshot, header, summary)
             request = map_turn_to_trace(turn, _context(snapshot.fingerprint, version)).to_create_request()
-            fingerprints.append(request.metadata["opencode.source_fingerprint"])
+            fingerprints.append(request.metadata["mlflow_import.source_fingerprint"])
             snapshots.append(request.artifact_snapshot_fingerprint)
             database_fingerprints.append(snapshot.fingerprint)
 
@@ -369,7 +369,7 @@ def test_all_failure_signals_survive_adapter_snapshot_replay_mapping_and_fake_ga
         request = map_turn_to_trace(turn, _context(snapshot.fingerprint)).to_create_request()
         children = {child.source_key: child for child in request.child_specs()}
         gateway = FakeMlflowGateway()
-        from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+        from mlflow_import.mlflow.capabilities import CapabilityRequest
 
         gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True))
         created = gateway.create_trace(request)
@@ -412,7 +412,7 @@ def test_lifecycle_records_map_as_children_once_in_the_artifact(tmp_path: Path) 
         request = map_turn_to_trace(turn, _context(snapshot.fingerprint)).to_create_request()
         children = list(request.child_specs())
         gateway = FakeMlflowGateway()
-        from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+        from mlflow_import.mlflow.capabilities import CapabilityRequest
 
         gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True))
         created = gateway.create_trace(request)
@@ -458,7 +458,7 @@ def test_colliding_message_and_part_ids_keep_qualified_parent_lineage(tmp_path: 
         request = map_turn_to_trace(turn, _context(snapshot.fingerprint)).to_create_request()
         children = list(request.child_specs())
         gateway = FakeMlflowGateway()
-        from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+        from mlflow_import.mlflow.capabilities import CapabilityRequest
 
         gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True))
         created = gateway.create_trace(request)
@@ -505,12 +505,12 @@ def test_legacy_session_scoped_todo_maps_as_a_root_event(tmp_path: Path) -> None
 
 
 def test_uploaded_artifact_carries_exact_mapped_provenance(six_turn_session, tmp_path: Path) -> None:
-    from opencode_mlflow.mlflow.reconciliation import upload_artifact
+    from mlflow_import.mlflow.reconciliation import upload_artifact
 
     turn = six_turn_session.turns[0]
     request = map_turn_to_trace(turn, six_turn_session.context).to_create_request()
     gateway = FakeMlflowGateway()
-    from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+    from mlflow_import.mlflow.capabilities import CapabilityRequest
 
     gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True))
     created = gateway.create_trace(request)
@@ -525,12 +525,12 @@ def test_uploaded_artifact_carries_exact_mapped_provenance(six_turn_session, tmp
     document = json.loads(gateway.stored_artifact(created.trace_id, verification.relative_path).decode("utf-8"))
     artifact = document["artifact"]
 
-    assert artifact["source_database_fingerprint"] == request.metadata["opencode.source_database_fingerprint"]
-    assert artifact["source_fingerprint"] == request.metadata["opencode.source_fingerprint"]
+    assert artifact["source_database_fingerprint"] == request.metadata["mlflow_import.source_database_fingerprint"]
+    assert artifact["source_fingerprint"] == request.metadata["mlflow_import.source_fingerprint"]
     assert artifact["render_fingerprint"] == request.metadata["opencode.render_fingerprint"]
     assert artifact["artifact_snapshot_fingerprint"] == request.artifact_snapshot_fingerprint
     assert artifact["artifact_path"] == request.artifact_relative_path
-    assert artifact["source_schema"] == request.metadata["opencode.source_schema"]
+    assert artifact["source_schema"] == request.metadata["mlflow_import.source_schema"]
     assert artifact["mapping_version"] == request.metadata["opencode.mapping_version"]
     assert artifact["redaction_mode"] == request.metadata["opencode.redaction_mode"]
 
@@ -546,7 +546,7 @@ def test_uploaded_artifact_carries_exact_mapped_provenance(six_turn_session, tmp
         lambda span: setattr(span, "end_time_ns", 2),
         lambda span: setattr(span, "name", "corrupt-name"),
         lambda span: setattr(span, "span_type", "CORRUPT"),
-        lambda span: span.attributes.update({"opencode.source_key": "corrupt"}),
+        lambda span: span.attributes.update({"mlflow_import.source_key": "corrupt"}),
         lambda span: span.tags.update({"opencode.span_tag": "corrupt"}),
     ],
     ids=["inputs", "outputs", "parent", "status", "start", "end", "name", "type", "attributes", "tags"],
@@ -555,14 +555,14 @@ def test_gateway_verifies_every_retrieved_child_field(
     fake_mlflow_client: FakeMlflowClient, mutate: Callable[[object], None]
 ) -> None:
     gateway = fake_mlflow_client.gateway()
-    from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+    from mlflow_import.mlflow.capabilities import CapabilityRequest
 
     assert gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True)).is_compatible
     child = child_spec(
         "session_message:child",
         inputs={"input": 1},
         outputs={"output": 2},
-        attributes={"opencode.source_key": "session_message:child"},
+        attributes={"mlflow_import.source_key": "session_message:child"},
         tags={"opencode.span_tag": "value"},
         start_time_ns=10,
         end_time_ns=20,
@@ -638,7 +638,7 @@ def test_mapping_gateway_boundary_uses_canonical_typed_payloads_losslessly() -> 
 
     client = FakeMlflowClient()
     gateway = client.gateway()
-    from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+    from mlflow_import.mlflow.capabilities import CapabilityRequest
 
     assert gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True)).is_compatible
     created = gateway.create_trace(request)
@@ -687,7 +687,7 @@ def test_pending_assistant_outcome_is_incomplete_from_source_to_trace(tmp_path: 
         request = map_turn_to_trace(turn, _context(snapshot.fingerprint)).to_create_request()
         client = FakeMlflowClient()
         gateway = client.gateway()
-        from opencode_mlflow.mlflow.capabilities import CapabilityRequest
+        from mlflow_import.mlflow.capabilities import CapabilityRequest
 
         gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True))
         created = gateway.create_trace(request)

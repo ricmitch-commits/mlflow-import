@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from opencode_mlflow.source.catalog import (
+from mlflow_import.source.catalog import (
     CURRENT_CATALOG_V1,
     LEGACY_CATALOG_V1,
     OPENCODE_SCHEMA_CATALOG_V1,

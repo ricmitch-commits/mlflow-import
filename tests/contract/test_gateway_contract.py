@@ -33,13 +33,13 @@ from pathlib import Path
 import mlflow
 import pytest
 
-from opencode_mlflow.mlflow import capabilities as capabilities_module
-from opencode_mlflow.mlflow import gateway as gateway_module
-from opencode_mlflow.mlflow.capabilities import (
+from mlflow_import.mlflow import capabilities as capabilities_module
+from mlflow_import.mlflow import gateway as gateway_module
+from mlflow_import.mlflow.capabilities import (
     PINNED_MLFLOW_VERSION,
     CapabilityRequest,
 )
-from opencode_mlflow.mlflow.capabilities import probe_capabilities as _production_probe_capabilities
+from mlflow_import.mlflow.capabilities import probe_capabilities as _production_probe_capabilities
 from tests.integration.mlflow_profile import (
     MAX_INLINE_PAYLOAD_BYTES,
     MlflowProfile,
@@ -52,7 +52,7 @@ from tests.support.fake_gateway import FakeMlflowClient, child_spec, trace_spec
 
 pytestmark = pytest.mark.contract
 
-_SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "opencode_mlflow"
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "mlflow_import"
 _ALLOWED_MLFLOW_IMPORT_ROOTS = frozenset({"mlflow", "mlflow.tracking", "mlflow.artifacts"})
 _GATEWAY_MODULES = ("gateway.py", "capabilities.py")
 
@@ -97,7 +97,7 @@ def _workout_gateway(client: FakeMlflowClient, tmp_path: Path):
     payload = tmp_path / "payload.json"
     payload.write_bytes(b'{"contract": "named-artifact"}')
     verification = gateway.upload_named_json(
-        created.trace_id, "opencode-mlflow/v1/sessions/s/turns/turn-x/aaa-bbb.json", payload, chunk_size=64
+        created.trace_id, "mlflow-import/v1/sessions/s/turns/turn-x/aaa-bbb.json", payload, chunk_size=64
     )
     gateway.verify_named_json(created.trace_id, verification.relative_path, verification.sha256, verification.size)
     gateway.record_artifact_verification(created.trace_id, verification.sha256, verification.size)

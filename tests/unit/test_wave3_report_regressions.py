@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.importer import ImportResult, _record_normal_results, exit_status
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.importer import ImportResult, _record_normal_results, exit_status
+from mlflow_import.mlflow.reconciliation import (
     ACTION_RETIRED,
     OwnedTraceCandidate,
     ReconciliationAction,
     ReconciliationPlan,
 )
-from opencode_mlflow.reporting import ReportBuilder
-from opencode_mlflow.source.discovery import DiscoveryTurnEntry
+from mlflow_import.reporting import ReportBuilder
+from mlflow_import.source.discovery import DiscoveryTurnEntry
 
 
 def _entry() -> DiscoveryTurnEntry:

@@ -13,7 +13,7 @@ behavior, and a versioned safe result document.
 
 ### Added
 
-- `opencode-mlflow import` CLI: `--experiment-name` (required), `--db`
+- Initial one-shot import CLI: `--experiment-name` (required), `--db`
   (default `~/.local/share/opencode/opencode.db`), `--tracking-uri`,
   inclusive creation-time bounds `--from-time`/`--to-time`
   (ISO-8601 with explicit offset or `Z`), `--directory`

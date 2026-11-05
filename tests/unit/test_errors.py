@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from opencode_mlflow.errors import (
+from mlflow_import.errors import (
     CapabilityError,
     ConfigurationError,
     ImporterError,

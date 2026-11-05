@@ -18,22 +18,22 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.errors import SourceCompatibilityError
-from opencode_mlflow.source.catalog import SCHEMA_CATALOG_VERSION, TIE_RANKS
-from opencode_mlflow.source.connection import open_live_connection
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import SchemaDescription, SourceAdapter
-from opencode_mlflow.source.probe import probe_schema
-from opencode_mlflow.source.registry import (
+from mlflow_import.errors import SourceCompatibilityError
+from mlflow_import.source.catalog import SCHEMA_CATALOG_VERSION, TIE_RANKS
+from mlflow_import.source.connection import open_live_connection
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import SchemaDescription, SourceAdapter
+from mlflow_import.source.probe import probe_schema
+from mlflow_import.source.registry import (
     AdapterRegistry,
     MixedAdapter,
     build_live_exporter,
     build_replay_adapter,
     default_adapter_registry,
 )
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.snapshot import SourceExporter, SourceSnapshot, create_normalized_snapshot
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.snapshot import SourceExporter, SourceSnapshot, create_normalized_snapshot
 from tests.support.fake_source import identity_redaction
 from tests.support.sqlite_builder import build_fixture_db
 
@@ -133,7 +133,7 @@ def _all_records(database: AdapterContractDatabase) -> list:
 
 @pytest.mark.parametrize("schema_name", ["legacy", "current", "mixed"])
 def test_adapter_contract_emits_canonical_records(schema_name, fixture_database):
-    from opencode_mlflow.source.ordering import session_sort_key
+    from mlflow_import.source.ordering import session_sort_key
 
     adapter = fixture_database(schema_name).adapter
     headers = list(adapter.iter_session_headers())

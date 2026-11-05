@@ -6,7 +6,7 @@ from collections.abc import Collection
 
 import pytest
 
-from opencode_mlflow.contracts import CanonicalRecordEnvelope, RedactionMode, Redactor
+from mlflow_import.contracts import CanonicalRecordEnvelope, RedactionMode, Redactor
 
 pytestmark = pytest.mark.unit
 

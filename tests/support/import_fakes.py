@@ -15,7 +15,7 @@ lock seams:
   handle on the gateway observes exactly the gateway the run used
   (``gateway.mutations`` is the accessor the verbatim assertion reads).
 - :class:`FakeImportDependencies` subclasses the production
-  :class:`~opencode_mlflow.importer.ImportDependencies` to carry the fake
+  :class:`~mlflow_import.importer.ImportDependencies` to carry the fake
   gateway as a direct test handle while every injected seam stays
   constructible through the production type.
 
@@ -35,20 +35,20 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from opencode_mlflow.content.fingerprint import artifact_snapshot_fingerprint
-from opencode_mlflow.errors import ConfigurationError
-from opencode_mlflow.importer import ImportDependencies, build_replay_index
-from opencode_mlflow.locking import ImportLock
-from opencode_mlflow.mlflow.gateway import TraceCreateRequest
-from opencode_mlflow.mlflow.mapping import MappingContext, map_turn_to_trace
-from opencode_mlflow.mlflow.reconciliation import upload_artifact
-from opencode_mlflow.retry import RetryPolicy
-from opencode_mlflow.source.discovery import DiscoveryTurnEntry
-from opencode_mlflow.source.model import SchemaDescription
-from opencode_mlflow.source.registry import build_live_exporter
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.selection import SelectionEvidenceEvaluator
-from opencode_mlflow.source.snapshot import (
+from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
+from mlflow_import.errors import ConfigurationError
+from mlflow_import.importer import ImportDependencies, build_replay_index
+from mlflow_import.locking import ImportLock
+from mlflow_import.mlflow.gateway import TraceCreateRequest
+from mlflow_import.mlflow.mapping import MappingContext, map_turn_to_trace
+from mlflow_import.mlflow.reconciliation import upload_artifact
+from mlflow_import.retry import RetryPolicy
+from mlflow_import.source.discovery import DiscoveryTurnEntry
+from mlflow_import.source.model import SchemaDescription
+from mlflow_import.source.registry import build_live_exporter
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.selection import SelectionEvidenceEvaluator
+from mlflow_import.source.snapshot import (
     RedactionCallback,
     SourceExporter,
     SourceSnapshot,

@@ -10,8 +10,9 @@ pytestmark = pytest.mark.unit
 def test_package_metadata_and_entry_point_import():
     import importlib.metadata
     import subprocess
-    import opencode_mlflow
 
-    assert opencode_mlflow.__version__
-    assert importlib.metadata.version("opencode-mlflow") == opencode_mlflow.__version__
-    assert subprocess.run(["opencode-mlflow", "--help"], check=False, capture_output=True).returncode == 0
+    import mlflow_import
+
+    assert mlflow_import.__version__
+    assert importlib.metadata.version("mlflow-import") == mlflow_import.__version__
+    assert subprocess.run(["mlflow-import", "--help"], check=False, capture_output=True).returncode == 0

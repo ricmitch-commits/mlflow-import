@@ -1,6 +1,6 @@
 """Unit tests for the MLflow gateway boundary (real gateway, fake seams).
 
-The production :class:`opencode_mlflow.mlflow.gateway.MlflowGateway` is
+The production :class:`mlflow_import.mlflow.gateway.MlflowGateway` is
 driven against the fake public-client/LiveSpan-shaped objects from
 ``tests/support/fake_gateway.py``: no network, no real MLflow server. These
 tests pin the writer-boundary contract — experiment resolution, preflight
@@ -20,9 +20,9 @@ from pathlib import Path
 import mlflow
 import pytest
 
-from opencode_mlflow.errors import CapabilityError, ConfigurationError, ItemImportError, PartialTraceCreateError
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.gateway import (
+from mlflow_import.errors import CapabilityError, ConfigurationError, ItemImportError, PartialTraceCreateError
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.gateway import (
     NO_OP_TRACE_ID,
     TRACE_SESSION_METADATA_KEY,
     CreatedTrace,
@@ -30,7 +30,7 @@ from opencode_mlflow.mlflow.gateway import (
     TraceChildRequest,
     build_gateway,
 )
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.mlflow.reconciliation import (
     ARTIFACT_PATH_TAG,
     CandidateContract,
     OwnedTraceCandidate,
@@ -97,7 +97,7 @@ def test_oversized_required_metadata_rejected_before_any_trace_is_created(fake_m
     gateway = _checked_gateway(fake_mlflow_client)
     oversized = "x" * 500
     metadata = {
-        "opencode.importer": "opencode-mlflow",
+        "opencode.importer": "mlflow-import",
         "opencode.session_id": oversized if field == "opencode.session_id" else "ses-sample",
         "opencode.turn_key": _TEST_TURN_KEY,
         field: oversized,
@@ -190,10 +190,10 @@ def test_retirement_refuses_a_source_identity_race_after_the_first_gateway_check
             experiment_id=experiment.experiment_id,
             native_session_id="ses-race",
             metadata={
-                "opencode.importer": "opencode-mlflow",
+                "opencode.importer": "mlflow-import",
                 "opencode.session_id": "ses-race",
                 "opencode.turn_key": _TEST_TURN_KEY,
-                "opencode.source_fingerprint": "a" * 64,
+                "mlflow_import.source_fingerprint": "a" * 64,
             },
         )
     )
@@ -201,7 +201,7 @@ def test_retirement_refuses_a_source_identity_race_after_the_first_gateway_check
 
     def race(_trace_id: str) -> None:
         stored.info.trace_metadata["opencode.session_id"] = "ses-other"
-        stored.info.trace_metadata["opencode.source_fingerprint"] = "b" * 64
+        stored.info.trace_metadata["mlflow_import.source_fingerprint"] = "b" * 64
 
     fake_mlflow_client.after_get_trace_hook = race
     mutation_count = len(fake_mlflow_client.mutations)
@@ -212,7 +212,7 @@ def test_retirement_refuses_a_source_identity_race_after_the_first_gateway_check
             created.trace_id,
             session_id="ses-race",
             turn_key=_TEST_TURN_KEY,
-            expected_metadata={"opencode.source_fingerprint": "a" * 64},
+            expected_metadata={"mlflow_import.source_fingerprint": "a" * 64},
         )
 
     assert excinfo.value.code == "ownership_conflict"
@@ -236,10 +236,10 @@ def test_retirement_refuses_a_turn_identity_race_between_checks(
             experiment_id=experiment.experiment_id,
             native_session_id="ses-race",
             metadata={
-                "opencode.importer": "opencode-mlflow",
+                "opencode.importer": "mlflow-import",
                 "opencode.session_id": "ses-race",
                 "opencode.turn_key": _TEST_TURN_KEY,
-                "opencode.source_fingerprint": "a" * 64,
+                "mlflow_import.source_fingerprint": "a" * 64,
             },
         )
     )
@@ -259,7 +259,7 @@ def test_retirement_refuses_a_turn_identity_race_between_checks(
             created.trace_id,
             session_id="ses-race",
             turn_key=_TEST_TURN_KEY,
-            expected_metadata={"opencode.source_fingerprint": "a" * 64},
+            expected_metadata={"mlflow_import.source_fingerprint": "a" * 64},
         )
 
     assert excinfo.value.code == "ownership_conflict"
@@ -276,7 +276,7 @@ def test_retirement_refuses_a_malformed_ownership_contract_before_delete(
         trace_spec(experiment_id=experiment.experiment_id, native_session_id="ses-malformed")
     )
     stored = fake_mlflow_client._traces[created.trace_id]
-    stored.info.trace_metadata["opencode.source_fingerprint"] = "not-a-64-hex-fingerprint"
+    stored.info.trace_metadata["mlflow_import.source_fingerprint"] = "not-a-64-hex-fingerprint"
     mutation_count = len(fake_mlflow_client.mutations)
 
     with pytest.raises(ItemImportError) as excinfo:
@@ -714,7 +714,7 @@ def test_create_trace_passes_child_payloads_and_times(fake_mlflow_client: FakeMl
             child_spec(
                 "msg-1",
                 inputs={"text": "hello"},
-                attributes={"opencode.source_id": "msg-1"},
+                attributes={"mlflow_import.source_id": "msg-1"},
                 tags={"opencode.span_role": "user"},
                 start_time_ns=1_700_000_000_005_000_000,
                 outputs={"text": "world"},
@@ -729,7 +729,7 @@ def test_create_trace_passes_child_payloads_and_times(fake_mlflow_client: FakeMl
     start_calls = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "start_span_no_context"]
     child_start = next(call[1] for call in start_calls if call[1]["parent_span"] is not None)
     assert child_start["inputs"] == {"text": "hello"}
-    assert child_start["attributes"] == {"opencode.source_id": "msg-1"}
+    assert child_start["attributes"] == {"mlflow_import.source_id": "msg-1"}
     assert child_start["tags"] == {"opencode.span_role": "user"}
     assert child_start["start_time_ns"] == 1_700_000_000_005_000_000
     # ``experiment_id`` is a root-span parameter: a child joins its parent's
@@ -895,7 +895,7 @@ def test_verify_trace_applies_the_trace_state_mapping_for_unset_roots(fake_mlflo
 
 def test_verify_trace_accepts_extra_internal_span_attributes(fake_mlflow_client: FakeMlflowClient) -> None:
     gateway = _checked_gateway(fake_mlflow_client)
-    spec = trace_spec(root_attributes={"opencode.turn_index": "1", "opencode.source_schema": "current"})
+    spec = trace_spec(root_attributes={"opencode.turn_index": "1", "mlflow_import.source_schema": "current"})
     created = gateway.create_trace(spec)
 
     # MLflow adds its own internal attribute keys to server-side spans; the
@@ -944,9 +944,9 @@ def test_iter_owned_traces_walks_pagination_and_yields_only_owned(fake_mlflow_cl
     owned = list(gateway.iter_owned_traces(experiment.experiment_id))
 
     assert len(owned) == 5
-    assert all(trace.metadata.get("opencode.importer") == "opencode-mlflow" for trace in owned)
+    assert all(trace.metadata.get("opencode.importer") == "mlflow-import" for trace in owned)
     assert all(
-        trace.tags.get("opencode.importer") == "opencode-mlflow" or trace.metadata.get("opencode.importer")
+        trace.tags.get("opencode.importer") == "mlflow-import" or trace.metadata.get("opencode.importer")
         for trace in owned
     )
 
@@ -1008,7 +1008,7 @@ def test_iter_owned_traces_finds_tag_marked_owned_traces(fake_mlflow_client: Fak
     spec = trace_spec(
         experiment_id=experiment.experiment_id,
         owned=False,
-        root_tags={"opencode.importer": "opencode-mlflow"},
+        root_tags={"opencode.importer": "mlflow-import"},
     )
     created = gateway.create_trace(spec)
 
@@ -1079,18 +1079,18 @@ def test_upload_named_json_preserves_relative_path_and_digest(
     local.write_bytes(payload)
 
     verification = gateway.upload_named_json(
-        created.trace_id, "opencode-mlflow/v1/sessions/s/nested/payload.json", local, chunk_size=512
+        created.trace_id, "mlflow-import/v1/sessions/s/nested/payload.json", local, chunk_size=512
     )
 
     assert verification.trace_id == created.trace_id
-    assert verification.relative_path == "opencode-mlflow/v1/sessions/s/nested/payload.json"
+    assert verification.relative_path == "mlflow-import/v1/sessions/s/nested/payload.json"
     assert verification.sha256 == hashlib.sha256(payload).hexdigest()
     assert verification.size == len(payload)
 
     repository = fake_mlflow_client.artifacts.repositories[f"fake-artifact://traces/{created.trace_id}"]
-    assert repository.files["opencode-mlflow/v1/sessions/s/nested/payload.json"] == payload
+    assert repository.files["mlflow-import/v1/sessions/s/nested/payload.json"] == payload
     assert repository.calls[0][0] == "log_artifact"
-    assert repository.calls[0][2] == "opencode-mlflow/v1/sessions/s/nested"
+    assert repository.calls[0][2] == "mlflow-import/v1/sessions/s/nested"
 
 
 def test_verify_named_json_round_trips_and_rejects_tampering(
@@ -1147,11 +1147,11 @@ def test_upload_named_json_rejects_non_positive_chunk_size(
 
 
 _OWNERSHIP_METADATA = {
-    "opencode.importer": "opencode-mlflow",
+    "opencode.importer": "mlflow-import",
     "opencode.session_id": "ses-recorded",
     "opencode.turn_key": _RECORDED_TURN_KEY,
-    "opencode.source_fingerprint": "a" * 64,
-    "opencode.source_schema": "current",
+    "mlflow_import.source_fingerprint": "a" * 64,
+    "mlflow_import.source_schema": "current",
     "opencode.turn_index": "1",
     "opencode.importer_version": "0.1.0",
     "opencode.mapping_version": "mapping-v3",
@@ -1183,7 +1183,7 @@ def test_verify_owned_candidate_checks_integrity_at_the_recorded_path(
     """
     gateway = _checked_gateway(fake_mlflow_client)
     experiment = fake_mlflow_client.add_experiment("recorded-path")
-    recorded_path = f"opencode-mlflow/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/aaa-bbb.json"
+    recorded_path = f"mlflow-import/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/aaa-bbb.json"
     spec = trace_spec(
         experiment_id=experiment.experiment_id,
         native_session_id="ses-recorded",
@@ -1202,7 +1202,7 @@ def test_verify_owned_candidate_checks_integrity_at_the_recorded_path(
     # matches because integrity runs at its own recorded location.
     contract = replace(
         CandidateContract.from_create_request(spec, verification.sha256, verification.size),
-        artifact_relative_path=f"opencode-mlflow/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/zzz-www.json",
+        artifact_relative_path=f"mlflow-import/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/zzz-www.json",
     )
 
     assert gateway.verify_owned_candidate(candidate, contract).matches is True
@@ -1232,7 +1232,7 @@ def test_verify_owned_candidate_without_a_recorded_path_is_an_incomplete_non_mat
     created = gateway.create_trace(spec)
     local = tmp_path / "artifact.json"
     local.write_bytes(b'{"artifact": "bytes"}')
-    legacy_path = f"opencode-mlflow/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/legacy.json"
+    legacy_path = f"mlflow-import/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/legacy.json"
     verification = gateway.upload_named_json(created.trace_id, legacy_path, local)
     gateway.record_artifact_verification(created.trace_id, verification.sha256, verification.size)
     candidate = _indexed_candidate(gateway, experiment.experiment_id)
@@ -1262,7 +1262,7 @@ def test_verify_owned_candidate_compares_every_creation_contract_field(
 ) -> None:
     gateway = _checked_gateway(fake_mlflow_client)
     experiment = fake_mlflow_client.add_experiment("full-contract")
-    recorded_path = f"opencode-mlflow/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/full.json"
+    recorded_path = f"mlflow-import/v1/sessions/ses-recorded/turns/{_RECORDED_TURN_KEY}/full.json"
     spec = trace_spec(
         experiment_id=experiment.experiment_id,
         native_session_id="ses-recorded",
@@ -1303,7 +1303,7 @@ def test_fake_gateway_records_event_history_in_order(tmp_path: Path) -> None:
     spec = trace_spec(experiment_id=reference.experiment_id, children=[child_spec("msg-1")])
     created = fake.create_trace(spec)
     fake.verify_trace(created, spec)
-    verification = fake.upload_named_json(created.trace_id, "opencode-mlflow/v1/x.json", payload)
+    verification = fake.upload_named_json(created.trace_id, "mlflow-import/v1/x.json", payload)
     fake.verify_named_json(created.trace_id, verification.relative_path, verification.sha256, verification.size)
     owned = list(fake.iter_owned_traces(reference.experiment_id))
     fake.retire_trace(
@@ -1330,7 +1330,7 @@ def test_fake_gateway_records_event_history_in_order(tmp_path: Path) -> None:
     assert fake.mutations == [
         ("experiment_create", "bdd-experiment", reference.experiment_id),
         ("trace_create", created.trace_id),
-        ("artifact_upload", created.trace_id, "opencode-mlflow/v1/x.json"),
+        ("artifact_upload", created.trace_id, "mlflow-import/v1/x.json"),
         ("trace_retire", reference.experiment_id, created.trace_id),
     ]
 

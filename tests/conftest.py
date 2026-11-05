@@ -1,4 +1,4 @@
-"""Shared fixtures for the opencode-mlflow test suite."""
+"""Shared fixtures for the mlflow-import test suite."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from tests.support.fake_gateway import FakeMlflowClient
 @pytest.fixture
 def restrictive_tmp_path() -> Iterator[Path]:
     """A temporary directory restricted to owner-only access (mode 0o700)."""
-    path = Path(tempfile.mkdtemp(prefix="opencode-mlflow-test-"))
+    path = Path(tempfile.mkdtemp(prefix="mlflow-import-test-"))
     os.chmod(path, 0o700)
     try:
         yield path

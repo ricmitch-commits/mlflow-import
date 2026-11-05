@@ -25,28 +25,28 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from opencode_mlflow.config import ImportConfig
-from opencode_mlflow.content.fingerprint import artifact_snapshot_fingerprint
-from opencode_mlflow.importer import (
+from mlflow_import.config import ImportConfig
+from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
+from mlflow_import.importer import (
     ImportDependencies,
     ImportResult,
     build_replay_index,
     exit_status,
     run_import,
 )
-from opencode_mlflow.locking import acquire_import_lock, resolve_lock_root
-from opencode_mlflow.mlflow.gateway import (
+from mlflow_import.locking import acquire_import_lock, resolve_lock_root
+from mlflow_import.mlflow.gateway import (
     DEFAULT_UPLOAD_CHUNK_BYTES,
     MlflowGateway,
     TraceCreateRequest,
     build_gateway,
 )
-from opencode_mlflow.mlflow.mapping import MappingContext, map_turn_to_trace
-from opencode_mlflow.mlflow.reconciliation import upload_artifact
-from opencode_mlflow.retry import RetryPolicy
-from opencode_mlflow.source.registry import build_live_exporter
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.snapshot import create_normalized_snapshot
+from mlflow_import.mlflow.mapping import MappingContext, map_turn_to_trace
+from mlflow_import.mlflow.reconciliation import upload_artifact
+from mlflow_import.retry import RetryPolicy
+from mlflow_import.source.registry import build_live_exporter
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.snapshot import create_normalized_snapshot
 
 __all__ = [
     "DETERMINISTIC_CLOCK_NS",
