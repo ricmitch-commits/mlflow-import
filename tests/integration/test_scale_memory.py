@@ -5,7 +5,7 @@ explicitly selected (``pytest tests/integration/test_scale_memory.py -m
 integration -q``). It generates a synthetic session of at least 100,000
 records whose streamed artifact is multi-hundred-megabyte — "multi-
 hundred-megabyte artifact" here means the TOTAL artifact bytes streamed
-through :func:`~opencode_mlflow.content.artifacts.stream_turn_artifact`
+through :func:`~mlflow_import.content.artifacts.stream_turn_artifact`
 and uploaded through the chunk sink exceed 200 MiB — and proves the
 artifact layer's bounded-memory contract:
 
@@ -53,33 +53,33 @@ from types import SimpleNamespace
 
 import pytest
 
-from opencode_mlflow.content.artifacts import (
+from mlflow_import.content.artifacts import (
     DEFAULT_UPLOAD_CHUNK_BYTES,
     ArtifactUploadChunk,
     iter_artifact_chunks,
     stream_turn_artifact,
     temporary_artifact_file,
 )
-from opencode_mlflow.content.fingerprint import build_effective_turn, source_fingerprint
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.importer import build_replay_index
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.gateway import MlflowGateway
-from opencode_mlflow.mlflow.mapping import MappingContext, map_turn_to_trace
-from opencode_mlflow.mlflow.reconciliation import created_artifact_identity_map
-from opencode_mlflow.source.discovery import (
+from mlflow_import.content.fingerprint import build_effective_turn, source_fingerprint
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ItemImportError
+from mlflow_import.importer import build_replay_index
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.gateway import MlflowGateway
+from mlflow_import.mlflow.mapping import MappingContext, map_turn_to_trace
+from mlflow_import.mlflow.reconciliation import created_artifact_identity_map
+from mlflow_import.source.discovery import (
     ARTIFACT_SCHEMA_VERSION,
     MAPPING_VERSION,
     DiscoveryPlanReader,
     discover_sessions,
 )
-from opencode_mlflow.source.model import SessionHeader, SourceRecord, TimestampValue, TurnSummary
-from opencode_mlflow.source.probe import probe_schema
-from opencode_mlflow.source.registry import build_live_exporter
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.selection import SelectionFilters
-from opencode_mlflow.source.snapshot import create_normalized_snapshot
+from mlflow_import.source.model import SessionHeader, SourceRecord, TimestampValue, TurnSummary
+from mlflow_import.source.probe import probe_schema
+from mlflow_import.source.registry import build_live_exporter
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.selection import SelectionFilters
+from mlflow_import.source.snapshot import create_normalized_snapshot
 from tests.integration.mlflow_profile import MAX_INLINE_PAYLOAD_BYTES
 from tests.support.fake_gateway import FakeMlflowClient
 from tests.support.fake_redactor import IdentityRedactor

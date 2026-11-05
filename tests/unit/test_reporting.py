@@ -1,7 +1,7 @@
 """Unit tests for the versioned result document and its renderers.
 
 The report layer is asserted two ways: directly through
-:class:`opencode_mlflow.reporting.ReportBuilder` (shape, count units,
+:class:`mlflow_import.reporting.ReportBuilder` (shape, count units,
 safe error entries) and end-to-end through ``run_import`` with the fake
 dependencies (schema version, action enum, dry-run planned actions,
 per-session/per-turn identities, sanitization sentinels, and the
@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.config import ImportConfig
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ImporterError
-from opencode_mlflow.importer import ImportResult, exit_status, run_import
-from opencode_mlflow.reporting import (
+from mlflow_import.config import ImportConfig
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ImporterError
+from mlflow_import.importer import ImportResult, exit_status, run_import
+from mlflow_import.reporting import (
     RESULT_SCHEMA,
     ReportBuilder,
     TurnResult,
@@ -52,7 +52,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_result_schema_is_the_versioned_result_name() -> None:
-    assert RESULT_SCHEMA == "opencode-mlflow.result.v1"
+    assert RESULT_SCHEMA == "mlflow-import.result.v1"
 
 
 def test_render_json_carries_the_schema_version_and_required_sections(import_dependencies, config) -> None:
@@ -348,7 +348,7 @@ def test_human_output_is_concise_progress_oriented_and_warns_on_broad_selection(
 
     text = render_human(result)
 
-    assert "opencode-mlflow import dry-run complete" in text
+    assert "mlflow-import import dry-run complete" in text
     assert "experiment:" in text
     assert "turns:" in text
     assert "broad_selection" in text
@@ -374,7 +374,7 @@ def test_human_output_reports_dry_run_errors_as_failed() -> None:
 
     text = render_human(result)
 
-    assert text.splitlines()[0] == "opencode-mlflow import failed"
+    assert text.splitlines()[0] == "mlflow-import import failed"
 
 
 def test_human_output_reports_result_error_as_failed_even_without_report_event() -> None:
@@ -387,7 +387,7 @@ def test_human_output_reports_result_error_as_failed_even_without_report_event()
 
     text = render_human(result)
 
-    assert text.splitlines()[0] == "opencode-mlflow import failed"
+    assert text.splitlines()[0] == "mlflow-import import failed"
 
 
 # ---------------------------------------------------------------------------

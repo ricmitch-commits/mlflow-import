@@ -37,7 +37,7 @@ from pathlib import Path
 import pytest
 from _pytest.capture import CaptureFixture
 
-from opencode_mlflow.cli import main
+from mlflow_import.cli import main
 from tests.support.fake_clock import FakeClock
 from tests.support.fake_gateway import FakeMlflowGateway
 from tests.support.import_fakes import (
@@ -151,7 +151,7 @@ def cli_import_runner(
         state_before = _source_file_state(source)
         event_marker = len(bdd_gateway.events)
         mutations_before = len(bdd_gateway.mutations)
-        run_root = Path(tempfile.mkdtemp(prefix="opencode-mlflow-bdd-", dir=tmp_path))
+        run_root = Path(tempfile.mkdtemp(prefix="mlflow-import-bdd-", dir=tmp_path))
         run_root.chmod(0o700)
         try:
             dependencies = build_import_fakes(

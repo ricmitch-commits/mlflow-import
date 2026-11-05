@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.source.selection import (
+from mlflow_import.source.selection import (
     SelectionEvidence,
     SelectionFilters,
     SessionDiscoverySummary,
@@ -46,7 +46,7 @@ def summary() -> SessionDiscoverySummary:
 
 def test_selection_requires_every_supplied_filter(summary):
     filters = SelectionFilters(
-        from_time=datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc),
+        from_time=datetime(2026, 10, 21, 12, 0, tzinfo=UTC),
         directory=Path("/repo/project"),
         model="provider/model",
         min_user_turns=2,

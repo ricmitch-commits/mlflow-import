@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import pytest
 
-from opencode_mlflow.source.catalog import TIE_RANKS
-from opencode_mlflow.source.model import SessionHeader, SourceRecord, normalize_timestamp
-from opencode_mlflow.source.ordering import (
+from mlflow_import.source.catalog import TIE_RANKS
+from mlflow_import.source.model import SessionHeader, SourceRecord, normalize_timestamp
+from mlflow_import.source.ordering import (
     SOURCE_TYPE_RANKS,
     RecordOrderContext,
     record_sort_key,

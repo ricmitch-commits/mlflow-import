@@ -31,8 +31,8 @@ from dataclasses import replace
 
 import pytest
 
-from opencode_mlflow.content.canonical import CANONICAL_JSON_VERSION, canonical_json
-from opencode_mlflow.content.fingerprint import (
+from mlflow_import.content.canonical import CANONICAL_JSON_VERSION, canonical_json
+from mlflow_import.content.fingerprint import (
     IDENTITY_MAP_PENDING,
     EffectiveTurn,
     artifact_snapshot_fingerprint,
@@ -41,10 +41,10 @@ from opencode_mlflow.content.fingerprint import (
     session_context_fingerprint,
     source_fingerprint,
 )
-from opencode_mlflow.contracts import RedactionMode, Redactor
-from opencode_mlflow.source import replay as replay_module
-from opencode_mlflow.source.model import SessionHeader, SourceRecord, TimestampValue, normalize_timestamp
-from opencode_mlflow.source.replay import ReplayTurn
+from mlflow_import.contracts import RedactionMode, Redactor
+from mlflow_import.source import replay as replay_module
+from mlflow_import.source.model import SessionHeader, SourceRecord, TimestampValue, normalize_timestamp
+from mlflow_import.source.replay import ReplayTurn
 from tests.support.fake_redactor import IdentityRedactor, SecretMaskingRedactor
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
@@ -186,7 +186,7 @@ class TestEffectiveTurn:
         assert isinstance(_turn_pair()[0], ReplayTurn)
 
     def test_replay_turn_is_imported_never_redefined(self) -> None:
-        from opencode_mlflow.content import fingerprint
+        from mlflow_import.content import fingerprint
 
         assert fingerprint.ReplayTurn is replay_module.ReplayTurn
         assert "ReplayTurn" not in fingerprint.__all__
@@ -449,7 +449,7 @@ class TestArtifactSnapshotFingerprint:
         # White-box pin: Task 8's artifact writer must reproduce this hash
         # before inserting generated MLflow IDs, so the placeholder and its
         # position are part of the contract.
-        from opencode_mlflow.content.fingerprint import _iter_artifact_snapshot_chunks
+        from mlflow_import.content.fingerprint import _iter_artifact_snapshot_chunks
 
         chunks = list(_iter_artifact_snapshot_chunks(_turn_pair()[0], RedactionMode.VERBATIM))
 
@@ -457,7 +457,7 @@ class TestArtifactSnapshotFingerprint:
         assert chunks[-1] == canonical_json({"identity_map": IDENTITY_MAP_PENDING})
 
     def test_hashes_exactly_the_public_chunk_stream(self) -> None:
-        from opencode_mlflow.content.fingerprint import (
+        from mlflow_import.content.fingerprint import (
             _DOMAIN_ARTIFACT_SNAPSHOT,
             _hash_chunks,
             _iter_artifact_snapshot_chunks,
@@ -483,8 +483,8 @@ class TestArtifactSnapshotFingerprint:
         import io
         import json
 
-        from opencode_mlflow.content.artifacts import stream_turn_artifact
-        from opencode_mlflow.content.fingerprint import _DOMAIN_ARTIFACT_SNAPSHOT, _hash_chunks
+        from mlflow_import.content.artifacts import stream_turn_artifact
+        from mlflow_import.content.fingerprint import _DOMAIN_ARTIFACT_SNAPSHOT, _hash_chunks
 
         replay = _turn_pair()[0]
         buffer = io.BytesIO()

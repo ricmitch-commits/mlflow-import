@@ -13,7 +13,7 @@ fixture database, runs the REAL public pipeline (current adapter →
 normalized snapshot → replay adapter → logical-turn summaries →
 ``build_replay_turn``), and yields a :class:`SixTurnSession` holding the
 open snapshot, the six replay turns, and the
-:class:`~opencode_mlflow.mlflow.mapping.MappingContext` the mapping is
+:class:`~mlflow_import.mlflow.mapping.MappingContext` the mapping is
 exercised under. The factory is a context manager because the replay
 turns keep fresh cursors over the temporary snapshot; the pytest fixture
 wrapper lives in ``tests/conftest.py``.
@@ -41,16 +41,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from opencode_mlflow import __version__ as IMPORTER_VERSION
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.mlflow.mapping import MappingContext
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
-from opencode_mlflow.source.model import SourceRecord
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.snapshot import SourceSnapshot, create_normalized_snapshot
-from opencode_mlflow.source.turns import TurnSummary, build_replay_turn, iter_turn_summaries
+from mlflow_import import __version__ as IMPORTER_VERSION
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.mlflow.mapping import MappingContext
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
+from mlflow_import.source.model import SourceRecord
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.snapshot import SourceSnapshot, create_normalized_snapshot
+from mlflow_import.source.turns import TurnSummary, build_replay_turn, iter_turn_summaries
 from tests.support.fake_source import identity_redaction
 
 __all__ = [

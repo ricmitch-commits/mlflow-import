@@ -36,8 +36,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.snapshot import create_normalized_snapshot
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.snapshot import create_normalized_snapshot
 from tests.support.fake_source import FixtureExporter, identity_redaction
 from tests.support.sqlite_builder import build_wal_fixture_db
 

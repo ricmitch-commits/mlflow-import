@@ -118,7 +118,7 @@ def test_full_payload_trace_retrieval(profile_client):
         span_type="CHAIN",
         inputs={"session_id": "s-1"},
         attributes={"scope": "profile"},
-        tags={"opencode-mlflow": "payload-probe"},
+        tags={"mlflow-import": "payload-probe"},
         metadata={"probe": "1"},
         experiment_id=experiment_id,
         start_time_ns=start_ns,

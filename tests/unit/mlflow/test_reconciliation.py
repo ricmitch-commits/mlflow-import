@@ -30,18 +30,18 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.content.fingerprint import artifact_snapshot_fingerprint as calculate_artifact_snapshot_fingerprint
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.gateway import CreatedTrace, OwnedTrace, TraceChildRequest, TraceCreateRequest
-from opencode_mlflow.mlflow.mapping import (
+from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint as calculate_artifact_snapshot_fingerprint
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ItemImportError
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.gateway import CreatedTrace, OwnedTrace, TraceChildRequest, TraceCreateRequest
+from mlflow_import.mlflow.mapping import (
     ArtifactIdentityEnvelope,
     MappingContext,
     bind_mlflow_identity_map,
     map_turn_to_trace,
 )
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.mlflow.reconciliation import (
     ACTION_FAILED,
     ACTION_IMPORTED,
     ACTION_RETIRED,
@@ -57,15 +57,15 @@ from opencode_mlflow.mlflow.reconciliation import (
     plan_reconciliation,
     upload_artifact,
 )
-from opencode_mlflow.retry import RetryPolicy
-from opencode_mlflow.source.catalog import SCHEMA_CATALOG_VERSION
-from opencode_mlflow.source.discovery import (
+from mlflow_import.retry import RetryPolicy
+from mlflow_import.source.catalog import SCHEMA_CATALOG_VERSION
+from mlflow_import.source.discovery import (
     ARTIFACT_SCHEMA_VERSION,
     MAPPING_VERSION,
     DiscoveryTurnEntry,
     SessionScanEntry,
 )
-from opencode_mlflow.source.replay import ReplayTurn
+from mlflow_import.source.replay import ReplayTurn
 from tests.support.fake_gateway import FakeMlflowException, FakeMlflowGateway
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
@@ -162,7 +162,7 @@ def owned(
         render_fingerprint="9" * 64,
         operation_key="c" * 64,
         turn_index=1,
-        importer_marker="opencode-mlflow",
+        importer_marker="mlflow-import",
     )
 
 
@@ -299,9 +299,9 @@ def test_incomplete_owned_candidate_is_unexamined_and_never_stale_retired() -> N
     owned_preview = OwnedTrace(
         trace_id="trace-incomplete-owner",
         request_time_ms=1_000,
-        tags={"opencode.importer": "opencode-mlflow"},
+        tags={"opencode.importer": "mlflow-import"},
         metadata={
-            "opencode.importer": "opencode-mlflow",
+            "opencode.importer": "mlflow-import",
             "opencode.session_id": "session-gone",
             "opencode.turn_index": "1",
             "opencode.turn_key": _turn_key("removed-turn"),
@@ -329,7 +329,7 @@ def test_incomplete_owned_candidate_is_unexamined_and_never_stale_retired() -> N
         ("artifact_schema_version", ""),
         ("redaction_mode", "masked"),
         ("catalog_version", None),
-        ("importer_marker", "not-opencode-mlflow"),
+        ("importer_marker", "not-mlflow-import"),
     ],
 )
 def test_malformed_ownership_contract_is_unexamined_and_never_retired(field: str, value: object) -> None:
@@ -344,12 +344,12 @@ def test_malformed_ownership_contract_is_unexamined_and_never_retired(field: str
 
 def test_invalid_candidate_warning_metadata_is_generic_and_blocks_cleanup() -> None:
     metadata = {
-        "opencode.importer": "opencode-mlflow",
+        "opencode.importer": "mlflow-import",
         "opencode.session_id": "session-gone",
         "opencode.turn_index": "1",
         "opencode.turn_key": _turn_key("removed-turn"),
-        "opencode.source_fingerprint": "f" * 64,
-        "opencode.source_schema": "current",
+        "mlflow_import.source_fingerprint": "f" * 64,
+        "mlflow_import.source_schema": "current",
         "opencode.importer_version": "0.1.0",
         "opencode.mapping_version": MAPPING_VERSION,
         "opencode.artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -363,7 +363,7 @@ def test_invalid_candidate_warning_metadata_is_generic_and_blocks_cleanup() -> N
         OwnedTrace(
             trace_id="trace-warning-metadata",
             request_time_ms=1,
-            tags={"opencode.importer": "opencode-mlflow"},
+            tags={"opencode.importer": "mlflow-import"},
             metadata=metadata,
         ),
         "exp-1",
@@ -409,14 +409,14 @@ def test_overlong_warning_metadata_candidate_for_selected_turn_is_unexamined_con
         OwnedTrace(
             trace_id="trace-overlong-warning",
             request_time_ms=1,
-            tags={"opencode.importer": "opencode-mlflow"},
+            tags={"opencode.importer": "mlflow-import"},
             metadata={
-                "opencode.importer": "opencode-mlflow",
+                "opencode.importer": "mlflow-import",
                 "opencode.session_id": "session-warning",
                 "opencode.turn_index": "1",
                 "opencode.turn_key": turn.turn_key,
-                "opencode.source_fingerprint": "f" * 64,
-                "opencode.source_schema": "current",
+                "mlflow_import.source_fingerprint": "f" * 64,
+                "mlflow_import.source_schema": "current",
                 "opencode.importer_version": "test",
                 "opencode.mapping_version": MAPPING_VERSION,
                 "opencode.artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -540,16 +540,16 @@ def _request(
         root_attributes={"opencode.session_id": session_id},
         root_tags={
             ARTIFACT_PATH_TAG: (
-                f"opencode-mlflow/v1/sessions/{session_id}/turns/{key}/{render_fingerprint}-{snapshot_fingerprint}.json"
+                f"mlflow-import/v1/sessions/{session_id}/turns/{key}/{render_fingerprint}-{snapshot_fingerprint}.json"
             )
         },
         metadata={
-            "opencode.importer": "opencode-mlflow",
+            "opencode.importer": "mlflow-import",
             "opencode.session_id": session_id,
             "opencode.turn_index": "1",
             "opencode.turn_key": key,
-            "opencode.source_fingerprint": source_fingerprint,
-            "opencode.source_schema": source_schema,
+            "mlflow_import.source_fingerprint": source_fingerprint,
+            "mlflow_import.source_schema": source_schema,
             "opencode.importer_version": "test",
             "opencode.mapping_version": MAPPING_VERSION,
             "opencode.artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -564,7 +564,7 @@ def _request(
         expected_operation_key=operation_key,
         artifact_snapshot_fingerprint=snapshot_fingerprint,
         artifact_relative_path=(
-            f"opencode-mlflow/v1/sessions/{session_id}/turns/{key}/{render_fingerprint}-{snapshot_fingerprint}.json"
+            f"mlflow-import/v1/sessions/{session_id}/turns/{key}/{render_fingerprint}-{snapshot_fingerprint}.json"
         ),
         root_status="OK",
     )
@@ -649,7 +649,7 @@ class _ScriptedRun:
         self, turn: ReplayTurn, created: CreatedTrace, artifact_relative_path: str, redaction_mode: RedactionMode
     ):
         self.uploads.append((created.trace_id, artifact_relative_path))
-        with tempfile.TemporaryDirectory(prefix="opencode-mlflow-test-upload-") as directory:
+        with tempfile.TemporaryDirectory(prefix="mlflow-import-test-upload-") as directory:
             staged = Path(directory) / "artifact.json"
             staged.write_bytes(self.upload_payload)
             return self.gateway.upload_named_json(created.trace_id, artifact_relative_path, staged)
@@ -749,7 +749,7 @@ def test_apply_preserves_selected_malformed_candidate_without_duplicate_create(
     second_candidate, second_created = _previous_import(fake_gateway, turn, second_request)
 
     invalid_metadata = dict(first_request.metadata)
-    del invalid_metadata["opencode.source_fingerprint"]
+    del invalid_metadata["mlflow_import.source_fingerprint"]
     invalid_request = replace(first_request, metadata=invalid_metadata)
     requests = iter((invalid_request, second_request, second_request))
     run = _ScriptedRun(fake_gateway, turn, lambda: next(requests))
@@ -925,7 +925,7 @@ def test_apply_verifies_every_candidate_before_any_winner_or_create(fake_gateway
     )
 
     def upload(turn: ReplayTurn, created: CreatedTrace, path: str, mode: RedactionMode):
-        with tempfile.TemporaryDirectory(prefix="opencode-mlflow-test-upload-") as directory:
+        with tempfile.TemporaryDirectory(prefix="mlflow-import-test-upload-") as directory:
             staged = Path(directory) / "artifact.json"
             staged.write_bytes(b'{"synthetic": "artifact"}')
             return fake_gateway.upload_named_json(created.trace_id, path, staged)
@@ -1025,8 +1025,8 @@ def test_crash_leftover_without_artifact_is_replaced_and_retired(fake_gateway: F
         turn_key=request.metadata["opencode.turn_key"],
         request_time_ms=1_000,
         experiment_id=request.experiment_id,
-        source_fingerprint=request.metadata["opencode.source_fingerprint"],
-        source_schema=request.metadata["opencode.source_schema"],
+        source_fingerprint=request.metadata["mlflow_import.source_fingerprint"],
+        source_schema=request.metadata["mlflow_import.source_schema"],
         importer_version=request.metadata["opencode.importer_version"],
         mapping_version=request.metadata["opencode.mapping_version"],
         artifact_schema_version=request.metadata.get("opencode.artifact_schema_version"),
@@ -1364,7 +1364,7 @@ def test_redundant_cleanup_failure_keeps_winner_and_reports_affected_ids(fake_ga
 
 
 def test_verify_all_retains_contracts_not_replay_or_root_payloads(fake_gateway):
-    from opencode_mlflow.mlflow.reconciliation import _verify_all_candidates
+    from mlflow_import.mlflow.reconciliation import _verify_all_candidates
 
     turn = _replay_turn()
     candidate, _created = _previous_import(fake_gateway, turn, _request())
@@ -1398,7 +1398,7 @@ def test_remapped_contract_mismatch_fails_before_mutation(fake_gateway):
 
 @pytest.mark.parametrize("rollback_fails", [False, True])
 def test_known_partial_create_is_rolled_back_without_touching_old(fake_gateway, rollback_fails):
-    from opencode_mlflow.errors import PartialTraceCreateError
+    from mlflow_import.errors import PartialTraceCreateError
 
     turn = _replay_turn()
     old, old_created = _previous_import(fake_gateway, turn, _request(source_fingerprint="old" + "0" * 61))
@@ -1507,7 +1507,7 @@ def test_malformed_contract_on_final_candidate_fetch_is_a_conflict_without_repla
     plan = plan_reconciliation(scans, turns, [candidate])
     stored = fake_gateway.stored_trace(created.trace_id)
     assert stored is not None
-    stored.metadata["opencode.source_fingerprint"] = "malformed"
+    stored.metadata["mlflow_import.source_fingerprint"] = "malformed"
     marker = len(fake_gateway.mutations)
 
     apply_reconciliation(plan, fake_gateway, run.dependencies(), _IMMEDIATE_POLICY)
@@ -1940,7 +1940,7 @@ def test_ownership_metadata_keys_match_the_real_mapper() -> None:
     assert contract.session_id == turn.session_header.session_id
     assert contract.turn_key == turn.summary.turn_key
     assert contract.source_schema == "current"
-    assert contract.source_fingerprint == request.metadata["opencode.source_fingerprint"]
+    assert contract.source_fingerprint == request.metadata["mlflow_import.source_fingerprint"]
     assert contract.render_fingerprint == request.metadata["opencode.render_fingerprint"]
     assert contract.operation_key == request.expected_operation_key
 
@@ -1958,7 +1958,7 @@ def test_created_identity_map_matches_the_mapper_artifact_section() -> None:
         turn_key=_turn_key("turn-1"),
         render_fingerprint="b" * 64,
         snapshot_fingerprint="d" * 64,
-        artifact_relative_path="opencode-mlflow/v1/sessions/ses-1/turns/x/b-d.json",
+        artifact_relative_path="mlflow-import/v1/sessions/ses-1/turns/x/b-d.json",
     )
     bound = bind_mlflow_identity_map(envelope, "tr-1", {"msg-1": "span-2", "msg-2": "span-3"})
 
@@ -2001,7 +2001,7 @@ def test_default_upload_artifact_rejects_a_divergent_upload_result(
     created = fake_gateway.create_trace(request)
 
     def lying_upload(trace_id: str, relative_path: str, local_file: Path, chunk_size: int = 8 * 1024 * 1024):
-        from opencode_mlflow.mlflow.gateway import ArtifactVerification
+        from mlflow_import.mlflow.gateway import ArtifactVerification
 
         return ArtifactVerification(trace_id=trace_id, relative_path=relative_path, sha256="0" * 64, size=1)
 

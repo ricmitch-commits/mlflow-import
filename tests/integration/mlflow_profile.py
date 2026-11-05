@@ -1,4 +1,4 @@
-"""Pinned MLflow compatibility profile for the opencode-mlflow importer.
+"""Pinned MLflow compatibility profile for the mlflow-import importer.
 
 This is a library module (not a test). It records the exact public MLflow
 surface the importer's writer will rely on and verifies — behaviorally, against
@@ -50,7 +50,7 @@ from mlflow.entities.span import NO_OP_SPAN_TRACE_ID
 from mlflow.exceptions import MlflowException
 from mlflow.utils.mlflow_tags import MLFLOW_ARTIFACT_LOCATION
 
-from opencode_mlflow.mlflow.capabilities import attest_server_version
+from mlflow_import.mlflow.capabilities import attest_server_version
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
@@ -273,7 +273,7 @@ def upload_named_json(
     source = Path(local_file)
     digest = hashlib.sha256()
     size = 0
-    with TemporaryDirectory(prefix="opencode-mlflow-upload-") as tmp:
+    with TemporaryDirectory(prefix="mlflow-import-upload-") as tmp:
         staged = Path(tmp) / rel.name
         with source.open("rb") as src, staged.open("wb") as dst:
             while chunk := src.read(chunk_size):
@@ -303,7 +303,7 @@ def verify_named_json(
     repo = _trace_artifact_repo(client, trace_id)
     digest = hashlib.sha256()
     seen = 0
-    with TemporaryDirectory(prefix="opencode-mlflow-verify-") as tmp:
+    with TemporaryDirectory(prefix="mlflow-import-verify-") as tmp:
         downloaded = Path(repo.download_artifacts(str(rel), tmp))
         with downloaded.open("rb") as f:
             while chunk := f.read(DEFAULT_CHUNK_SIZE):
@@ -405,11 +405,11 @@ def _step_spans(state: _ProbeState, verified: set[str], errors: list[str]) -> No
         return
     with _proof(errors, "mlflow.start_span_no_context"):
         state.root = mlflow.start_span_no_context(
-            name="opencode-mlflow-profile-root",
+            name="mlflow-import-profile-root",
             span_type="CHAIN",
-            inputs={"session_id": "opencode-mlflow-profile"},
+            inputs={"session_id": "mlflow-import-profile"},
             attributes={"probe": "profile"},
-            tags={"opencode-mlflow.profile": "probe"},
+            tags={"mlflow-import.profile": "probe"},
             metadata={"probe": "1"},
             experiment_id=state.experiment_id,
             start_time_ns=_PROBE_START_NS,
@@ -420,7 +420,7 @@ def _step_spans(state: _ProbeState, verified: set[str], errors: list[str]) -> No
             "likely rerouted span export away from the tracking server",
         )
         child = mlflow.start_span_no_context(
-            name="opencode-mlflow-profile-child",
+            name="mlflow-import-profile-child",
             span_type="LLM",
             parent_span=state.root,
             start_time_ns=_PROBE_START_NS + 10_000_000,
@@ -448,11 +448,11 @@ def _step_retrieval(state: _ProbeState, verified: set[str], errors: list[str]) -
     with _proof(errors, "get_trace"):
         trace = state.client.get_trace(state.root.trace_id, display=False, flush=True)
         spans = {span.name: span for span in trace.data.spans}
-        root_span = spans["opencode-mlflow-profile-root"]
+        root_span = spans["mlflow-import-profile-root"]
         _require(trace.info.trace_id == state.root.trace_id, "get_trace returned a different trace")
         _require(trace.info.state.value == "OK", f"trace state is {trace.info.state!r}, expected OK")
         _require(
-            root_span.inputs == {"session_id": "opencode-mlflow-profile"},
+            root_span.inputs == {"session_id": "mlflow-import-profile"},
             "span inputs did not round-trip exactly",
         )
         _require(
@@ -475,7 +475,7 @@ def _step_search(state: _ProbeState, verified: set[str], errors: list[str]) -> N
     with _proof(errors, "search_traces"):
         for index in range(2):
             span = mlflow.start_span_no_context(
-                name=f"opencode-mlflow-profile-page-{index}",
+                name=f"mlflow-import-profile-page-{index}",
                 span_type="CHAIN",
                 experiment_id=state.experiment_id,
             )
@@ -508,7 +508,7 @@ def _step_search(state: _ProbeState, verified: set[str], errors: list[str]) -> N
         _require(set(state.trace_ids) <= seen, "pagination did not cover every probe trace")
         filtered = state.client.search_traces(
             locations=[state.experiment_id],
-            filter_string="tags.`mlflow.traceName` = 'opencode-mlflow-profile-root'",
+            filter_string="tags.`mlflow.traceName` = 'mlflow-import-profile-root'",
             include_spans=False,
         )
         _require(
@@ -522,14 +522,14 @@ def _step_tag_update(state: _ProbeState, verified: set[str], errors: list[str]) 
     if state.root is None:
         return
     with _proof(errors, "set_trace_tag"):
-        state.client.set_trace_tag(state.root.trace_id, "opencode_mlflow_probe", "set")
+        state.client.set_trace_tag(state.root.trace_id, "mlflow_import_probe", "set")
         tags = state.client.get_trace(state.root.trace_id, display=False).info.tags
-        _require(tags.get("opencode_mlflow_probe") == "set", "set_trace_tag did not persist")
+        _require(tags.get("mlflow_import_probe") == "set", "set_trace_tag did not persist")
         verified.add("set_trace_tag")
     with _proof(errors, "delete_trace_tag"):
-        state.client.delete_trace_tag(state.root.trace_id, "opencode_mlflow_probe")
+        state.client.delete_trace_tag(state.root.trace_id, "mlflow_import_probe")
         tags = state.client.get_trace(state.root.trace_id, display=False).info.tags
-        _require("opencode_mlflow_probe" not in tags, "delete_trace_tag did not remove the tag")
+        _require("mlflow_import_probe" not in tags, "delete_trace_tag did not remove the tag")
         verified.add("delete_trace_tag")
 
 
@@ -538,7 +538,7 @@ def _step_named_artifacts(state: _ProbeState, verified: set[str], errors: list[s
         return
     with _proof(errors, "upload_named_json"):
         payload = {"probe": "named-artifact", "rows": list(range(256))}
-        with TemporaryDirectory(prefix="opencode-mlflow-profile-upload-") as tmp:
+        with TemporaryDirectory(prefix="mlflow-import-profile-upload-") as tmp:
             local = Path(tmp) / "profile-probe.json"
             local.write_bytes(json.dumps(payload, separators=(",", ":")).encode())
             state.upload = upload_named_json(
@@ -643,7 +643,7 @@ def _verify_live(client: MlflowClient, profile: MlflowProfile) -> CapabilityRepo
         )
     state = _ProbeState(
         client=client,
-        probe_experiment_name=f"opencode-mlflow-profile-probe-{int(time.time() * 1000)}",
+        probe_experiment_name=f"mlflow-import-profile-probe-{int(time.time() * 1000)}",
         inline_blob="x" * MAX_INLINE_PAYLOAD_BYTES,
     )
     with _isolated_tracing_env(client):
@@ -706,16 +706,16 @@ def _verify_dry_run(client: MlflowClient, profile: MlflowProfile) -> CapabilityR
         # mutation) so read-only discovery observes everything already written.
         mlflow.flush_trace_async_logging()
         try:
-            found = client.get_experiment_by_name("opencode-mlflow-dry-run-probe")
+            found = client.get_experiment_by_name("mlflow-import-dry-run-probe")
             _require(
                 found is None,
-                "experiment 'opencode-mlflow-dry-run-probe' unexpectedly exists on the target",
+                "experiment 'mlflow-import-dry-run-probe' unexpectedly exists on the target",
             )
         except Exception as exc:  # noqa: BLE001 - a failed probe is a report input
             errors.append(f"server reachability probe failed: {type(exc).__name__}: {exc}")
 
         try:
-            client.get_trace("tr-opencode-mlflow-dry-run-probe", display=False)
+            client.get_trace("tr-mlflow-import-dry-run-probe", display=False)
             errors.append("get_trace on an unknown trace id did not raise a protocol error")
         except MlflowException:
             pass  # a proper MLflow error response proves the trace protocol

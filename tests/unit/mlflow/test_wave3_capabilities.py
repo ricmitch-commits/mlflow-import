@@ -7,8 +7,8 @@ import json
 import mlflow
 import pytest
 
-import opencode_mlflow.mlflow.capabilities as capabilities_module
-from opencode_mlflow.mlflow.capabilities import (
+import mlflow_import.mlflow.capabilities as capabilities_module
+from mlflow_import.mlflow.capabilities import (
     MAX_VERSION_RESPONSE_BYTES,
     PINNED_MLFLOW_VERSION,
     CapabilityRequest,

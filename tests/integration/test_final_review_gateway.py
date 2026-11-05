@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from opencode_mlflow.mlflow.gateway import MlflowGateway, PublicTraceApi
+from mlflow_import.mlflow.gateway import MlflowGateway, PublicTraceApi
 from tests.integration.import_runner import run_real_import, turn_entries
 from tests.integration.server import unique_experiment_name
 from tests.support.import_fakes import build_current_source_db

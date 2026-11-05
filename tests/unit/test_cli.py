@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.cli import build_parser, main
-from opencode_mlflow.config import ImportConfig
+from mlflow_import.cli import build_parser, main
+from mlflow_import.config import ImportConfig
 from tests.support.import_fakes import FakeImportDependencies
 
 pytestmark = pytest.mark.unit
@@ -67,7 +67,7 @@ def test_main_reports_source_failure_through_the_real_dependencies(
 
     captured = capsys.readouterr()
     report = json.loads(captured.out)
-    assert report["schema_version"] == "opencode-mlflow.result.v1"
+    assert report["schema_version"] == "mlflow-import.result.v1"
     assert report["errors"][0]["code"] == "source_unavailable"
     # The failure report never echoes the source path.
     assert str(missing) not in captured.out
@@ -140,7 +140,7 @@ def test_build_parser_exposes_the_import_subcommand() -> None:
 
 def _run_entry_point(argv: list[str]) -> int:
     """Run the console-script entry point in a child process."""
-    program = "import sys; from opencode_mlflow.cli import main; sys.exit(main())"
+    program = "import sys; from mlflow_import.cli import main; sys.exit(main())"
     completed = subprocess.run(
         [sys.executable, "-c", program, *argv],
         check=False,
@@ -182,7 +182,7 @@ def test_main_runs_the_import_with_injected_dependencies(
     captured = capsys.readouterr()
     assert captured.err == ""
     report = json.loads(captured.out)
-    assert report["schema_version"] == "opencode-mlflow.result.v1"
+    assert report["schema_version"] == "mlflow-import.result.v1"
     assert report["dry_run"] is False
     assert [turn["action"] for turn in report["sessions"][0]["turns"]] == ["imported", "imported"]
     assert import_dependencies.gateway.mutations
@@ -196,7 +196,7 @@ def test_main_writes_human_output_to_stdout(
 
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert "opencode-mlflow import complete" in captured.out
+    assert "mlflow-import import complete" in captured.out
     with pytest.raises(json.JSONDecodeError):
         json.loads(captured.out)
 

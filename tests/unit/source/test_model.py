@@ -10,8 +10,8 @@ from typing import get_args
 
 import pytest
 
-from opencode_mlflow.content.canonical import DuplicateKeyObject, canonical_json
-from opencode_mlflow.source.model import (
+from mlflow_import.content.canonical import DuplicateKeyObject, canonical_json
+from mlflow_import.source.model import (
     AdapterGeneration,
     SchemaDescription,
     SchemaGeneration,
@@ -24,9 +24,9 @@ from opencode_mlflow.source.model import (
     normalize_timestamp,
     source_database_fingerprint,
 )
-from opencode_mlflow.source.model_identity import extract_model_identity
-from opencode_mlflow.source.normalize import normalize_epoch_ms, unknown_json_field_warning
-from opencode_mlflow.source.selection import SelectionEvidence
+from mlflow_import.source.model_identity import extract_model_identity
+from mlflow_import.source.normalize import normalize_epoch_ms, unknown_json_field_warning
+from mlflow_import.source.selection import SelectionEvidence
 
 pytestmark = pytest.mark.unit
 

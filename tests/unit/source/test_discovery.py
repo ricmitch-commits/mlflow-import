@@ -25,20 +25,20 @@ from typing import IO, cast
 
 import pytest
 
-from opencode_mlflow import __version__ as importer_version
-from opencode_mlflow.content.fingerprint import (
+from mlflow_import import __version__ as importer_version
+from mlflow_import.content.fingerprint import (
     build_effective_turn,
     render_fingerprint,
     session_context_fingerprint,
     source_fingerprint,
 )
-from opencode_mlflow.content.redaction import DeterministicRedactor
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ImporterError, SourceCompatibilityError
-from opencode_mlflow.source import discovery as discovery_module
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.discovery import (
+from mlflow_import.content.redaction import DeterministicRedactor
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ImporterError, SourceCompatibilityError
+from mlflow_import.source import discovery as discovery_module
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.discovery import (
     ARTIFACT_SCHEMA_VERSION,
     DISCOVERY_PLAN_SCHEMA_VERSION,
     MAPPING_VERSION,
@@ -49,8 +49,8 @@ from opencode_mlflow.source.discovery import (
     discover_sessions,
     extract_model_identity,
 )
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import (
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import (
     AdapterGeneration,
     SchemaDescription,
     SessionHeader,
@@ -58,10 +58,10 @@ from opencode_mlflow.source.model import (
     TurnSummary,
     normalize_timestamp,
 )
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.selection import SelectionEvidenceEvaluator, SelectionFilters
-from opencode_mlflow.source.snapshot import SourceSnapshot, create_normalized_snapshot
-from opencode_mlflow.source.turns import NO_ASSISTANT_RESULT_OUTCOME, build_replay_turn, iter_turn_summaries
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.selection import SelectionEvidenceEvaluator, SelectionFilters
+from mlflow_import.source.snapshot import SourceSnapshot, create_normalized_snapshot
+from mlflow_import.source.turns import NO_ASSISTANT_RESULT_OUTCOME, build_replay_turn, iter_turn_summaries
 from tests.support.fake_redactor import IdentityRedactor
 from tests.support.fake_source import identity_redaction
 from tests.support.sqlite_builder import build_fixture_db
@@ -1044,7 +1044,7 @@ def test_reader_round_trips_a_discovery_plan(tmp_path: Path) -> None:
 
 def test_reader_rejects_unknown_plan_schema_versions(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.jsonl"
-    unknown_header = json.dumps({"kind": "plan_header", "plan_schema_version": "opencode-mlflow-discovery-plan-v99"})
+    unknown_header = json.dumps({"kind": "plan_header", "plan_schema_version": "mlflow-import-discovery-plan-v99"})
     _write_lines(plan_path, [unknown_header])
 
     with pytest.raises(ImporterError) as exc_info:

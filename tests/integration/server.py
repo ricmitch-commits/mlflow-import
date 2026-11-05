@@ -225,7 +225,7 @@ def live_mlflow_server() -> Iterator[LiveServer]:
         else:
             base = Path(tempfile.gettempdir()).resolve() / "opencode"
             base.mkdir(parents=True, exist_ok=True)
-            run_root = base / f"opencode-mlflow-integration-{uuid.uuid4().hex[:12]}"
+            run_root = base / f"mlflow-import-integration-{uuid.uuid4().hex[:12]}"
             run_root.mkdir()
             server, uri = _launch_disposable_server(run_root)
         mlflow.set_tracking_uri(uri)

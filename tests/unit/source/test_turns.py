@@ -28,24 +28,24 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.content.canonical import canonical_json
-from opencode_mlflow.content.fingerprint import (
+from mlflow_import.content.canonical import canonical_json
+from mlflow_import.content.fingerprint import (
     FramedDigest,
     build_effective_turn,
     canonical_record_value,
 )
-from opencode_mlflow.contracts import CanonicalRecordEnvelope
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import SessionHeader, SourceRecord, normalize_timestamp
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.snapshot import (
+from mlflow_import.contracts import CanonicalRecordEnvelope
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import SessionHeader, SourceRecord, normalize_timestamp
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.snapshot import (
     SourceExporter,
     SourceSnapshot,
     create_normalized_snapshot,
 )
-from opencode_mlflow.source.turns import (
+from mlflow_import.source.turns import (
     ASSISTANT_ERROR_OUTCOME,
     ASSISTANT_RESULT_OUTCOME,
     NO_ASSISTANT_RESULT_OUTCOME,

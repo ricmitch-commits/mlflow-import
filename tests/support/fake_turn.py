@@ -3,7 +3,7 @@
 Task 3's snapshot tests injected a fake ``SourceExporter`` because the
 real adapters did not exist yet; these tests inject a fake
 ``ReplayTurn`` satisfying the protocol that
-:mod:`opencode_mlflow.source.replay` owns, because the concrete
+:mod:`mlflow_import.source.replay` owns, because the concrete
 implementation (Task 5's ``build_replay_turn``) does not exist yet.
 
 Cursor semantics mirror the contract the concrete implementation must
@@ -22,7 +22,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from opencode_mlflow.source.model import (
+from mlflow_import.source.model import (
     SessionHeader,
     SourceRecord,
     TimestampValue,

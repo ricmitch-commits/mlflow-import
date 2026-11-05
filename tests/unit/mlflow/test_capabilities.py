@@ -1,6 +1,6 @@
 """Unit tests for the runtime MLflow capability probe.
 
-The runtime :func:`opencode_mlflow.mlflow.capabilities.probe_capabilities`
+The runtime :func:`mlflow_import.mlflow.capabilities.probe_capabilities`
 is strictly read-only in BOTH modes: it inspects client methods, server
 reachability/protocol responses, the recorded compatibility profile, the
 artifact composition, and reported payload limits — never creating a probe
@@ -17,15 +17,15 @@ from __future__ import annotations
 import mlflow
 import pytest
 
-from opencode_mlflow.errors import CapabilityError
-from opencode_mlflow.mlflow.capabilities import (
+from mlflow_import.errors import CapabilityError
+from mlflow_import.mlflow.capabilities import (
     PINNED_MAX_INLINE_PAYLOAD_BYTES,
     PINNED_MLFLOW_VERSION,
     PROBE_EXPERIMENT_NAME,
     CapabilityRequest,
     require_capabilities,
 )
-from opencode_mlflow.mlflow.capabilities import probe_capabilities as _production_probe_capabilities
+from mlflow_import.mlflow.capabilities import probe_capabilities as _production_probe_capabilities
 from tests.support.fake_gateway import FakeMlflowClient, FakeMlflowException
 
 pytestmark = pytest.mark.unit

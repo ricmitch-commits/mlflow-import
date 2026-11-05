@@ -3,28 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.config import (
+from mlflow_import.config import (
     ImportConfig,
     normalize_model_identity,
     normalize_path,
     parse_config,
     parse_timestamp,
 )
-from opencode_mlflow.errors import ConfigurationError
+from mlflow_import.errors import ConfigurationError
 
 pytestmark = pytest.mark.unit
 
 
 def test_parse_timestamp_requires_explicit_timezone():
-    from datetime import timezone
-    from opencode_mlflow.config import parse_timestamp
+    from mlflow_import.config import parse_timestamp
 
-    assert parse_timestamp("2026-10-21T12:00:00Z").tzinfo == timezone.utc
+    assert parse_timestamp("2026-10-21T12:00:00Z").tzinfo == UTC
     assert parse_timestamp("2026-10-21T08:00:00-04:00").isoformat() == "2026-10-21T12:00:00+00:00"
 
     with pytest.raises(ConfigurationError) as exc:
@@ -52,8 +51,8 @@ def test_parse_timestamp_rejects_values_without_an_explicit_offset(value: str) -
 def test_parse_timestamp_converts_explicit_offsets_to_utc() -> None:
     parsed = parse_timestamp("2026-10-21T08:00:00-04:00")
 
-    assert parsed.tzinfo == timezone.utc
-    assert parsed == datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
+    assert parsed.tzinfo == UTC
+    assert parsed == datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
 
 
 def test_parse_timestamp_preserves_the_exact_instant() -> None:
@@ -62,7 +61,7 @@ def test_parse_timestamp_preserves_the_exact_instant() -> None:
 
     assert z_form == offset_form
     assert z_form.microsecond == 123456
-    assert z_form.tzinfo == timezone.utc
+    assert z_form.tzinfo == UTC
 
 
 @pytest.mark.parametrize(
@@ -214,8 +213,8 @@ def test_parse_config_normalizes_every_option(restrictive_tmp_path: Path, monkey
     assert config.experiment_name == "exp"
     assert config.db_path == restrictive_tmp_path / "source" / "db.sqlite"
     assert config.tracking_uri == "http://localhost:5000"
-    assert config.from_time == datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
-    assert config.to_time == datetime(2026, 10, 21, 13, 0, tzinfo=timezone.utc)
+    assert config.from_time == datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
+    assert config.to_time == datetime(2026, 10, 21, 13, 0, tzinfo=UTC)
     assert config.directory == cwd / "work"
     assert config.model == "AntHropic/Claude-4"
     assert config.min_user_turns == 3

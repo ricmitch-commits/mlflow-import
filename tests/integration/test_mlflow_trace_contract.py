@@ -46,16 +46,16 @@ import pytest
 from mlflow import MlflowClient
 from mlflow.artifacts import get_artifact_repository
 
-from opencode_mlflow.content.artifacts import ArtifactProvenance, stream_turn_artifact
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.mlflow.gateway import (
+from mlflow_import.content.artifacts import ArtifactProvenance, stream_turn_artifact
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.mlflow.gateway import (
     RETRIEVED_SPAN_STATUS,
     TRACE_SESSION_METADATA_KEY,
     TRACE_STATE_FOR_ROOT_STATUS,
     TraceChildRequest,
     TraceCreateRequest,
 )
-from opencode_mlflow.source.replay import ReplayTurn
+from mlflow_import.source.replay import ReplayTurn
 from tests.fixtures.six_turn_session import (
     SESSION_ID,
     build_six_turn_source_db,
@@ -243,7 +243,7 @@ def test_one_trace_per_logical_turn(imported: ImportedSession, expected: Expecte
     seen_keys: set[str] = set()
     for trace in traces:
         metadata = trace.info.trace_metadata
-        assert metadata["opencode.importer"] == "opencode-mlflow"
+        assert metadata["opencode.importer"] == "mlflow-import"
         assert metadata["opencode.session_id"] == SESSION_ID
         turn_key = metadata["opencode.turn_key"]
         assert turn_key in expected_keys, turn_key
@@ -310,7 +310,7 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         root = _root_span(trace)
         spans_by_source = {
-            span.attributes["opencode.source_key"]: span for span in trace.data.spans if span.parent_id is not None
+            span.attributes["mlflow_import.source_key"]: span for span in trace.data.spans if span.parent_id is not None
         }
         span_ids = {span.span_id for span in trace.data.spans}
         assert set(spans_by_source) == {child.source_key for child in turn_children}
@@ -346,7 +346,7 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
     root = _root_span(trace)
     spans_by_source = {
-        span.attributes["opencode.source_key"]: span for span in trace.data.spans if span.parent_id is not None
+        span.attributes["mlflow_import.source_key"]: span for span in trace.data.spans if span.parent_id is not None
     }
     model_span = spans_by_source["session_message:msg-synthetic-a1"]
     tool_span = spans_by_source["session_message:msg-synthetic-a1#content-1"]
@@ -458,7 +458,7 @@ def _identity_map_from_trace(trace: Any) -> dict[str, str]:
     section: dict[str, str] = {"trace_id": trace.trace_id}
     for span in trace.data.spans:
         if span.parent_id is not None:
-            section[f"span:{span.attributes['opencode.source_key']}"] = span.span_id
+            section[f"span:{span.attributes['mlflow_import.source_key']}"] = span.span_id
     return section
 
 
@@ -482,7 +482,7 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
         repository = get_artifact_repository(
             trace.info.tags["mlflow.artifactLocation"], tracking_uri=imported.client.tracking_uri
         )
-        with TemporaryDirectory(prefix="opencode-mlflow-contract-") as dst:
+        with TemporaryDirectory(prefix="mlflow-import-contract-") as dst:
             downloaded = Path(repository.download_artifacts(recorded_path, dst))
             stored_bytes = downloaded.read_bytes()
         assert len(stored_bytes) == recorded_size
@@ -492,7 +492,7 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
         # the identity map recovered from the retrieved trace: the document
         # is a deterministic function of (turn, identity map), so the
         # re-streamed bytes must equal the stored bytes exactly.
-        with TemporaryDirectory(prefix="opencode-mlflow-restream-") as restream:
+        with TemporaryDirectory(prefix="mlflow-import-restream-") as restream:
             restaged = Path(restream) / "artifact.json"
             with restaged.open("wb") as handle:
                 manifest = stream_turn_artifact(

@@ -21,10 +21,10 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.content.redaction import DeterministicRedactor
-from opencode_mlflow.contracts import CanonicalRecordEnvelope, RedactionMode
-from opencode_mlflow.errors import SnapshotError, SourceCompatibilityError
-from opencode_mlflow.source.model import (
+from mlflow_import.content.redaction import DeterministicRedactor
+from mlflow_import.contracts import CanonicalRecordEnvelope, RedactionMode
+from mlflow_import.errors import SnapshotError, SourceCompatibilityError
+from mlflow_import.source.model import (
     SchemaDescription,
     SessionHeader,
     SourceRecord,
@@ -32,8 +32,8 @@ from opencode_mlflow.source.model import (
     normalize_timestamp,
     source_database_fingerprint,
 )
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.snapshot import (
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.snapshot import (
     ExportStats,
     SourceExporter,
     SourceSnapshot,
@@ -293,7 +293,7 @@ class TestSnapshotFailures:
             original_unlink(self, *args, **kwargs)
 
         def failing_rmdir(self: Path) -> None:
-            if self.name.startswith("opencode-mlflow-snapshot-"):
+            if self.name.startswith("mlflow-import-snapshot-"):
                 raise OSError("synthetic rmdir failure")
             original_rmdir(self)
 
@@ -359,7 +359,7 @@ class TestSnapshotFailures:
         original_rmdir = Path.rmdir
 
         def failing_rmdir(self: Path) -> None:
-            if self.name.startswith("opencode-mlflow-snapshot-"):
+            if self.name.startswith("mlflow-import-snapshot-"):
                 raise OSError("synthetic cleanup path failure")
             original_rmdir(self)
 
@@ -381,14 +381,14 @@ class TestSnapshotRedaction:
         source = _build_current_fixture(tmp_path)
         token_bytes = b"sk-abcdefghijklmnop"
         payload = {
-            "bytes_collision": {"__opencode_mlflow_bytes_b64__": base64.b64encode(token_bytes).decode("ascii")},
+            "bytes_collision": {"__mlflow_import_bytes_b64__": base64.b64encode(token_bytes).decode("ascii")},
             "duplicate_collision": {
-                "__opencode_mlflow_duplicate_keys__": {
+                "__mlflow_import_duplicate_keys__": {
                     "pairs": [["ordinary", "source-value"]],
                     "raw_text": "ordinary-source-value",
                 }
             },
-            "escape_collision": {"__opencode_mlflow_mapping__": [["ordinary", "source-value"]]},
+            "escape_collision": {"__mlflow_import_mapping__": [["ordinary", "source-value"]]},
         }
         scripted = _record("msg-tag-collisions", raw_json=None)
         scripted.canonical_record = CanonicalRecordEnvelope(

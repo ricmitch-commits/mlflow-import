@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.errors import SnapshotError
-from opencode_mlflow.source.connection import LiveReadOnlyConnection, open_live_connection
+from mlflow_import.errors import SnapshotError
+from mlflow_import.source.connection import LiveReadOnlyConnection, open_live_connection
 from tests.support.sqlite_builder import build_sqlite_db
 
 pytestmark = pytest.mark.unit

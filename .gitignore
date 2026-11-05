@@ -1,6 +1,3 @@
-# Virtual environments
-.venv/
-venv/
 
 # Python bytecode and tool caches
 __pycache__/
@@ -33,5 +30,7 @@ mlartifacts/
 *-wal
 *-shm
 
-# Session working files
-.superpowers/
+#agents
+.agents
+
+skills-lock.json

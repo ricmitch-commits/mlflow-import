@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.config import ImportConfig
+from mlflow_import.config import ImportConfig
 from tests.support.import_fakes import (
     DEFAULT_SESSION_CREATED_MS,
     UNIT_PROMPT_JSON,

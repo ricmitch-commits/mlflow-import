@@ -3,16 +3,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "opencode-mlflow"
+name = "mlflow-import"
 version = "0.1.0"
-description = "One-shot CLI that imports OpenCode SQLite sessions into MLflow as traces."
+description = "One-shot CLI that imports coding-agent sessions into MLflow as traces."
 requires-python = ">=3.11"
 dependencies = [
     "mlflow==3.17.2",
 ]
 
 [project.scripts]
-opencode-mlflow = "opencode_mlflow.cli:main"
+mlflow-import = "mlflow_import.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -51,19 +51,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["opencode_mlflow", "tests"]
-
-[tool.ruff.lint.per-file-ignores]
-# The scaffold smoke test body is kept byte-identical to the plan's Step 1
-# code, including its ungrouped in-function imports.
-"tests/unit/test_package_scaffold.py" = ["I001"]
-# The configuration test keeps the plan's Step 1 example test verbatim,
-# including its ungrouped in-function imports and its use of the
-# timezone.utc alias instead of datetime.UTC.
-"tests/unit/test_config.py" = ["I001", "UP017"]
-# The selection test keeps the plan's Step 1 example test verbatim,
-# including its use of the timezone.utc alias instead of datetime.UTC.
-"tests/unit/source/test_selection.py" = ["UP017"]
+known-first-party = ["mlflow_import", "tests"]
 
 [tool.mypy]
 python_version = "3.11"

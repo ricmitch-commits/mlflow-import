@@ -1,6 +1,6 @@
 """Unit tests for the legacy-generation live exporter.
 
-The tests drive :class:`~opencode_mlflow.source.legacy.LegacyAdapter`
+The tests drive :class:`~mlflow_import.source.legacy.LegacyAdapter`
 through the real snapshot driver (bind → inspect → export) over sanitized
 synthetic fixture databases, then assert on the normalized snapshot
 through the replay adapter. Identity and deduplication edge cases use
@@ -18,19 +18,19 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.content.canonical import DuplicateKeyObject
-from opencode_mlflow.source.catalog import LEGACY_CATALOG_V1, SCHEMA_CATALOG_VERSION, TIE_RANKS
-from opencode_mlflow.source.legacy import LegacyAdapter
-from opencode_mlflow.source.model import SchemaDescription
-from opencode_mlflow.source.normalize import canonical_row_digest, fallback_source_identity
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter
-from opencode_mlflow.source.snapshot import (
+from mlflow_import.content.canonical import DuplicateKeyObject
+from mlflow_import.source.catalog import LEGACY_CATALOG_V1, SCHEMA_CATALOG_VERSION, TIE_RANKS
+from mlflow_import.source.legacy import LegacyAdapter
+from mlflow_import.source.model import SchemaDescription
+from mlflow_import.source.normalize import canonical_row_digest, fallback_source_identity
+from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.snapshot import (
     SnapshotWriter,
     SourceExporter,
     SourceSnapshot,
     create_normalized_snapshot,
 )
-from opencode_mlflow.source.turns import ASSISTANT_ERROR_OUTCOME, iter_turn_summaries
+from mlflow_import.source.turns import ASSISTANT_ERROR_OUTCOME, iter_turn_summaries
 from tests.support.fake_source import identity_redaction
 from tests.support.sqlite_builder import fixture_script
 

@@ -5,7 +5,7 @@ Two groups of fakes live here:
 - **Fake public-client/LiveSpan-shaped objects** (`FakeMlflowClient`,
   `FakeTraceApi`, `FakeLiveSpan`, `FakeArtifactStore`): an in-memory stand-in
   for the real ``MlflowClient`` + module-level trace API + artifact
-  repository factory. The *real* :class:`opencode_mlflow.mlflow.gateway.MlflowGateway`
+  repository factory. The *real* :class:`mlflow_import.mlflow.gateway.MlflowGateway`
   is driven against these in unit and contract tests, so the production
   gateway's public call shapes (keyword names, pagination tokens, ownership
   filtering, the named-artifact composition) are exercised without a server.
@@ -18,7 +18,7 @@ Two groups of fakes live here:
   carries the ``mlflow.artifactLocation`` tag.
 
 - **`FakeMlflowGateway`**: a complete in-memory
-  :class:`opencode_mlflow.mlflow.gateway.MlflowGateway` stand-in for later
+  :class:`mlflow_import.mlflow.gateway.MlflowGateway` stand-in for later
   BDD tasks. It records an event/mutation history (every experiment create,
   trace create/end, tag set, artifact upload/verify, retirement) with enough
   state to verify payloads and ordering, and enforces the same
@@ -40,10 +40,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from opencode_mlflow.content.artifacts import ArtifactProvenance
-from opencode_mlflow.content.canonical import canonical_json
-from opencode_mlflow.errors import CapabilityError, ConfigurationError, ItemImportError
-from opencode_mlflow.mlflow.capabilities import (
+from mlflow_import.content.artifacts import ArtifactProvenance
+from mlflow_import.content.canonical import canonical_json
+from mlflow_import.errors import CapabilityError, ConfigurationError, ItemImportError
+from mlflow_import.mlflow.capabilities import (
     PINNED_MAX_INLINE_PAYLOAD_BYTES,
     PINNED_MLFLOW_VERSION,
     REQUIRED_METHODS,
@@ -51,7 +51,7 @@ from opencode_mlflow.mlflow.capabilities import (
     CapabilityRequest,
     attest_server_version,
 )
-from opencode_mlflow.mlflow.gateway import (
+from mlflow_import.mlflow.gateway import (
     DEFAULT_UPLOAD_CHUNK_BYTES,
     NO_OP_TRACE_ID,
     RETRIEVED_SPAN_STATUS,
@@ -73,7 +73,7 @@ from opencode_mlflow.mlflow.gateway import (
     # drift from production.
     _effective_root_status,
 )
-from opencode_mlflow.mlflow.reconciliation import (
+from mlflow_import.mlflow.reconciliation import (
     ARTIFACT_PATH_TAG,
     ARTIFACT_SHA256_TAG,
     ARTIFACT_SIZE_TAG,
@@ -92,8 +92,8 @@ from opencode_mlflow.mlflow.reconciliation import (
     _parse_turn_index,
     _parse_warning_metadata,
 )
-from opencode_mlflow.source.catalog import SCHEMA_CATALOG_VERSION
-from opencode_mlflow.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
+from mlflow_import.source.catalog import SCHEMA_CATALOG_VERSION
+from mlflow_import.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
 
 __all__ = [
     "FakeArtifactRepository",
@@ -812,7 +812,7 @@ def trace_spec(
     expected_operation_key: str = "0" * 64,
     artifact_snapshot_fingerprint: str = "1" * 64,
     artifact_relative_path: str = (
-        "opencode-mlflow/v1/sessions/ses-sample/turns/turn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+        "mlflow-import/v1/sessions/ses-sample/turns/turn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
         "111-222.json"
     ),
     root_status: str | None = None,
@@ -821,7 +821,7 @@ def trace_spec(
     """A complete trace-create request with importer-ownership defaults.
 
     ``owned=True`` seeds the exact ownership metadata the importer writes
-    (``opencode.importer = opencode-mlflow`` plus the session identity), so
+    (``opencode.importer = mlflow-import`` plus the session identity), so
     ``iter_owned_traces`` finds the created trace; pass ``owned=False`` to
     build an unowned trace for exclusion tests.
     """
@@ -829,12 +829,12 @@ def trace_spec(
         resolved_metadata = dict(metadata)
     elif owned:
         resolved_metadata = {
-            "opencode.importer": "opencode-mlflow",
+            "opencode.importer": "mlflow-import",
             "opencode.session_id": native_session_id,
             "opencode.turn_index": "1",
             "opencode.turn_key": "turn-" + "a" * 64,
-            "opencode.source_fingerprint": "a" * 64,
-            "opencode.source_schema": "current",
+            "mlflow_import.source_fingerprint": "a" * 64,
+            "mlflow_import.source_schema": "current",
             "opencode.importer_version": "0.1.0",
             "opencode.mapping_version": MAPPING_VERSION,
             "opencode.artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -848,8 +848,8 @@ def trace_spec(
     if owned:
         resolved_metadata.setdefault("opencode.turn_index", "1")
         resolved_metadata.setdefault("opencode.turn_key", "turn-" + "a" * 64)
-        resolved_metadata.setdefault("opencode.source_fingerprint", "a" * 64)
-        resolved_metadata.setdefault("opencode.source_schema", "current")
+        resolved_metadata.setdefault("mlflow_import.source_fingerprint", "a" * 64)
+        resolved_metadata.setdefault("mlflow_import.source_schema", "current")
         resolved_metadata.setdefault("opencode.importer_version", "0.1.0")
         resolved_metadata.setdefault("opencode.mapping_version", MAPPING_VERSION)
         resolved_metadata.setdefault("opencode.artifact_schema_version", ARTIFACT_SCHEMA_VERSION)
@@ -1067,7 +1067,7 @@ class FakeMlflowGateway:
     # -- trace lifecycle ---------------------------------------------------------
 
     def create_trace(self, spec: TraceCreateRequest) -> CreatedTrace:
-        from opencode_mlflow.mlflow.gateway import validate_required_metadata, validate_source_timing
+        from mlflow_import.mlflow.gateway import validate_required_metadata, validate_source_timing
 
         self._require_mutation_allowed()
         validate_required_metadata(spec)
@@ -1292,7 +1292,7 @@ class FakeMlflowGateway:
                     end_time_ns=None,
                     tags=tags,
                     metadata={
-                        "opencode.importer": candidate.importer_marker or "opencode-mlflow",
+                        "opencode.importer": candidate.importer_marker or "mlflow-import",
                         "opencode.session_id": candidate.session_id,
                         "opencode.turn_key": candidate.turn_key,
                         **(
@@ -1301,12 +1301,12 @@ class FakeMlflowGateway:
                             else {}
                         ),
                         **(
-                            {"opencode.source_fingerprint": candidate.source_fingerprint}
+                            {"mlflow_import.source_fingerprint": candidate.source_fingerprint}
                             if candidate.source_fingerprint is not None
                             else {}
                         ),
                         **(
-                            {"opencode.source_schema": candidate.source_schema}
+                            {"mlflow_import.source_schema": candidate.source_schema}
                             if candidate.source_schema is not None
                             else {}
                         ),
@@ -1602,8 +1602,8 @@ class FakeMlflowGateway:
     @staticmethod
     def _is_owned(trace: _StoredTrace) -> bool:
         return (
-            trace.metadata.get("opencode.importer") == "opencode-mlflow"
-            or trace.tags.get("opencode.importer") == "opencode-mlflow"
+            trace.metadata.get("opencode.importer") == "mlflow-import"
+            or trace.tags.get("opencode.importer") == "mlflow-import"
         )
 
     @staticmethod
@@ -1611,7 +1611,7 @@ class FakeMlflowGateway:
         values = [
             mapping["opencode.importer"] for mapping in (trace.metadata, trace.tags) if "opencode.importer" in mapping
         ]
-        return bool(values) and all(value == "opencode-mlflow" for value in values)
+        return bool(values) and all(value == "mlflow-import" for value in values)
 
     @staticmethod
     def _complete_retirement_metadata(
@@ -1623,8 +1623,8 @@ class FakeMlflowGateway:
             "opencode.session_id",
             "opencode.turn_index",
             "opencode.turn_key",
-            "opencode.source_fingerprint",
-            "opencode.source_schema",
+            "mlflow_import.source_fingerprint",
+            "mlflow_import.source_schema",
             "opencode.importer_version",
             "opencode.mapping_version",
             "opencode.artifact_schema_version",

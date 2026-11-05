@@ -33,9 +33,9 @@ from typing import Any, cast
 
 import pytest
 
-from opencode_mlflow.content import redaction as redaction_module
-from opencode_mlflow.content.canonical import DuplicateKeyObject
-from opencode_mlflow.content.redaction import (
+from mlflow_import.content import redaction as redaction_module
+from mlflow_import.content.canonical import DuplicateKeyObject
+from mlflow_import.content.redaction import (
     DETECTOR_CATEGORIES,
     REDACTED_BINARY_MARKER,
     REDACTED_MARKER,
@@ -45,9 +45,9 @@ from opencode_mlflow.content.redaction import (
     redact_text,
     redact_value,
 )
-from opencode_mlflow.contracts import RedactionMode, Redactor
-from opencode_mlflow.source.model import SourceRecord
-from opencode_mlflow.source.snapshot import PROTECTED_IDENTITY_FIELDS
+from mlflow_import.contracts import RedactionMode, Redactor
+from mlflow_import.source.model import SourceRecord
+from mlflow_import.source.snapshot import PROTECTED_IDENTITY_FIELDS
 
 pytestmark = pytest.mark.unit
 

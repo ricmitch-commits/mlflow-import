@@ -26,22 +26,22 @@ from typing import Any
 
 import pytest
 
-from opencode_mlflow.content.canonical import (
+from mlflow_import.content.canonical import (
     CANONICAL_JSON_VERSION,
     DuplicateKeyObject,
     canonical_json,
     canonical_record_envelope,
     canonical_stream,
 )
-from opencode_mlflow.contracts import (
+from mlflow_import.contracts import (
     CanonicalRecordEnvelope,
     RedactionMode,
     Redactor,
 )
-from opencode_mlflow.contracts import (
+from mlflow_import.contracts import (
     DuplicateKeyObject as SharedDuplicateKeyObject,
 )
-from opencode_mlflow.source.snapshot import PROTECTED_IDENTITY_FIELDS
+from mlflow_import.source.snapshot import PROTECTED_IDENTITY_FIELDS
 from tests.support.fake_redactor import IdentityRedactor, RecordingRedactor, SecretMaskingRedactor
 
 pytestmark = pytest.mark.unit
@@ -88,7 +88,7 @@ class TestContractSurface:
         assert CANONICAL_JSON_VERSION == "canonical-json-v1"
 
     def test_reexports_the_shared_contract_types(self) -> None:
-        from opencode_mlflow.content import canonical
+        from mlflow_import.content import canonical
 
         assert canonical.CanonicalRecordEnvelope is CanonicalRecordEnvelope
         assert canonical.DuplicateKeyObject is SharedDuplicateKeyObject
@@ -196,7 +196,7 @@ class TestArtifactSerialization:
     )
 
     def test_artifact_records_embed_golden_vector_bytes(self) -> None:
-        from opencode_mlflow.content.artifacts import stream_turn_artifact
+        from mlflow_import.content.artifacts import stream_turn_artifact
         from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
         vectors = {vector["name"]: vector for vector in VECTORS}
@@ -230,7 +230,7 @@ class TestArtifactSerialization:
             assert vectors[name]["expected"].encode("utf-8") in artifact_bytes
 
     def test_artifact_document_parses_as_valid_json(self) -> None:
-        from opencode_mlflow.content.artifacts import stream_turn_artifact
+        from mlflow_import.content.artifacts import stream_turn_artifact
         from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
         record = fake_record(

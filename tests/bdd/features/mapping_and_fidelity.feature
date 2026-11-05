@@ -12,7 +12,7 @@ Feature: Turn-to-trace mapping and content fidelity
     And every spec carries the native session id "ses-synthetic-1"
     And the specs carry 6 distinct client request ids
     And every spec metadata records "opencode.session_id" as "ses-synthetic-1"
-    And every spec metadata records "opencode.importer" as "opencode-mlflow"
+    And every spec metadata records "opencode.importer" as "mlflow-import"
 
   Scenario: Root values follow the first prompt and the final result
     Given the synthetic six-turn session fixture

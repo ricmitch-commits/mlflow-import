@@ -1,6 +1,6 @@
 """Unit tests for the two-pass import orchestration.
 
-The tests drive :func:`opencode_mlflow.importer.run_import` through the
+The tests drive :func:`mlflow_import.importer.run_import` through the
 REAL source pipeline (fixture database → live read-only probe →
 registered exporter → normalized snapshot → replay adapter → discovery)
 with in-memory MLflow/lock fakes, asserting the binding phase order, the
@@ -22,21 +22,21 @@ from typing import Any
 
 import pytest
 
-import opencode_mlflow.importer as importer_module
-from opencode_mlflow.config import ImportConfig
-from opencode_mlflow.content.fingerprint import build_effective_turn, source_fingerprint
-from opencode_mlflow.contracts import IDENTITY_REDACTOR, RedactionMode
-from opencode_mlflow.errors import SourceCompatibilityError
-from opencode_mlflow.importer import exit_status, replay_turn, run_import
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.reconciliation import OwnedTraceCandidate
-from opencode_mlflow.reporting import render_human, render_json
-from opencode_mlflow.source.discovery import DiscoveryPlanReader, DiscoveryTurnEntry, discover_sessions
-from opencode_mlflow.source.probe import probe_schema
-from opencode_mlflow.source.registry import build_live_exporter
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.selection import SelectionEvidenceEvaluator, SelectionFilters
-from opencode_mlflow.source.snapshot import (
+import mlflow_import.importer as importer_module
+from mlflow_import.config import ImportConfig
+from mlflow_import.content.fingerprint import build_effective_turn, source_fingerprint
+from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
+from mlflow_import.errors import SourceCompatibilityError
+from mlflow_import.importer import exit_status, replay_turn, run_import
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.reconciliation import OwnedTraceCandidate
+from mlflow_import.reporting import render_human, render_json
+from mlflow_import.source.discovery import DiscoveryPlanReader, DiscoveryTurnEntry, discover_sessions
+from mlflow_import.source.probe import probe_schema
+from mlflow_import.source.registry import build_live_exporter
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.selection import SelectionEvidenceEvaluator, SelectionFilters
+from mlflow_import.source.snapshot import (
     RedactionCallback,
     SourceExporter,
     SourceSnapshot,
@@ -718,7 +718,7 @@ def test_dry_run_reports_selected_malformed_candidate_as_ownership_conflict(
     trace_id = first.report["sessions"][0]["turns"][0]["trace_id"]
     trace = dependencies.gateway.stored_trace(trace_id)
     assert trace is not None
-    trace.metadata["opencode.source_fingerprint"] = None
+    trace.metadata["mlflow_import.source_fingerprint"] = None
 
     result = run_import(replace(config, dry_run=True), dependencies)
 
@@ -1182,7 +1182,7 @@ def test_population_error_with_snapshot_cleanup_failure_reaches_report(
         original_unlink(self, *args, **kwargs)
 
     def failing_rmdir(self: Path) -> None:
-        if self.name.startswith("opencode-mlflow-snapshot-"):
+        if self.name.startswith("mlflow-import-snapshot-"):
             raise OSError("synthetic rmdir failure")
         original_rmdir(self)
 

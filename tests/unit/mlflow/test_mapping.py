@@ -22,11 +22,11 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.content.canonical import canonical_json
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.mlflow import mapping
-from opencode_mlflow.mlflow.mapping import (
+from mlflow_import.content.canonical import canonical_json
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ItemImportError
+from mlflow_import.mlflow import mapping
+from mlflow_import.mlflow.mapping import (
     EVENT_SPAN_TYPE,
     IMPORTER_IDENTITY,
     OUTCOME_EXPLICIT_FAILURE,
@@ -42,8 +42,8 @@ from opencode_mlflow.mlflow.mapping import (
     map_turn_to_trace,
     operation_key,
 )
-from opencode_mlflow.source.model import SessionHeader, SourceRecord, TurnSummary, normalize_timestamp
-from opencode_mlflow.source.turns import ASSISTANT_RESULT_OUTCOME, NO_ASSISTANT_RESULT_OUTCOME, iter_turn_summaries
+from mlflow_import.source.model import SessionHeader, SourceRecord, TurnSummary, normalize_timestamp
+from mlflow_import.source.turns import ASSISTANT_RESULT_OUTCOME, NO_ASSISTANT_RESULT_OUTCOME, iter_turn_summaries
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
 pytestmark = pytest.mark.unit
@@ -203,7 +203,7 @@ def test_importing_the_mapping_module_never_loads_mlflow() -> None:
         [
             sys.executable,
             "-c",
-            "import sys, opencode_mlflow.mlflow.mapping; sys.exit(0 if 'mlflow' not in sys.modules else 1)",
+            "import sys, mlflow_import.mlflow.mapping; sys.exit(0 if 'mlflow' not in sys.modules else 1)",
         ],
         capture_output=True,
         text=True,
@@ -218,7 +218,7 @@ def test_importing_the_mapping_module_never_loads_mlflow() -> None:
 
 
 def test_trace_spec_field_parity_with_the_create_request() -> None:
-    from opencode_mlflow.mlflow.gateway import TraceCreateRequest
+    from mlflow_import.mlflow.gateway import TraceCreateRequest
 
     assert {field.name for field in dataclass_fields(TraceSpec)} == {
         field.name for field in dataclass_fields(TraceCreateRequest)
@@ -226,7 +226,7 @@ def test_trace_spec_field_parity_with_the_create_request() -> None:
 
 
 def test_span_spec_field_parity_with_the_child_request() -> None:
-    from opencode_mlflow.mlflow.gateway import TraceChildRequest
+    from mlflow_import.mlflow.gateway import TraceChildRequest
 
     assert {field.name for field in dataclass_fields(SpanSpec)} == {
         field.name for field in dataclass_fields(TraceChildRequest)
@@ -234,7 +234,7 @@ def test_span_spec_field_parity_with_the_child_request() -> None:
 
 
 def test_event_spec_field_parity_with_the_child_request() -> None:
-    from opencode_mlflow.mlflow.gateway import TraceChildRequest
+    from mlflow_import.mlflow.gateway import TraceChildRequest
 
     assert {field.name for field in dataclass_fields(EventSpec)} | {"span_type"} == {
         field.name for field in dataclass_fields(TraceChildRequest)
@@ -243,7 +243,7 @@ def test_event_spec_field_parity_with_the_child_request() -> None:
 
 
 def test_specs_convert_to_real_gateway_requests() -> None:
-    from opencode_mlflow.mlflow.gateway import TraceChildRequest, TraceCreateRequest
+    from mlflow_import.mlflow.gateway import TraceChildRequest, TraceCreateRequest
 
     turn = _replay_turn(
         [
@@ -267,7 +267,7 @@ def test_specs_convert_to_real_gateway_requests() -> None:
 
 
 def test_event_spec_converts_with_the_event_span_type() -> None:
-    from opencode_mlflow.mlflow.gateway import TraceChildRequest
+    from mlflow_import.mlflow.gateway import TraceChildRequest
 
     event = EventSpec(
         source_key="msg-a1#content-0",
@@ -616,7 +616,7 @@ def test_all_explicit_failed_tool_statuses_map_to_error(status: str) -> None:
     spec = map_source_record(_part("msg-a1#content-1", "msg-a1", payload, ordinal=1), "msg-a1")
 
     assert spec.status == "ERROR"
-    assert spec.attributes["opencode.source_outcome"] == status
+    assert spec.attributes["mlflow_import.source_outcome"] == status
 
 
 def test_pending_tool_part_maps_to_an_unset_status_span() -> None:
@@ -662,7 +662,7 @@ def test_legacy_part_rows_map_as_content_parts() -> None:
     assert isinstance(spec, SpanSpec)
     assert spec.span_type != EVENT_SPAN_TYPE
     assert spec.inputs == payload
-    assert spec.attributes["opencode.source_table"] == "part"
+    assert spec.attributes["mlflow_import.source_table"] == "part"
 
 
 def test_lifecycle_record_maps_to_a_lifecycle_event() -> None:
@@ -685,7 +685,7 @@ def test_lifecycle_record_maps_to_a_lifecycle_event() -> None:
     assert isinstance(spec, EventSpec)
     assert spec.name == "lifecycle tool"
     assert spec.attributes["opencode.lifecycle_outcome"] == "admitted"
-    assert spec.attributes["opencode.source_table"] == "session_pending"
+    assert spec.attributes["mlflow_import.source_table"] == "session_pending"
     assert spec.start_time_ns == 1_772_000_012_000_000_000
 
 
@@ -858,7 +858,7 @@ def test_failed_opaque_record_maps_to_error_but_unknown_status_does_not() -> Non
     unknown_spec = map_source_record(unknown, None)
 
     assert failed_spec.status == "ERROR"
-    assert failed_spec.attributes["opencode.source_outcome"] == "failed"
+    assert failed_spec.attributes["mlflow_import.source_outcome"] == "failed"
     assert unknown_spec.status == "OK"
 
 
@@ -880,7 +880,7 @@ def test_failed_opaque_row_status_maps_to_error_from_retained_raw_columns() -> N
     spec = map_source_record(record, None)
 
     assert spec.status == "ERROR"
-    assert spec.attributes["opencode.source_outcome"] == "failed"
+    assert spec.attributes["mlflow_import.source_outcome"] == "failed"
 
 
 def test_children_preserve_source_identity_sequence_and_times() -> None:
@@ -899,7 +899,7 @@ def test_children_preserve_source_identity_sequence_and_times() -> None:
 
     assert [child.source_key for child in children] == ["session_message:msg-a1"]
     child = children[0]
-    assert child.attributes["opencode.source_id"] == "msg-a1"
+    assert child.attributes["mlflow_import.source_id"] == "msg-a1"
     assert child.attributes["opencode.sequence"] == 7
     assert child.attributes["opencode.sequence_domain"] == "session_message.seq"
     assert child.attributes["opencode.timestamp_ns"] == 1_772_000_020_000_000_000
@@ -1063,8 +1063,8 @@ def test_ownership_metadata_carries_exactly_the_namespaced_keys() -> None:
         "opencode.session_id",
         "opencode.turn_index",
         "opencode.turn_key",
-        "opencode.source_fingerprint",
-        "opencode.source_schema",
+        "mlflow_import.source_fingerprint",
+        "mlflow_import.source_schema",
         "opencode.importer_version",
         "opencode.mapping_version",
         "opencode.redaction_mode",
@@ -1072,18 +1072,18 @@ def test_ownership_metadata_carries_exactly_the_namespaced_keys() -> None:
         "opencode.operation_key",
     }
     assert required <= set(spec.metadata)
-    assert spec.metadata["opencode.importer"] == IMPORTER_IDENTITY == "opencode-mlflow"
+    assert spec.metadata["opencode.importer"] == IMPORTER_IDENTITY == "mlflow-import"
     assert spec.metadata["opencode.session_id"] == _SESSION_ID
     assert spec.metadata["opencode.turn_index"] == "1"
     assert spec.metadata["opencode.turn_key"] == _TURN_KEY
-    assert spec.metadata["opencode.source_schema"] == "current"
+    assert spec.metadata["mlflow_import.source_schema"] == "current"
     assert spec.metadata["opencode.importer_version"] == "0.1.0"
     assert spec.metadata["opencode.mapping_version"] == "mapping-v1"
     assert spec.metadata["opencode.redaction_mode"] == "verbatim"
-    assert spec.metadata["opencode.source_database_fingerprint"] == "synthetic-database-fingerprint"
+    assert spec.metadata["mlflow_import.source_database_fingerprint"] == "synthetic-database-fingerprint"
     assert spec.metadata["opencode.logical_turn_count"] == "3"
-    assert spec.metadata["opencode.source_message_count"] == "7"
-    assert spec.metadata["opencode.source_part_count"] == "5"
+    assert spec.metadata["mlflow_import.source_message_count"] == "7"
+    assert spec.metadata["mlflow_import.source_part_count"] == "5"
     assert spec.metadata["opencode.first_user_source_id"] == "msg-u1"
     assert spec.metadata["opencode.root_result_source_id"] == "msg-a1"
 
@@ -1188,7 +1188,7 @@ def test_root_attributes_carry_typed_aggregates() -> None:
     assert spec.root_attributes["opencode.tokens.cache_read"] == 40
     assert spec.root_attributes["opencode.record_count"] == 3
     assert spec.root_attributes["opencode.logical_turn_count"] == 3
-    assert spec.root_attributes["opencode.source_message_count"] == 7
+    assert spec.root_attributes["mlflow_import.source_message_count"] == 7
     assert "opencode.timing_estimated" not in spec.root_attributes
 
 
@@ -1200,7 +1200,7 @@ def test_root_attributes_carry_typed_aggregates() -> None:
 def test_operation_key_is_the_versioned_sha256_of_the_exact_tuple() -> None:
     render_fp = "a" * 64
     expected = hashlib.sha256(
-        "\0".join(("opencode-mlflow-operation-key-v1", _EXPERIMENT_ID, _SESSION_ID, _TURN_KEY, render_fp)).encode()
+        "\0".join(("mlflow-import-operation-key-v1", _EXPERIMENT_ID, _SESSION_ID, _TURN_KEY, render_fp)).encode()
     ).hexdigest()
 
     assert operation_key(_EXPERIMENT_ID, _SESSION_ID, _TURN_KEY, render_fp) == expected
@@ -1222,7 +1222,7 @@ def test_client_request_id_and_operation_key_metadata_are_the_operation_key() ->
 
 
 def test_fingerprints_match_the_task_4a_seams() -> None:
-    from opencode_mlflow.content.fingerprint import (
+    from mlflow_import.content.fingerprint import (
         artifact_snapshot_fingerprint,
         build_effective_turn,
         render_fingerprint,
@@ -1239,9 +1239,9 @@ def test_fingerprints_match_the_task_4a_seams() -> None:
     spec = map_turn_to_trace(turn, context)
     effective = build_effective_turn(turn, _IdentityRedactor(), context.redaction_mode)
 
-    assert spec.metadata["opencode.source_fingerprint"] == source_fingerprint(effective, context.redaction_mode)
+    assert spec.metadata["mlflow_import.source_fingerprint"] == source_fingerprint(effective, context.redaction_mode)
     render_fp = render_fingerprint(
-        spec.metadata["opencode.source_fingerprint"],
+        spec.metadata["mlflow_import.source_fingerprint"],
         context.artifact_schema_version,
         context.mapping_version,
         context.importer_version,
@@ -1261,11 +1261,11 @@ def test_artifact_relative_path_is_deterministic_and_namespaced() -> None:
     spec = map_turn_to_trace(turn, _context())
 
     expected = (
-        f"opencode-mlflow/v1/sessions/{_SESSION_ID}/turns/{_TURN_KEY}/"
+        f"mlflow-import/v1/sessions/{_SESSION_ID}/turns/{_TURN_KEY}/"
         f"{spec.metadata['opencode.render_fingerprint']}-{spec.artifact_snapshot_fingerprint}.json"
     )
     assert spec.artifact_relative_path == expected
-    assert spec.artifact_relative_path.startswith("opencode-mlflow/v1/")
+    assert spec.artifact_relative_path.startswith("mlflow-import/v1/")
 
 
 def test_mapping_is_deterministic_for_identical_turns() -> None:
@@ -1549,7 +1549,7 @@ def test_artifact_identity_map_keeps_same_source_id_distinct_across_tables() -> 
 
 
 def test_binding_generated_ids_never_changes_the_fingerprints() -> None:
-    from opencode_mlflow.content.fingerprint import (
+    from mlflow_import.content.fingerprint import (
         artifact_snapshot_fingerprint,
         build_effective_turn,
         source_fingerprint,
@@ -1701,10 +1701,10 @@ def test_six_turn_metadata_carries_session_and_database_identity(six_turn_sessio
     assert spec.metadata["opencode.agent"] == "synthetic-agent"
     assert spec.metadata["opencode.version"] == "synthetic-opencode-version"
     assert spec.metadata["opencode.model"] == "synthetic-provider/synthetic-model"
-    assert spec.metadata["opencode.source_database_fingerprint"] == six_turn_session.snapshot.fingerprint
+    assert spec.metadata["mlflow_import.source_database_fingerprint"] == six_turn_session.snapshot.fingerprint
     assert spec.metadata["opencode.logical_turn_count"] == "6"
-    assert spec.metadata["opencode.source_message_count"] == str(len(six_turn_session.message_records()))
-    assert spec.metadata["opencode.source_part_count"] == str(len(six_turn_session.part_records()))
+    assert spec.metadata["mlflow_import.source_message_count"] == str(len(six_turn_session.message_records()))
+    assert spec.metadata["mlflow_import.source_part_count"] == str(len(six_turn_session.part_records()))
 
 
 def test_six_turn_timing_comes_from_source_timestamps(six_turn_session) -> None:

@@ -15,7 +15,7 @@ Task 8 controller rulings:
   ``artifact_snapshot_fingerprint`` (the fixed ``identity_map_pending``
   placeholder) has fixed the hash and path;
 - relative paths are namespaced under
-  ``opencode-mlflow/v1/sessions/<encoded-session-id>/turns/<stable-turn-key>/``
+  ``mlflow-import/v1/sessions/<encoded-session-id>/turns/<stable-turn-key>/``
   with session IDs percent-encoded so path traversal is impossible;
 - writing streams through fixed-size upload chunks, temporary files are
   created atomically with mode ``0o600`` and deleted best-effort;
@@ -46,8 +46,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow import __version__ as importer_version
-from opencode_mlflow.content.artifacts import (
+from mlflow_import import __version__ as importer_version
+from mlflow_import.content.artifacts import (
     DEFAULT_INLINE_LIMIT_BYTES,
     DEFAULT_UPLOAD_CHUNK_BYTES,
     ArtifactManifest,
@@ -60,24 +60,24 @@ from opencode_mlflow.content.artifacts import (
     stream_turn_artifact,
     temporary_artifact_file,
 )
-from opencode_mlflow.content.canonical import DuplicateKeyObject, canonical_json
-from opencode_mlflow.content.fingerprint import (
+from mlflow_import.content.canonical import DuplicateKeyObject, canonical_json
+from mlflow_import.content.fingerprint import (
     artifact_snapshot_fingerprint,
     build_effective_turn,
     canonical_record_value,
     render_fingerprint,
     source_fingerprint,
 )
-from opencode_mlflow.content.redaction import DeterministicRedactor
-from opencode_mlflow.contracts import RedactionMode
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.source.catalog import CURRENT_CATALOG_V1
-from opencode_mlflow.source.current import CurrentAdapter
-from opencode_mlflow.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
-from opencode_mlflow.source.model import SessionHeader
-from opencode_mlflow.source.replay import NormalizedSnapshotAdapter, ReplayTurn
-from opencode_mlflow.source.snapshot import RedactionCallback, create_normalized_snapshot
-from opencode_mlflow.source.turns import BoundedRootValue, build_replay_turn, iter_turn_summaries
+from mlflow_import.content.redaction import DeterministicRedactor
+from mlflow_import.contracts import RedactionMode
+from mlflow_import.errors import ItemImportError
+from mlflow_import.source.catalog import CURRENT_CATALOG_V1
+from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
+from mlflow_import.source.model import SessionHeader
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
+from mlflow_import.source.snapshot import RedactionCallback, create_normalized_snapshot
+from mlflow_import.source.turns import BoundedRootValue, build_replay_turn, iter_turn_summaries
 from tests.support.fake_redactor import IdentityRedactor
 from tests.support.fake_source import identity_redaction
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
@@ -273,7 +273,7 @@ class TestArtifactRelativePath:
     def test_exact_namespaced_shape(self) -> None:
         path = artifact_relative_path("ses-1", TURN_KEY, RENDER_FP, SNAPSHOT_FP)
 
-        assert path == f"opencode-mlflow/v1/sessions/ses-1/turns/{TURN_KEY}/{RENDER_FP}-{SNAPSHOT_FP}.json"
+        assert path == f"mlflow-import/v1/sessions/ses-1/turns/{TURN_KEY}/{RENDER_FP}-{SNAPSHOT_FP}.json"
 
     def test_is_deterministic(self) -> None:
         first = artifact_relative_path("ses-1", TURN_KEY, RENDER_FP, SNAPSHOT_FP)
@@ -810,7 +810,7 @@ class TestPayloadLimits:
 
 class TestArtifactIntegrationWithFingerprints:
     def test_artifacts_module_never_imports_mlflow(self) -> None:
-        from opencode_mlflow.content import artifacts as artifacts_module
+        from mlflow_import.content import artifacts as artifacts_module
 
         source = Path(artifacts_module.__file__).read_text(encoding="utf-8")
 
@@ -837,6 +837,6 @@ class TestArtifactIntegrationWithFingerprints:
         path = artifact_relative_path("ses-1", TURN_KEY, render_fp, manifest.snapshot_fingerprint)
 
         assert path == (
-            f"opencode-mlflow/v1/sessions/ses-1/turns/{TURN_KEY}/{render_fp}-{manifest.snapshot_fingerprint}.json"
+            f"mlflow-import/v1/sessions/ses-1/turns/{TURN_KEY}/{render_fp}-{manifest.snapshot_fingerprint}.json"
         )
         assert Path(path).name.endswith(".json")

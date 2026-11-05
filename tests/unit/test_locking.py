@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.errors import ConfigurationError
-from opencode_mlflow.locking import (
+from mlflow_import.errors import ConfigurationError
+from mlflow_import.locking import (
     ImportLock,
     acquire_import_lock,
     lock_path,
@@ -173,7 +173,7 @@ def test_lock_root_defaults_to_restrictive_tempdir_subdirectory(
 
     root = resolve_lock_root()
 
-    assert root == tmp_path / "opencode-mlflow-import-locks"
+    assert root == tmp_path / "mlflow-import-import-locks"
     with acquire_import_lock("http://tracking.example.com", "team/opencode", root):
         assert stat_mode(root) == 0o700
         children = list(root.iterdir())

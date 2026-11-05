@@ -23,20 +23,20 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.errors import ItemImportError
-from opencode_mlflow.mlflow.capabilities import CapabilityRequest
-from opencode_mlflow.mlflow.gateway import (
+from mlflow_import.errors import ItemImportError
+from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.gateway import (
     OWNERSHIP_IMPORTER_VALUE,
     TraceChildRequest,
     TraceCreateRequest,
 )
-from opencode_mlflow.mlflow.mapping import (
+from mlflow_import.mlflow.mapping import (
     IMPORTER_IDENTITY,
     TraceSpec,
     bind_mlflow_identity_map,
     map_turn_to_trace,
 )
-from opencode_mlflow.source.turns import NO_ASSISTANT_RESULT_OUTCOME
+from mlflow_import.source.turns import NO_ASSISTANT_RESULT_OUTCOME
 from tests.support.fake_gateway import FakeMlflowGateway
 from tests.support.fake_turn import FakeReplayTurn, fake_header, fake_record, fake_summary
 
@@ -96,7 +96,7 @@ def test_trace_spec_fields_exactly_match_the_create_request() -> None:
 
 
 def test_span_spec_fields_exactly_match_the_child_request() -> None:
-    from opencode_mlflow.mlflow.mapping import SpanSpec
+    from mlflow_import.mlflow.mapping import SpanSpec
 
     assert {field.name for field in dataclass_fields(SpanSpec)} == {
         field.name for field in dataclass_fields(TraceChildRequest)

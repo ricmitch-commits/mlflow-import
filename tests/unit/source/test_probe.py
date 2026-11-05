@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from opencode_mlflow.errors import SourceCompatibilityError
-from opencode_mlflow.source.catalog import OPENCODE_SCHEMA_CATALOG_V1, SCHEMA_CATALOG_VERSION
-from opencode_mlflow.source.model import SchemaDescription
-from opencode_mlflow.source.probe import probe_schema
+from mlflow_import.errors import SourceCompatibilityError
+from mlflow_import.source.catalog import OPENCODE_SCHEMA_CATALOG_V1, SCHEMA_CATALOG_VERSION
+from mlflow_import.source.model import SchemaDescription
+from mlflow_import.source.probe import probe_schema
 from tests.support.sqlite_builder import build_fixture_db
 
 pytestmark = pytest.mark.unit
