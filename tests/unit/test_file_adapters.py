@@ -2,6 +2,7 @@ import json
 
 from mlflow_import.source.file_snapshot import create_file_snapshot
 from mlflow_import.source.replay import NormalizedSnapshotAdapter
+from mlflow_import.source.turns import iter_turn_summaries
 from mlflow_import.sources.claude import detect as detect_claude
 from mlflow_import.sources.claude import exporter as claude_exporter
 from mlflow_import.sources.codex import detect as detect_codex
@@ -34,6 +35,83 @@ def test_claude_jsonl_freezes_into_shared_replay_contract(tmp_path):
         assert header is not None
         records = list(adapter.iter_records("claude-1"))
         assert [record.source_id for record in records] == ["u1", "a1"]
+
+
+def test_claude_message_envelopes_produce_logical_turns(tmp_path):
+    source = tmp_path / "projects" / "demo" / "session.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            json.dumps(value)
+            for value in (
+                {"type": "mode", "sessionId": "claude-1", "mode": "normal"},
+                {
+                    "sessionId": "claude-1",
+                    "uuid": "u1",
+                    "type": "user",
+                    "message": {"role": "user", "content": "hello"},
+                    "timestamp": "2025-01-01T00:00:00Z",
+                },
+                {
+                    "sessionId": "claude-1",
+                    "uuid": "a1",
+                    "parentUuid": "u1",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": []},
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with create_file_snapshot(source, tmp_path, claude_exporter(source), _identity) as snapshot:
+        adapter = NormalizedSnapshotAdapter(snapshot)
+        (summary,) = iter_turn_summaries(adapter.iter_records("claude-1"))
+        assert summary.first_user_source_id == "u1"
+        assert summary.assistant_record_count == 1
+
+
+def test_claude_tool_result_envelope_does_not_start_a_second_turn(tmp_path):
+    source = tmp_path / "projects" / "demo" / "session.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            json.dumps(value)
+            for value in (
+                {"sessionId": "claude-1", "uuid": "u1", "type": "user", "message": {"role": "user", "content": "run"}},
+                {
+                    "sessionId": "claude-1",
+                    "uuid": "a1",
+                    "parentUuid": "u1",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": []},
+                },
+                {
+                    "sessionId": "claude-1",
+                    "uuid": "tool-result",
+                    "parentUuid": "a1",
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+                },
+                {
+                    "sessionId": "claude-1",
+                    "uuid": "a2",
+                    "parentUuid": "tool-result",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": []},
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with create_file_snapshot(source, tmp_path, claude_exporter(source), _identity) as snapshot:
+        adapter = NormalizedSnapshotAdapter(snapshot)
+        summaries = list(iter_turn_summaries(adapter.iter_records("claude-1")))
+        assert len(summaries) == 1
+        assert summaries[0].record_count == 4
 
 
 def test_codex_rollout_detection_and_session_filter(tmp_path):

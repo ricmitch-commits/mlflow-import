@@ -860,6 +860,10 @@ class MlflowGateway:
                     status=root_status,
                     end_time_ns=spec.end_time_ns,
                 )
+                # MLflow's span exporter follows the process-global URI and
+                # may flush asynchronously after end_span returns. Drain it
+                # before restoring the caller's ambient URI.
+                mlflow.flush_trace_async_logging()
             except Exception as error:
                 # Preserve identity even if cleanup/end itself fails. Never
                 # substitute a local clock for the source-derived end instant.

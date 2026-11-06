@@ -61,7 +61,7 @@ SOURCE_TYPE_RANKS: Mapping[str, int] = TIE_RANKS
 - ``unknown_record`` (90): unrecognized permitted rows.
 """
 
-_MESSAGE_CONTAINER_TABLES = frozenset({"message", "session_message"})
+_MESSAGE_CONTAINER_TABLES = frozenset({"message", "session_message", "jsonl_message"})
 _LIFECYCLE_TABLES = frozenset({"session_pending", "session_inbox"})
 _SCOPED_TABLES = frozenset({"todo", "instruction_entry", "instruction_blob", "instruction_state"})
 
