@@ -186,9 +186,7 @@ def test_parse_config_discovers_claude_session_source(
     source.write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(restrictive_tmp_path))
 
-    config = parse_config(
-        ["import", "--experiment-name", "exp", "--harness", "claude", "--session", session_id]
-    )
+    config = parse_config(["import", "--experiment-name", "exp", "--harness", "claude", "--session", session_id])
 
     assert config.db_path == source
 
