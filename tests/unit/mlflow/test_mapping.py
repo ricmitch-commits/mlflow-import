@@ -1162,6 +1162,7 @@ def test_oversized_metadata_value_becomes_an_artifact_reference() -> None:
 def test_root_attributes_carry_typed_aggregates() -> None:
     header = fake_header(
         _SESSION_ID,
+        parent_id="ses_parent",
         cost=0.25,
         tokens_input=120,
         tokens_output=80,
@@ -1179,6 +1180,7 @@ def test_root_attributes_carry_typed_aggregates() -> None:
     spec = map_turn_to_trace(turn, _context())
 
     assert spec.root_attributes["opencode.session_id"] == _SESSION_ID
+    assert spec.root_attributes["opencode.parent_session_id"] == "ses_parent"
     assert spec.root_attributes["opencode.turn_index"] == 1
     assert spec.root_attributes["opencode.turn_key"] == _TURN_KEY
     assert spec.root_attributes["opencode.outcome"] == ASSISTANT_RESULT_OUTCOME
@@ -1190,6 +1192,18 @@ def test_root_attributes_carry_typed_aggregates() -> None:
     assert spec.root_attributes["opencode.logical_turn_count"] == 3
     assert spec.root_attributes["mlflow_import.source_message_count"] == 7
     assert "opencode.timing_estimated" not in spec.root_attributes
+
+
+def test_root_attributes_omit_absent_parent_session_id() -> None:
+    turn = _replay_turn(
+        [_message("msg-u1", "user", 1, _user_payload())],
+        root_input=_user_payload(),
+        root_output=None,
+    )
+
+    spec = map_turn_to_trace(turn, _context())
+
+    assert "opencode.parent_session_id" not in spec.root_attributes
 
 
 # ---------------------------------------------------------------------------

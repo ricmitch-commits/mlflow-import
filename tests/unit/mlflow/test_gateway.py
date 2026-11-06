@@ -1154,7 +1154,7 @@ _OWNERSHIP_METADATA = {
     "mlflow_import.source_schema": "current",
     "opencode.turn_index": "1",
     "opencode.importer_version": "0.1.0",
-    "opencode.mapping_version": "mapping-v3",
+    "opencode.mapping_version": "mapping-v4",
     "opencode.artifact_schema_version": "artifact-v2",
     "opencode.redaction_mode": "verbatim",
     "opencode.catalog_version": "opencode-schema-catalog-v1",

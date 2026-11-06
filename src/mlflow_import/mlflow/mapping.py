@@ -1463,6 +1463,8 @@ def _root_attributes(
         "opencode.turn_key": summary.turn_key,
         "opencode.outcome": outcome,
     }
+    if header.parent_id is not None:
+        attributes["opencode.parent_session_id"] = header.parent_id
     if context.catalog_version:
         attributes["opencode.catalog_version"] = context.catalog_version
     if timing_estimated:

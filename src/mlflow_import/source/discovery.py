@@ -119,7 +119,7 @@ DISCOVERY_PLAN_SCHEMA_VERSION = "mlflow-import-discovery-plan-v1"
 ARTIFACT_SCHEMA_VERSION = "artifact-v2"
 """Artifact schema version recorded as a render-contract input in the plan."""
 
-MAPPING_VERSION = "mapping-v3"
+MAPPING_VERSION = "mapping-v4"
 """Turn-to-trace mapping version recorded as a render-contract input in the plan."""
 
 PLANNED_ACTION_IMPORT = "import"
@@ -288,31 +288,51 @@ class _TurnSummarySpool:
         descriptor, path = tempfile.mkstemp(prefix=".turn-summaries-", suffix=".jsonl", dir=directory)
         os.chmod(path, 0o600)
         self._path = Path(path)
-        self._handle = os.fdopen(descriptor, "w+", encoding="utf-8", newline="\n")
+        self._handle: IO[str] | None = os.fdopen(descriptor, "w+", encoding="utf-8", newline="\n")
         self._closed = False
 
     def write(self, summary: TurnSummary) -> None:
-        if self._closed:
+        if self._closed or self._handle is None:
             raise ValueError("the turn-summary spool was already closed")
         self._handle.write(_dumps(_turn_summary_payload(summary)) + "\n")
 
     def __iter__(self) -> Iterator[TurnSummary]:
         if self._closed:
             raise ValueError("the turn-summary spool was already closed")
-        self._handle.flush()
-        self._handle.seek(0)
-        for line in self._handle:
-            payload = json.loads(line)
-            if not isinstance(payload, dict):  # pragma: no cover - only this module writes the spool
-                raise ValueError("the turn-summary spool contains a malformed entry")
-            yield _turn_summary_from_payload(payload)
+        if self._handle is not None:
+            self._handle.flush()
+            self._handle.seek(0)
+            handle = self._handle
+            close_after = False
+        else:
+            handle = self._path.open(encoding="utf-8")
+            close_after = True
+        try:
+            for line in handle:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):  # pragma: no cover - only this module writes the spool
+                    raise ValueError("the turn-summary spool contains a malformed entry")
+                yield _turn_summary_from_payload(payload)
+        finally:
+            if close_after:
+                handle.close()
+
+    def finish(self) -> None:
+        """Close the writer while retaining the spool for a later read."""
+        if self._closed:
+            raise ValueError("the turn-summary spool was already closed")
+        if self._handle is not None:
+            self._handle.flush()
+            self._handle.close()
+            self._handle = None
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
-            self._handle.close()
+            if self._handle is not None:
+                self._handle.close()
         finally:
             self._path.unlink(missing_ok=True)
 
@@ -656,15 +676,32 @@ def discover_sessions(
     adapter: SourceAdapter,
     filters: SelectionFilters,
     plan_path: Path,
+    requested_session_id: str | None = None,
+) -> DiscoveryStats:
+    """Discover sessions and always clean deferred summary spools."""
+    scanned: list[tuple[SessionHeader, _SessionScanOutcome]] = []
+    try:
+        return _discover_sessions(adapter, filters, plan_path, requested_session_id, scanned)
+    finally:
+        for _header, outcome in scanned:
+            if outcome.summary_spool is not None:
+                outcome.summary_spool.close()
+
+
+def _discover_sessions(
+    adapter: SourceAdapter,
+    filters: SelectionFilters,
+    plan_path: Path,
+    requested_session_id: str | None,
+    scanned: list[tuple[SessionHeader, _SessionScanOutcome]],
 ) -> DiscoveryStats:
     """Stream every compatible session into the sanitized plan at ``plan_path``.
 
     Sessions are consumed in the adapter's normalized order, asserting
-    monotonic ``(creation_time, session_id)`` keys while streaming (the
-    header list is never materialized merely to sort it). Every
-    compatible session gets one :class:`SessionScanEntry`; every
-    selected session additionally gets one :class:`DiscoveryTurnEntry`
-    per logical turn, fingerprinted through the Task 4A seam.
+    monotonic ``(creation_time, session_id)`` keys while streaming. Every
+    compatible session gets one :class:`SessionScanEntry`; after all direct
+    matches are known, ancestry expansion determines which scans and turns
+    are selected.
     Incompatible/unsupported sessions are reported through the returned
     stats, never as plan entries.
     """
@@ -692,20 +729,61 @@ def discover_sessions(
                 incompatible_session_count += 1
                 warning_count += 1
                 continue
-            outcome = _scan_session(
-                snapshot,
-                adapter,
-                header,
-                filters,
-                writer,
-                catalog_version,
-                schema_warnings,
-            )
+            try:
+                outcome = _scan_session(
+                    snapshot,
+                    adapter,
+                    header,
+                    filters,
+                    writer,
+                    catalog_version,
+                    schema_warnings,
+                    defer_writes=True,
+                )
+            except BaseException:
+                for _scanned_header, scanned_outcome in scanned:
+                    if scanned_outcome.summary_spool is not None:
+                        scanned_outcome.summary_spool.close()
+                raise
+            scanned.append((header, outcome))
             session_scan_count += 1
-            selected_session_count += 1 if outcome.selected else 0
-            turn_entry_count += outcome.turn_entry_count
-            tombstone_count += 1 if outcome.tombstone else 0
             warning_count += len(outcome.warnings)
+        selected_ids = _selection_closure(
+            {
+                header.session_id
+                for header, outcome in scanned
+                if outcome.selected and (requested_session_id is None or header.session_id == requested_session_id)
+            },
+            [header for header, _outcome in scanned],
+        )
+        try:
+            for header, outcome in scanned:
+                selected = header.session_id in selected_ids
+                selected_session_count += 1 if selected else 0
+                if outcome.session_scan is None or outcome.summary_spool is None or outcome.collector is None:
+                    continue
+                tombstone = (
+                    selected and outcome.session_scan.complete_scan and outcome.session_scan.logical_turn_count == 0
+                )
+                tombstone_count += 1 if tombstone else 0
+                writer.write_session_scan(replace(outcome.session_scan, selected=selected, tombstone=tombstone))
+                if not selected:
+                    continue
+                for turn_summary in outcome.summary_spool:
+                    writer.write_turn(
+                        _turn_entry_for(
+                            snapshot,
+                            header,
+                            _summary_with_session_timing(turn_summary, outcome.collector),
+                            outcome.session_scan.session_context_fingerprint,
+                            catalog_version,
+                        )
+                    )
+                    turn_entry_count += 1
+        finally:
+            for _header, outcome in scanned:
+                if outcome.summary_spool is not None:
+                    outcome.summary_spool.close()
     return DiscoveryStats(
         session_scan_count=session_scan_count,
         selected_session_count=selected_session_count,
@@ -717,6 +795,45 @@ def discover_sessions(
     )
 
 
+def _selection_closure(seeds: set[str], headers: list[SessionHeader]) -> set[str]:
+    """Include each selected session's ancestors and descendants."""
+    known = {header.session_id for header in headers}
+    parents: dict[str, set[str]] = {}
+    children: dict[str, set[str]] = {}
+    for header in headers:
+        for parent_id in (header.parent_id, header.fork_session_id):
+            if parent_id is None:
+                continue
+            parents.setdefault(header.session_id, set()).add(parent_id)
+            children.setdefault(parent_id, set()).add(header.session_id)
+
+    included = {seed for seed in seeds if seed in known}
+    pending = list(included)
+    visited: set[str] = set()
+    while pending:
+        parent = pending.pop()
+        if parent in visited:
+            continue
+        visited.add(parent)
+        for ancestor in parents.get(parent, ()):
+            if ancestor in known and ancestor not in visited:
+                included.add(ancestor)
+                pending.append(ancestor)
+
+    pending = list(seeds & known)
+    visited = set()
+    while pending:
+        child = pending.pop()
+        if child in visited:
+            continue
+        visited.add(child)
+        for descendant in children.get(child, ()):
+            if descendant in known and descendant not in visited:
+                included.add(descendant)
+                pending.append(descendant)
+    return included
+
+
 @dataclass
 class _SessionScanOutcome:
     """Per-session bookkeeping returned by one scan."""
@@ -725,6 +842,9 @@ class _SessionScanOutcome:
     tombstone: bool
     turn_entry_count: int
     warnings: tuple[str, ...]
+    session_scan: SessionScanEntry | None = None
+    summary_spool: _TurnSummarySpool | None = None
+    collector: _SessionCollector | None = None
 
 
 def _scan_session(
@@ -735,20 +855,22 @@ def _scan_session(
     writer: DiscoveryPlanWriter,
     catalog_version: str,
     schema_warnings: tuple[str, ...] = (),
+    defer_writes: bool = False,
 ) -> _SessionScanOutcome:
-    """Scan one compatible session and append its sanitized plan entries.
+    """Scan one compatible session and prepare its sanitized plan entries.
 
     The session's records stream once through
     :func:`iter_turn_summaries` (collecting model identities, record
     counts, and warnings as a side effect) into a restrictive disk-backed
     summary spool, the session-scoped records stream once more for the same
     collection, selection is evaluated against the resulting counters, the
-    scan entry is appended, and only then — for a selected session — are
-    summaries replayed from disk and fingerprinted through the Task 4A seam.
+    scan entry is appended immediately unless ``defer_writes`` is set; in
+    deferred mode the restrictive spool remains open for ancestry selection.
     """
     collector = _SessionCollector(header)
     collector.record_warnings(schema_warnings)
-    with _TurnSummarySpool(writer._plan_path.parent) as summaries:
+    summaries = _TurnSummarySpool(writer._plan_path.parent)
+    try:
         logical_turn_count = 0
         for turn_summary in iter_turn_summaries(collector.observe(adapter.iter_records(header.session_id))):
             summaries.write(turn_summary)
@@ -776,21 +898,32 @@ def _scan_session(
         session_fingerprint = session_context_fingerprint(
             build_effective_turn(_SessionHeaderReplayTurn(header), IDENTITY_REDACTOR, _DISCOVERY_REDACTION_MODE)
         )
-        writer.write_session_scan(
-            SessionScanEntry(
-                session_id=header.session_id,
-                adapter_generation=header.adapter_generation,
-                selected=selected,
-                complete_scan=complete_scan,
-                tombstone=tombstone,
-                logical_turn_count=logical_turn_count,
-                record_count=collector.record_count,
-                creation_time_ns=header.time_created.nanoseconds if header.time_created is not None else None,
-                session_context_fingerprint=session_fingerprint,
-                warnings=collector.warnings,
-                catalog_version=catalog_version,
-            )
+        session_scan = SessionScanEntry(
+            session_id=header.session_id,
+            adapter_generation=header.adapter_generation,
+            selected=selected,
+            complete_scan=complete_scan,
+            tombstone=tombstone,
+            logical_turn_count=logical_turn_count,
+            record_count=collector.record_count,
+            creation_time_ns=header.time_created.nanoseconds if header.time_created is not None else None,
+            session_context_fingerprint=session_fingerprint,
+            warnings=collector.warnings,
+            catalog_version=catalog_version,
         )
+        if defer_writes:
+            summaries.finish()
+            return _SessionScanOutcome(
+                selected,
+                tombstone,
+                logical_turn_count if selected else 0,
+                collector.warnings,
+                session_scan,
+                summaries,
+                collector,
+            )
+
+        writer.write_session_scan(session_scan)
 
         turn_entry_count = 0
         if not selected:
@@ -807,6 +940,12 @@ def _scan_session(
             )
             turn_entry_count += 1
         return _SessionScanOutcome(selected, tombstone, turn_entry_count, collector.warnings)
+    except BaseException:
+        summaries.close()
+        raise
+    finally:
+        if not defer_writes:
+            summaries.close()
 
 
 def _turn_entry_for(

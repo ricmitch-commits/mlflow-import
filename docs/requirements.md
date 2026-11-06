@@ -217,6 +217,10 @@ read-only opening behavior; the CLI does not encode harness-specific paths.
   greater than `N`; `N` must be a non-negative integer.
 - All supplied selection options combine with logical **AND**. An omitted
   option imposes no restriction.
+- When a session passes the configured filters, selection also includes its
+  transitive parent/fork ancestors and all transitive descendants. This
+  expansion does not traverse from an ancestor into unrelated sibling
+  branches unless those siblings match the filters independently.
 - With no optional selection filter, all compatible sessions are eligible;
   the command must clearly report the potentially broad selection and support
   `--dry-run` before any writes.
@@ -318,6 +322,8 @@ Every imported turn trace must carry:
   visible as `mlflow.trace.session`;
 - an explicit namespaced `mlflow_import.session_id` field for robust reconciliation;
 - title, slug, directory, path, project/workspace/parent/fork IDs;
+- when available, the normalized parent session ID as the typed root trace
+  attribute `opencode.parent_session_id`; omit it when the source has no parent;
 - harness, agent, configured model, harness version, source schema generation;
 - session creation/update/lifecycle timestamps;
 - session cost and token aggregates;

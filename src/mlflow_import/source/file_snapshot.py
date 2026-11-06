@@ -24,6 +24,18 @@ from mlflow_import.source.snapshot import (
 )
 
 
+def _source_manifest(path: Path) -> tuple[tuple[str, int, int, int], ...]:
+    """Return a stable stat manifest for a file or a JSONL source directory."""
+    paths = (path,) if path.is_file() else tuple(sorted(path.rglob("*.jsonl")))
+    manifest: list[tuple[str, int, int, int]] = []
+    for source_path in paths:
+        if not source_path.is_file():
+            continue
+        stat = source_path.stat()
+        manifest.append((str(source_path), stat.st_size, stat.st_mtime_ns, stat.st_ino))
+    return tuple(manifest)
+
+
 @contextmanager
 def create_file_snapshot(
     path: Path,
@@ -35,14 +47,14 @@ def create_file_snapshot(
     session_ids: frozenset[str] | None = None,
 ) -> Iterator[SourceSnapshot]:
     """Freeze one JSONL source into the same replay schema as SQLite sources."""
-    if not path.is_file() or path.is_symlink():
+    if not path.exists() or path.is_symlink():
         raise SnapshotError("source_unavailable", "the selected source file is unavailable")
     run_dir = Path(tempfile.mkdtemp(prefix="mlflow-import-file-", dir=temp_root))
     snapshot_path = run_dir / SNAPSHOT_FILENAME
     connection: sqlite3.Connection | None = None
     replay: sqlite3.Connection | None = None
     try:
-        before = path.stat()
+        before = _source_manifest(path)
         connection = sqlite3.connect(snapshot_path, isolation_level=None)
         connection.executescript(_SNAPSHOT_SCHEMA)
         os.chmod(snapshot_path, 0o600)
@@ -52,8 +64,8 @@ def create_file_snapshot(
         exporter.bind_connection(connection)
         stats = exporter.export_to_snapshot(writer, redaction, session_id, session_ids)
         stats = writer.finalize()
-        after = path.stat()
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        after = _source_manifest(path)
+        if before != after:
             raise SnapshotError("source_changed", "the source file changed while it was being frozen")
         connection.close()
         connection = None

@@ -710,7 +710,7 @@ def _run_pipeline(
         # Phase 5-6: the replay snapshot and the sanitized discovery plan.
         adapter = dependencies.replay_adapter_factory(snapshot)
         plan_path = run_root / DISCOVERY_PLAN_FILENAME
-        stats = discover_sessions(adapter, filters, plan_path)
+        stats = discover_sessions(adapter, filters, plan_path, config.session)
         builder.set_source_counts(
             sessions_scanned=stats.session_scan_count, sessions_selected=stats.selected_session_count
         )

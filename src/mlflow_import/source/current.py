@@ -296,19 +296,10 @@ class CurrentAdapter:
         session_id: str | None = None,
         session_ids: frozenset[str] | None = None,
     ) -> ExportStats:
-        if session_ids is not None and session_id is None:
-            warnings: list[str] = []
-            for selected in sorted(session_ids):
-                self.begin_export(selected_session_id=selected)
-                for _key, row, child_key in self.iter_exportable_sessions():
-                    self.export_session_records(writer, row, child_key)
-                warnings.extend(self._export_warnings)
-            self._export_warnings = warnings
-        else:
-            self.begin_export(selected_session_id=session_id, selected_session_ids=session_ids)
-            for _key, row, child_key in self.iter_exportable_sessions():
-                self.export_session_records(writer, row, child_key)
-            self.report_unassociated_records()
+        self.begin_export(selected_session_id=session_id, selected_session_ids=session_ids)
+        for _key, row, child_key in self.iter_exportable_sessions():
+            self.export_session_records(writer, row, child_key)
+        self.report_unassociated_records()
         stats = writer.finalize()
         if not self._export_warnings:
             return stats
