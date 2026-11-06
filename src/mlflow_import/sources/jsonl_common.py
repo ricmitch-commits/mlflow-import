@@ -123,11 +123,12 @@ class JsonlExporter:
                 source_id = value.get("uuid") or value.get("id") or f"line-{line_number}"
                 record_type = str(value.get("type") or value.get("kind") or "record")
                 classification = self._classification(value, record_type)
+                source_table = "jsonl_message" if classification in {"user", "assistant"} else "jsonl"
                 timestamp = self._timestamp(value)
                 parent = value.get("parentUuid") or value.get("parent_id") or value.get("parentId")
                 records.append(
                     SourceRecord(
-                        source_table="jsonl",
+                        source_table=source_table,
                         source_type=record_type,
                         source_id=str(source_id),
                         raw_json=text,
@@ -184,6 +185,11 @@ class JsonlExporter:
         message = value.get("message")
         if isinstance(message, dict):
             role = role or message.get("role")
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "tool_result" for part in content
+            ):
+                return "system"
         if role in {"user", "human"} or record_type in {"user", "human"}:
             return "user"
         if role in {"assistant", "model"} or record_type in {"assistant", "response", "message"}:

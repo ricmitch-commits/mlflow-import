@@ -15,7 +15,7 @@ class HarnessAdapter(Protocol):
 
     def detect(self, source: Path) -> bool: ...
 
-    def default_locations(self) -> tuple[Path, ...]: ...
+    def default_locations(self, session_id: str | None = None) -> tuple[Path, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,15 @@ class Adapter:
             return detect(source)
         return False
 
-    def default_locations(self) -> tuple[Path, ...]:
+    def default_locations(self, session_id: str | None = None) -> tuple[Path, ...]:
+        if self.name == "claude":
+            from .claude import default_sources as claude_default_sources
+
+            return claude_default_sources(session_id)
+        if self.name == "codex":
+            from .codex import default_sources as codex_default_sources
+
+            return codex_default_sources()
         return self.locations
 
     def require_qualified(self) -> None:

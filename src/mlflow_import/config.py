@@ -208,10 +208,24 @@ def parse_config(argv: Sequence[str]) -> ImportConfig:
         if source is not None and not adapter.detect(source):
             raise ConfigurationError("harness_source_mismatch", "the source does not match the selected harness")
 
+    default_db = DEFAULT_DB_PATH
+    if source is None and args.db is None and harness in {"claude", "codex"}:
+        locations = adapter.default_locations(args.session)
+        if len(locations) > 1:
+            raise ConfigurationError(
+                "ambiguous_source", "the selected harness has multiple default sources; specify --source"
+            )
+        if locations:
+            default_db = str(locations[0])
+        elif harness == "claude":
+            default_db = str(Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects")
+        else:
+            default_db = str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions")
+
     config = ImportConfig(
         experiment_name=experiment_name,
         db_path=normalize_path(
-            cast(str, args.db) if args.db is not None else (str(source) if harness == "opencode" else DEFAULT_DB_PATH)
+            cast(str, args.db) if args.db is not None else (str(source) if source is not None else default_db)
         ),
         tracking_uri=args.tracking_uri,
         from_time=_parse_time_bound("--from-time", args.from_time),

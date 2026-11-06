@@ -177,6 +177,40 @@ def test_parse_config_applies_defaults(restrictive_tmp_path: Path, monkeypatch: 
     assert config.log_level == "INFO"
 
 
+def test_parse_config_discovers_claude_session_source(
+    restrictive_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "dea37895-233c-47dd-9677-dac3d49dea6a"
+    source = restrictive_tmp_path / "projects" / "-Users-test" / f"{session_id}.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(restrictive_tmp_path))
+
+    config = parse_config(["import", "--experiment-name", "exp", "--harness", "claude", "--session", session_id])
+
+    assert config.db_path == source
+
+
+def test_parse_config_does_not_fall_back_to_opencode_for_missing_claude_source(
+    restrictive_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(restrictive_tmp_path))
+
+    config = parse_config(
+        [
+            "import",
+            "--experiment-name",
+            "exp",
+            "--harness",
+            "claude",
+            "--session",
+            "missing-session",
+        ]
+    )
+
+    assert config.db_path == restrictive_tmp_path / "projects"
+
+
 def test_parse_config_normalizes_every_option(restrictive_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(restrictive_tmp_path)
     monkeypatch.setenv("HOME", str(restrictive_tmp_path))

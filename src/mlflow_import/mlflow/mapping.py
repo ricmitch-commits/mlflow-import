@@ -181,7 +181,7 @@ _AGENT_SPAN_TYPE = "AGENT"
 _TOOL_SPAN_TYPE = "TOOL"
 _CONTENT_SPAN_TYPE = "UNKNOWN"
 
-_MESSAGE_TABLES = frozenset({"message", "session_message"})
+_MESSAGE_TABLES = frozenset({"message", "session_message", "jsonl_message"})
 _LIFECYCLE_TABLES = SESSION_EVENT_TABLES - {"todo"}
 _SESSION_EVENT_TABLES = SESSION_EVENT_TABLES
 
@@ -1108,6 +1108,8 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
         for record in turn.iter_records():
             if first:
                 first = False
+                continue
+            if record.timestamp is None and record.completion_timestamp is None:
                 continue
             parent_key = _qualified_parent_source_key(record)
             parent = parent_key if parent_key in emitted else None
