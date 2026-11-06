@@ -18,7 +18,9 @@ def default_sources() -> tuple[Path, ...]:
 
 
 def detect(path: Path) -> bool:
-    return path.suffix == ".jsonl" and ("rollout-" in path.name or "archived_sessions" in path.parts)
+    return (
+        path.is_dir() and ("codex" in path.parts or "sessions" in path.parts or "archived_sessions" in path.parts)
+    ) or (path.suffix == ".jsonl" and ("rollout-" in path.name or "archived_sessions" in path.parts))
 
 
 def exporter(path: Path) -> JsonlExporter:

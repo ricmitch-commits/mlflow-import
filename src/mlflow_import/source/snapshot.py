@@ -491,7 +491,7 @@ def create_normalized_snapshot(
                         selection_evaluator,
                     )
                     try:
-                        if session_id is None:
+                        if session_id is None and session_ids is None:
                             returned = exporter.export_to_snapshot(writer, redaction)
                         else:
                             returned = exporter.export_to_snapshot(writer, redaction, session_id, session_ids)

@@ -116,11 +116,11 @@ class MixedAdapter:
         session_id: str | None = None,
         session_ids: frozenset[str] | None = None,
     ) -> ExportStats:
-        overlaps = (
-            frozenset()
-            if session_id is not None or session_ids is not None
-            else self._current.session_ids() & self._legacy.session_ids()
-        )
+        overlaps = self._current.session_ids() & self._legacy.session_ids()
+        if session_ids is not None:
+            overlaps &= set(session_ids)
+        elif session_id is not None:
+            overlaps &= {session_id}
         self._current.begin_export(
             overlap_session_ids=frozenset(overlaps),
             selected_session_id=session_id,

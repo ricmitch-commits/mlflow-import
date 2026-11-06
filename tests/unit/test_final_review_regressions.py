@@ -447,7 +447,7 @@ def test_adapter_snapshot_turn_mapping_preserves_session_lifecycle_outcomes(
             replay,
             MappingContext(
                 importer_version="test",
-                mapping_version="mapping-v3",
+                mapping_version="mapping-v4",
                 artifact_schema_version="artifact-v2",
                 source_schema=generation,
                 redaction_mode=RedactionMode.VERBATIM,
@@ -847,8 +847,9 @@ def test_shared_instruction_blob_survives_selecting_only_later_session(tmp_path)
     dependencies = build_import_fakes(restrictive_tmp_path=tmp_path)
     result = run_import(ImportConfig("shared", path, directory=Path("/selected")), dependencies)
     assert exit_status(result) == 0
-    selected = next(s for s in result.report["sessions"] if s["selected"])
-    assert selected["session_id"] == "ses-current-002"
+    selected_sessions = [s for s in result.report["sessions"] if s["selected"]]
+    assert {session["session_id"] for session in selected_sessions} == {"ses-current-001", "ses-current-002"}
+    selected = next(s for s in selected_sessions if s["session_id"] == "ses-current-002")
     trace = dependencies.gateway.stored_trace(selected["turns"][0]["trace_id"])
     artifact = json.loads(dependencies.gateway.stored_artifact(trace.trace_id, trace.tags["opencode.artifact_path"]))
     blobs = [r for r in artifact["session_records"] if r["source_table"] == "instruction_blob"]
@@ -881,7 +882,7 @@ def test_corrected_mapping_contract_replaces_old_version_once(tmp_path):
     assert exit_status(second) == 0
     assert second.report["sessions"][0]["turns"][0]["action"] == "updated"
     trace = dependencies.gateway.stored_trace(second.report["sessions"][0]["turns"][0]["trace_id"])
-    assert trace.metadata["opencode.mapping_version"] == "mapping-v3"
+    assert trace.metadata["opencode.mapping_version"] == "mapping-v4"
     marker = len(dependencies.gateway.mutations)
     third = run_import(config, dependencies)
     assert exit_status(third) == 0

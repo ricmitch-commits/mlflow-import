@@ -181,6 +181,8 @@ def _current_session(
     directory: str | None = None,
     created_ms: int | None = _CREATED_MS,
     model: str | None = None,
+    parent_id: str | None = None,
+    fork_session_id: str | None = None,
 ) -> Insert:
     columns = ["id", "time_created", "time_updated"]
     values: list[object] = [session_id, created_ms, created_ms]
@@ -190,6 +192,12 @@ def _current_session(
     if model is not None:
         columns.append("model")
         values.append(model)
+    if parent_id is not None:
+        columns.append("parent_id")
+        values.append(parent_id)
+    if fork_session_id is not None:
+        columns.append("fork_session_id")
+        values.append(fork_session_id)
     placeholders = ", ".join("?" for _ in columns)
     return (f"INSERT INTO session_v2 ({', '.join(columns)}) VALUES ({placeholders})", tuple(values))
 
@@ -486,6 +494,37 @@ def test_discovery_selects_only_sessions_matching_every_supplied_filter(
     assert scans["ses-b"].retirement_scope is False
     assert scans["ses-b"].logical_turn_count == 1
     assert [turn.session_id for turn in turns] == ["ses-a"]
+
+
+def test_discovery_includes_matching_session_ancestors_and_descendants(
+    tmp_path: Path, restrictive_tmp_path: Path
+) -> None:
+    session_ids = ("ses-grandparent", "ses-parent", "ses-match", "ses-child", "ses-grandchild", "ses-sibling")
+    inserts: list[Insert] = [
+        _current_session("ses-grandparent", directory="/repo/other"),
+        _current_session("ses-parent", directory="/repo/other", parent_id="ses-grandparent"),
+        _current_session("ses-match", directory="/repo/project", parent_id="ses-parent"),
+        _current_session("ses-child", directory="/repo/other", parent_id="ses-match"),
+        _current_session("ses-grandchild", directory="/repo/other", parent_id="ses-child"),
+        _current_session("ses-sibling", directory="/repo/other", parent_id="ses-parent"),
+    ]
+    inserts.extend(
+        _current_message(f"msg-{session_id}", session_id, "user", 1, _PROMPT_JSON) for session_id in session_ids
+    )
+    filters = SelectionFilters(directory=Path("/repo/project"))
+    with _replay_adapter(tmp_path, "ancestry", "current", inserts, selection_filters=filters) as adapter:
+        plan_path = _plan_path(restrictive_tmp_path)
+        stats = discover_sessions(adapter, filters, plan_path)
+        scans = {scan.session_id: scan for scan in DiscoveryPlanReader(plan_path).iter_session_scans()}
+
+    assert stats.selected_session_count == 5
+    assert {session_id for session_id, scan in scans.items() if scan.selected} == {
+        "ses-grandparent",
+        "ses-parent",
+        "ses-match",
+        "ses-child",
+        "ses-grandchild",
+    }
 
 
 def test_discovery_uses_pre_redaction_filter_evidence_without_putting_it_in_the_plan(

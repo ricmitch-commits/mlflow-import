@@ -42,3 +42,60 @@ def test_candidate_discovery_can_return_no_sessions_without_falling_back_to_all(
         assert candidate_session_ids(connection, description, filters) == frozenset()
     finally:
         connection.close()
+
+
+def test_explicit_session_stays_scoped_with_record_level_filters() -> None:
+    connection = _connection()
+    try:
+        description = SchemaDescription(generation="current", catalog_version="test")
+        assert candidate_session_ids(connection, description, SelectionFilters(min_user_turns=0), "keep") == frozenset(
+            {"keep"}
+        )
+    finally:
+        connection.close()
+
+
+def test_candidate_discovery_includes_ancestors_and_descendants_of_a_match() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE session_v2 "
+        "(id TEXT, time_created INTEGER, directory TEXT, path TEXT, parent_id TEXT, fork_session_id TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO session_v2 VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            ("grandparent", 1_735_689_600_000, "/repo/other", "/repo/other", None, None),
+            ("parent", 1_735_689_600_000, "/repo/other", "/repo/other", "grandparent", None),
+            ("match", 1_735_689_600_000, "/repo/app", "/repo/app", "parent", None),
+            ("child", 1_735_689_600_000, "/repo/other", "/repo/other", "match", None),
+            ("grandchild", 1_735_689_600_000, "/repo/other", "/repo/other", "child", None),
+            ("sibling", 1_735_689_600_000, "/repo/other", "/repo/other", "parent", None),
+        ),
+    )
+    try:
+        selected = candidate_session_ids(
+            connection,
+            SchemaDescription(generation="current", catalog_version="test"),
+            SelectionFilters(directory=Path("/repo/app")),
+        )
+        assert selected == frozenset({"grandparent", "parent", "match", "child", "grandchild"})
+    finally:
+        connection.close()
+
+
+def test_candidate_discovery_handles_ancestry_cycles() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, parent_id TEXT)")
+    connection.executemany(
+        "INSERT INTO session_v2 VALUES (?, ?, ?)",
+        (("a", "/repo/app", "b"), ("b", "/repo/other", "a"), ("c", "/repo/other", "b")),
+    )
+    try:
+        selected = candidate_session_ids(
+            connection,
+            SchemaDescription(generation="current", catalog_version="test"),
+            SelectionFilters(directory=Path("/repo/app")),
+        )
+        assert selected == frozenset({"a", "b", "c"})
+    finally:
+        connection.close()
