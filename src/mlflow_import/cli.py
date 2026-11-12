@@ -15,6 +15,7 @@ name.
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Sequence
 
 from mlflow_import.config import PROG, build_parser, parse_config
@@ -45,11 +46,13 @@ def main(argv: Sequence[str] | None = None, dependencies: ImportDependencies | N
     except SystemExit as error:  # argparse: --help exits 0, usage errors exit 2
         return error.code if isinstance(error.code, int) else 2
     effective_dependencies = dependencies if dependencies is not None else build_dependencies(config)
+    started = time.perf_counter() if config.log_level == "DEBUG" else None
     if config.log_level == "DEBUG":
-        print("mlflow-import: starting read-only discovery and planning", file=sys.stderr, flush=True)
+        _write_debug("mlflow-import: import pipeline started")
     result = run_import(config, effective_dependencies)
-    if config.log_level == "DEBUG":
-        print("mlflow-import: read-only planning complete", file=sys.stderr, flush=True)
+    if started is not None:
+        elapsed = time.perf_counter() - started
+        _write_debug(f"mlflow-import: import pipeline complete elapsed_s={elapsed:.3f}")
     output = render_human(result) if config.output == "human" else render_json(result)
     print(output)
     return exit_status(result)
@@ -59,3 +62,11 @@ def _report_failure(error: ImporterError) -> int:
     """Print one safe error line to stderr and return the exit status."""
     print(f"{PROG}: error ({error.code}): {error.safe_message}", file=sys.stderr)
     return error.exit_status
+
+
+def _write_debug(message: str) -> None:
+    """Write best-effort diagnostics that cannot change the import outcome."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass

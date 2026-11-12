@@ -47,7 +47,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -193,7 +193,9 @@ class SnapshotWriter:
     persisted envelope value and permitted raw field before temporary
     persistence; typed structural identity fields are written verbatim
     while raw-column projections are redacted as content. ``finalize`` is idempotent and
-    flushes any pending batch.
+    flushes any pending batch. Each flush uses one explicit SQLite
+    transaction, including when its connection is configured for autocommit.
+    An optional progress callback receives committed session and record counts.
     """
 
     def __init__(
@@ -203,6 +205,7 @@ class SnapshotWriter:
         redaction: RedactionCallback,
         write_batch: int = 256,
         selection_evaluator: SelectionEvidenceEvaluator | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         if write_batch < 1:
             raise ValueError("write_batch must be a positive integer")
@@ -210,11 +213,14 @@ class SnapshotWriter:
         self._schema_generation = schema_generation
         self._redaction_policy = redaction
         self._selection_evaluator = selection_evaluator
+        self._progress_callback = progress_callback
         self._write_batch = write_batch
         self._session_rows: list[tuple[str, str, str, int, int]] = []
         self._record_rows: list[tuple[str, str, str, str | None, str, str]] = []
         self._session_count = 0
         self._record_count = 0
+        self._committed_session_count = 0
+        self._committed_record_count = 0
         self._warning_count = 0
         self._stats: ExportStats | None = None
         self._current_session_id: str | None = None
@@ -413,24 +419,58 @@ class SnapshotWriter:
     def _flush_sessions(self) -> None:
         if not self._session_rows:
             return
-        self._connection.executemany(
+        self._execute_batch(
             "INSERT INTO snapshot_sessions"
             " (session_id, schema, canonical_session_row, directory_filter_match, model_filter_match)"
             " VALUES (?, ?, ?, ?, ?)",
             self._session_rows,
         )
+        self._committed_session_count += len(self._session_rows)
         self._session_rows.clear()
+        self._report_progress()
 
     def _flush_records(self) -> None:
         if not self._record_rows:
             return
-        self._connection.executemany(
+        self._execute_batch(
             "INSERT INTO snapshot_records"
             " (session_id, order_key, source_table, source_id, canonical_record, raw_permitted_fields)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             self._record_rows,
         )
+        self._committed_record_count += len(self._record_rows)
         self._record_rows.clear()
+        self._report_progress()
+
+    def _execute_batch(self, statement: str, rows: Iterable[Sequence[object]]) -> None:
+        """Commit one buffered batch atomically, even on autocommit connections."""
+        transaction_started = False
+        try:
+            self._connection.execute("BEGIN")
+            transaction_started = True
+            self._connection.executemany(statement, rows)
+            self._connection.execute("COMMIT")
+            transaction_started = False
+        except BaseException:
+            if transaction_started and self._connection.in_transaction:
+                try:
+                    self._connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    # Preserve the original batch failure; the temporary
+                    # snapshot is discarded by its owning context manager.
+                    pass
+            raise
+
+    def _report_progress(self) -> None:
+        """Report committed aggregate counts without making diagnostics fatal."""
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(self._committed_session_count, self._committed_record_count)
+        except Exception:
+            # Progress output is observational; a broken stderr must not
+            # abort snapshot creation after a batch has already committed.
+            self._progress_callback = None
 
 
 @contextmanager
@@ -444,6 +484,7 @@ def create_normalized_snapshot(
     selection_evaluator: SelectionEvidenceEvaluator | None = None,
     session_id: str | None = None,
     session_ids: frozenset[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> Iterator[SourceSnapshot]:
     """Extract a normalized read-only snapshot of the source at ``path``.
 
@@ -489,6 +530,7 @@ def create_normalized_snapshot(
                         redaction,
                         write_batch,
                         selection_evaluator,
+                        progress_callback,
                     )
                     try:
                         if session_id is None and session_ids is None:

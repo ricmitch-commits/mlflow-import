@@ -68,6 +68,7 @@ from __future__ import annotations
 import inspect
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
@@ -171,6 +172,9 @@ BROAD_SELECTION_MESSAGE = (
 
 DISCOVERY_PLAN_FILENAME = "discovery-plan.jsonl"
 """File name of the discovery plan inside the run's temporary directory."""
+
+SNAPSHOT_PROGRESS_INTERVAL = 10_000
+"""Record count between safe snapshot progress messages in DEBUG mode."""
 
 _ARTIFACT_STAGING_DIRNAME = "artifact-staging"
 """Subdirectory of the run root where artifact uploads stage their streams."""
@@ -688,6 +692,7 @@ def _run_pipeline(
             exporter = dependencies.exporter_factory(live.connection, description)
             candidate_ids = candidate_session_ids(live.connection, description, filters, config.session)
 
+    snapshot_started = _debug_phase_started(config, "snapshot")
     with _snapshot_reporting_context(
         dependencies.snapshot_factory,
         config.db_path,
@@ -697,9 +702,17 @@ def _run_pipeline(
         SelectionEvidenceEvaluator(filters),
         session_id=config.session,
         session_ids=candidate_ids,
+        progress_callback=_snapshot_progress_callback(config),
         require_selection_evidence=filters.directory is not None or filters.model is not None,
         builder=builder,
     ) as snapshot:
+        _debug_phase_completed(
+            config,
+            "snapshot",
+            snapshot_started,
+            sessions=snapshot.stats.session_count,
+            records=snapshot.stats.record_count,
+        )
         builder.set_source(schema_generation=description.generation, fingerprint=snapshot.fingerprint)
         builder.set_redaction_report(counting.report)
         for warning_code in snapshot.export_warnings:
@@ -710,7 +723,16 @@ def _run_pipeline(
         # Phase 5-6: the replay snapshot and the sanitized discovery plan.
         adapter = dependencies.replay_adapter_factory(snapshot)
         plan_path = run_root / DISCOVERY_PLAN_FILENAME
+        discovery_started = _debug_phase_started(config, "discovery")
         stats = discover_sessions(adapter, filters, plan_path, config.session)
+        _debug_phase_completed(
+            config,
+            "discovery",
+            discovery_started,
+            sessions_scanned=stats.session_scan_count,
+            sessions_selected=stats.selected_session_count,
+            turns=stats.turn_entry_count,
+        )
         builder.set_source_counts(
             sessions_scanned=stats.session_scan_count, sessions_selected=stats.selected_session_count
         )
@@ -729,10 +751,12 @@ def _run_pipeline(
         # always required: a normal write needs rollback after any partial
         # create, and every imported turn uploads its artifact.
         gateway = dependencies.gateway_factory(config.dry_run)
+        capability_started = _debug_phase_started(config, "capability preflight")
         capability = gateway.probe(
             CapabilityRequest(needs_retirement=True, needs_named_artifacts=True), dry_run=config.dry_run
         )
         require_capabilities(capability)
+        _debug_phase_completed(config, "capability preflight", capability_started)
 
         if config.dry_run:
             result = _run_dry(config, dependencies, builder, gateway, snapshot, reader)
@@ -755,6 +779,53 @@ def _run_pipeline(
     return result
 
 
+def _debug_phase_started(config: ImportConfig, phase: str) -> float | None:
+    """Emit a safe DEBUG phase-start event and return its monotonic start time."""
+    if config.log_level != "DEBUG":
+        return None
+    _write_debug(f"mlflow-import: phase {phase} started")
+    return time.perf_counter()
+
+
+def _debug_phase_completed(
+    config: ImportConfig,
+    phase: str,
+    started: float | None,
+    **counts: int,
+) -> None:
+    """Emit elapsed phase time and optional safe aggregate counters."""
+    if started is None:
+        return
+    elapsed = time.perf_counter() - started
+    details = " ".join(f"{name}={value}" for name, value in counts.items())
+    suffix = f" {details}" if details else ""
+    _write_debug(f"mlflow-import: phase {phase} complete elapsed_s={elapsed:.3f}{suffix}")
+
+
+def _write_debug(message: str) -> None:
+    """Write best-effort diagnostics that cannot change the import outcome."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _snapshot_progress_callback(config: ImportConfig) -> Callable[[int, int], None] | None:
+    """Create a throttled, path-free callback for committed snapshot progress."""
+    if config.log_level != "DEBUG":
+        return None
+    last_reported_records = 0
+
+    def report(sessions: int, records: int) -> None:
+        nonlocal last_reported_records
+        if records - last_reported_records < SNAPSHOT_PROGRESS_INTERVAL:
+            return
+        _write_debug(f"mlflow-import: phase snapshot progress sessions={sessions} records={records}")
+        last_reported_records = records
+
+    return report
+
+
 def _run_dry(
     config: ImportConfig,
     dependencies: ImportDependencies,
@@ -774,13 +845,17 @@ def _run_dry(
     ownership conflicts remain failed and unexamined rather than becoming
     fresh import predictions.
     """
+    planning_started = _debug_phase_started(config, "planning and owned-trace lookup")
     experiment = gateway.resolve_experiment(config.experiment_name, create=True)
     _record_experiment(builder, experiment)
     plan = plan_reconciliation(reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment))
     builder.set_unexamined_owned_traces(len(plan.unexamined_owned_traces))
+    _debug_phase_completed(config, "planning and owned-trace lookup", planning_started, turns=len(plan.results))
 
     # The replay fingerprint checks still run: a dry run validates.
+    replay_started = _debug_phase_started(config, "replay fingerprint validation")
     _verify_replayed_fingerprints(reader.iter_turns(), dependencies.replay_builder(snapshot))
+    _debug_phase_completed(config, "replay fingerprint validation", replay_started, turns=len(plan.results))
 
     failed_items = 0
     for result in plan.results:
@@ -873,13 +948,17 @@ def _run_normal(
     # lookup. A missing experiment has zero owned traces, so its lookup is
     # trivially empty and the creation is deferred: no MLflow mutation may
     # happen before every pre-write check has passed.
+    planning_started = _debug_phase_started(config, "planning and owned-trace lookup")
     experiment = _resolve_existing_experiment(gateway, config.experiment_name)
     plan = plan_reconciliation(reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment))
     builder.set_unexamined_owned_traces(len(plan.unexamined_owned_traces))
+    _debug_phase_completed(config, "planning and owned-trace lookup", planning_started, turns=len(plan.results))
 
     # Phase 11: every replay fingerprint check passes before any mutation.
     replay = dependencies.replay_builder(snapshot)
+    replay_started = _debug_phase_started(config, "replay fingerprint validation")
     _verify_replayed_fingerprints(reader.iter_turns(), replay)
+    _debug_phase_completed(config, "replay fingerprint validation", replay_started, turns=len(plan.results))
 
     # Prepare every local write dependency before the deferred experiment
     # creation. A local staging failure is a pre-write failure and must not
@@ -909,7 +988,14 @@ def _run_normal(
         redaction_mode=redaction_mode,
         staging_directory=staging,
     )
+    reconciliation_started = _debug_phase_started(config, "reconciliation")
     apply_reconciliation(plan, gateway, reconciliation, dependencies.retry_policy)
+    _debug_phase_completed(
+        config,
+        "reconciliation",
+        reconciliation_started,
+        actions=len(plan.results),
+    )
 
     failed_items = _record_normal_results(builder, plan, reader.iter_turns())
     builder.set_retired_traces(sum(len(result.retired_trace_ids) for result in plan.results))
@@ -1084,6 +1170,7 @@ def _default_snapshot_factory(
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
     session_ids: frozenset[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> AbstractContextManager[SourceSnapshot]:
     """The production normalized-snapshot factory."""
     snapshot_factory = create_file_snapshot if getattr(exporter, "file_source", False) else create_normalized_snapshot
@@ -1095,6 +1182,7 @@ def _default_snapshot_factory(
         selection_evaluator=selection_evaluator,
         session_id=session_id,
         session_ids=session_ids,
+        progress_callback=progress_callback,
     )
 
 
@@ -1108,6 +1196,7 @@ def _snapshot_reporting_context(
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
     session_ids: frozenset[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
     *,
     require_selection_evidence: bool,
     builder: ReportBuilder,
@@ -1124,6 +1213,7 @@ def _snapshot_reporting_context(
             selection_evaluator,
             session_id,
             session_ids,
+            progress_callback,
             require_selection_evidence=require_selection_evidence,
         ) as opened:
             snapshot = opened
@@ -1145,6 +1235,7 @@ def _open_snapshot(
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
     session_ids: frozenset[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
     *,
     require_selection_evidence: bool,
 ) -> AbstractContextManager[SourceSnapshot]:
@@ -1160,9 +1251,31 @@ def _open_snapshot(
             ) from None
         return factory(*arguments)  # type: ignore[call-arg]
 
+    progress_kwargs: dict[str, Callable[[int, int], None]] = {}
+    if progress_callback is not None:
+        candidate_keywords: list[dict[str, object]] = [
+            {"selection_evaluator": selection_evaluator},
+        ]
+        if session_id is not None or session_ids is not None:
+            candidate_keywords.insert(
+                0,
+                {
+                    "selection_evaluator": selection_evaluator,
+                    "session_id": session_id,
+                    "session_ids": session_ids,
+                },
+            )
+        for keywords in candidate_keywords:
+            try:
+                signature.bind(*arguments, **keywords, progress_callback=progress_callback)
+            except TypeError:
+                continue
+            progress_kwargs["progress_callback"] = progress_callback
+            break
+
     if session_id is None and session_ids is None:
         try:
-            signature.bind(*arguments, selection_evaluator=selection_evaluator)
+            signature.bind(*arguments, selection_evaluator=selection_evaluator, **progress_kwargs)
         except TypeError:
             try:
                 signature.bind(*arguments, selection_evaluator)
@@ -1174,7 +1287,7 @@ def _open_snapshot(
                     ) from None
                 return factory(*arguments)  # type: ignore[call-arg]
             return factory(*arguments, selection_evaluator)  # type: ignore[call-arg]
-        return factory(*arguments, selection_evaluator=selection_evaluator)  # type: ignore[call-arg]
+        return factory(*arguments, selection_evaluator=selection_evaluator, **progress_kwargs)  # type: ignore[call-arg]
 
     try:
         signature.bind(
@@ -1182,13 +1295,14 @@ def _open_snapshot(
             selection_evaluator=selection_evaluator,
             session_id=session_id,
             session_ids=session_ids,
+            **progress_kwargs,
         )
     except TypeError:
         try:
             signature.bind(*arguments, selection_evaluator, session_id, session_ids)
         except TypeError:
             try:
-                signature.bind(*arguments, selection_evaluator=selection_evaluator)
+                signature.bind(*arguments, selection_evaluator=selection_evaluator, **progress_kwargs)
             except TypeError:
                 if require_selection_evidence:
                     raise ConfigurationError(
@@ -1201,13 +1315,14 @@ def _open_snapshot(
                     "snapshot_factory_session_filter_unsupported",
                     "the configured snapshot factory cannot apply a session filter safely",
                 ) from None
-            return factory(*arguments, selection_evaluator=selection_evaluator)  # type: ignore[call-arg]
+            return factory(*arguments, selection_evaluator=selection_evaluator, **progress_kwargs)  # type: ignore[call-arg]
         return factory(*arguments, selection_evaluator, session_id, session_ids)  # type: ignore[call-arg]
     return factory(
         *arguments,
         selection_evaluator=selection_evaluator,
         session_id=session_id,
         session_ids=session_ids,
+        **progress_kwargs,
     )  # type: ignore[call-arg]
 
 

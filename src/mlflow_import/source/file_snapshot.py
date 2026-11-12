@@ -6,7 +6,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -45,6 +45,7 @@ def create_file_snapshot(
     selection_evaluator: SelectionEvidenceEvaluator | None = None,
     session_id: str | None = None,
     session_ids: frozenset[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> Iterator[SourceSnapshot]:
     """Freeze one JSONL source into the same replay schema as SQLite sources."""
     if not path.exists() or path.is_symlink():
@@ -59,7 +60,11 @@ def create_file_snapshot(
         connection.executescript(_SNAPSHOT_SCHEMA)
         os.chmod(snapshot_path, 0o600)
         writer = SnapshotWriter(
-            connection, exporter.schema_generation, redaction, selection_evaluator=selection_evaluator
+            connection,
+            exporter.schema_generation,
+            redaction,
+            selection_evaluator=selection_evaluator,
+            progress_callback=progress_callback,
         )
         exporter.bind_connection(connection)
         stats = exporter.export_to_snapshot(writer, redaction, session_id, session_ids)

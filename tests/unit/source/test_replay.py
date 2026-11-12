@@ -35,6 +35,7 @@ from mlflow_import.source.model import (
 from mlflow_import.source.replay import NormalizedSnapshotAdapter, ReplayTurn
 from mlflow_import.source.snapshot import (
     ExportStats,
+    SnapshotWriter,
     SourceExporter,
     SourceSnapshot,
     create_normalized_snapshot,
@@ -143,7 +144,122 @@ def _build_current_fixture(tmp_path: Path) -> Path:
     return source
 
 
+def _snapshot_writer_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    connection.executescript(
+        """
+        CREATE TABLE snapshot_sessions (
+            session_id TEXT NOT NULL,
+            schema TEXT NOT NULL,
+            canonical_session_row TEXT NOT NULL,
+            directory_filter_match INTEGER NOT NULL,
+            model_filter_match INTEGER NOT NULL
+        );
+        CREATE TABLE snapshot_records (
+            session_id TEXT NOT NULL,
+            order_key TEXT NOT NULL,
+            source_table TEXT NOT NULL,
+            source_id TEXT,
+            canonical_record TEXT NOT NULL,
+            raw_permitted_fields TEXT NOT NULL
+        );
+        """
+    )
+    return connection
+
+
+def _write_scripted_record(writer: SnapshotWriter, source_id: str) -> None:
+    record = _record(source_id)
+    writer.write_record(record.record, record.order_key, record.canonical_record, record.raw_permitted_fields)
+
+
 class TestSnapshotCreation:
+    def test_each_record_batch_uses_one_transaction_in_autocommit_mode(self) -> None:
+        connection = _snapshot_writer_connection()
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            writer = SnapshotWriter(connection, "current", identity_redaction, write_batch=2)
+            _write_scripted_record(writer, "msg-1")
+            _write_scripted_record(writer, "msg-2")
+
+            transaction_statements = [
+                statement.upper() for statement in statements if statement.upper() in {"BEGIN", "COMMIT"}
+            ]
+            assert transaction_statements == ["BEGIN", "COMMIT"]
+            assert connection.in_transaction is False
+            assert connection.execute("SELECT count(*) FROM snapshot_records").fetchone()[0] == 2
+        finally:
+            connection.close()
+
+    def test_failed_record_batch_rolls_back_all_rows(self) -> None:
+        connection = _snapshot_writer_connection()
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_second_record
+            BEFORE INSERT ON snapshot_records
+            WHEN NEW.source_id = 'msg-2'
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic insert failure');
+            END;
+            """
+        )
+        try:
+            writer = SnapshotWriter(connection, "current", identity_redaction, write_batch=2)
+            _write_scripted_record(writer, "msg-1")
+
+            with pytest.raises(sqlite3.IntegrityError, match="synthetic insert failure"):
+                _write_scripted_record(writer, "msg-2")
+
+            assert connection.in_transaction is False
+            assert connection.execute("SELECT count(*) FROM snapshot_records").fetchone()[0] == 0
+        finally:
+            connection.close()
+
+    def test_record_batch_reports_committed_progress(self) -> None:
+        connection = _snapshot_writer_connection()
+        progress: list[tuple[int, int]] = []
+        try:
+            writer = SnapshotWriter(
+                connection,
+                "current",
+                identity_redaction,
+                write_batch=2,
+                progress_callback=lambda sessions, records: progress.append((sessions, records)),
+            )
+            _write_scripted_record(writer, "msg-1")
+            _write_scripted_record(writer, "msg-2")
+
+            assert progress == [(0, 2)]
+        finally:
+            connection.close()
+
+    def test_progress_counts_only_committed_sessions_and_reports_session_batches(self) -> None:
+        connection = _snapshot_writer_connection()
+        progress: list[tuple[int, int]] = []
+        try:
+            writer = SnapshotWriter(
+                connection,
+                "current",
+                identity_redaction,
+                write_batch=2,
+                progress_callback=lambda sessions, records: progress.append((sessions, records)),
+            )
+            session = _session()
+            writer.write_session(session.header, session.canonical_session_row)
+            _write_scripted_record(writer, "msg-1")
+            _write_scripted_record(writer, "msg-2")
+
+            assert progress == [(0, 2)]
+            assert connection.execute("SELECT count(*) FROM snapshot_sessions").fetchone()[0] == 0
+
+            writer.finalize()
+
+            assert progress == [(0, 2), (1, 2)]
+            assert connection.execute("SELECT count(*) FROM snapshot_sessions").fetchone()[0] == 1
+        finally:
+            connection.close()
+
     def test_snapshot_uses_restrictive_temporary_permissions(self, tmp_path: Path) -> None:
         source = _build_current_fixture(tmp_path)
         exporter = ScriptedExporter(sessions=[_session()], records=[_record("msg-1")])

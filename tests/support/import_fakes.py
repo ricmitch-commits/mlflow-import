@@ -602,6 +602,7 @@ def build_import_fakes(
         exporter: SourceExporter,
         redaction: RedactionCallback,
         selection_evaluator: SelectionEvidenceEvaluator,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> AbstractContextManager[SourceSnapshot]:
         return create_normalized_snapshot(
             path,
@@ -609,6 +610,7 @@ def build_import_fakes(
             exporter,
             redaction,
             selection_evaluator=selection_evaluator,
+            progress_callback=progress_callback,
         )
 
     return FakeImportDependencies(

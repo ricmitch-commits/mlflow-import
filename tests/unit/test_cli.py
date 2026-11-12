@@ -189,6 +189,53 @@ def test_main_runs_the_import_with_injected_dependencies(
     assert import_dependencies.lock_factory.acquisitions
 
 
+def test_debug_reports_phase_timing_and_snapshot_progress(
+    capsys: pytest.CaptureFixture[str],
+    config: ImportConfig,
+    import_dependencies: FakeImportDependencies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlflow_import.importer as importer
+
+    monkeypatch.setattr(importer, "SNAPSHOT_PROGRESS_INTERVAL", 1, raising=False)
+
+    assert main(_argv(config, "--log-level", "DEBUG", "--output", "json"), dependencies=import_dependencies) == 0
+
+    captured = capsys.readouterr()
+    assert "phase snapshot started" in captured.err
+    assert "phase snapshot progress sessions=" in captured.err
+    assert "records=" in captured.err
+    assert "phase snapshot complete elapsed_s=" in captured.err
+    assert "phase discovery complete elapsed_s=" in captured.err
+    assert "phase capability preflight complete elapsed_s=" in captured.err
+    assert json.loads(captured.out)["schema_version"] == "mlflow-import.result.v1"
+
+
+def test_debug_stderr_failure_does_not_fail_a_successful_import(
+    capsys: pytest.CaptureFixture[str],
+    config: ImportConfig,
+    import_dependencies: FakeImportDependencies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlflow_import.cli as cli
+
+    class FailingStderr:
+        def write(self, _value: str) -> int:
+            raise OSError("closed stderr")
+
+        def flush(self) -> None:
+            raise OSError("closed stderr")
+
+    monkeypatch.setattr(cli.sys, "stderr", FailingStderr())
+
+    assert main(_argv(config, "--log-level", "DEBUG", "--output", "json"), dependencies=import_dependencies) == 0
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["summary"]["turns_imported"] == 2
+    assert import_dependencies.gateway.mutations
+
+
 def test_main_writes_human_output_to_stdout(
     capsys: pytest.CaptureFixture[str], config: ImportConfig, import_dependencies: FakeImportDependencies
 ) -> None:
