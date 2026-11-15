@@ -267,6 +267,26 @@ def test_specs_convert_to_real_gateway_requests() -> None:
     assert children[0].span_type == "AGENT"
 
 
+@pytest.mark.parametrize("harness", ["opencode", "claude", "codex", "pi", "gemini"])
+@pytest.mark.parametrize("source_schema", ["current", "legacy"])
+def test_trace_name_uses_canonical_session_harness(harness: str, source_schema: str) -> None:
+    turn = _replay_turn(
+        [],
+        header=fake_header(
+            _SESSION_ID,
+            catalog_version=f"{harness}-persisted-v2",
+            metadata={"source": "conflicting-source", "mlflow.traceName": "source-title"},
+        ),
+    )
+
+    spec = map_turn_to_trace(turn, _context(source_schema=source_schema))
+    request = spec.to_create_request()
+
+    assert spec.trace_name == harness
+    assert request.trace_name == harness
+    assert spec.name == request.name == ("opencode_conversation" if source_schema == "legacy" else "opencode turn 1")
+
+
 def test_event_spec_converts_with_the_event_span_type() -> None:
     from mlflow_import.mlflow.gateway import TraceChildRequest
 

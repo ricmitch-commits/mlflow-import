@@ -304,7 +304,7 @@ def test_literal_native_and_structured_readback(live_server, tmp_path, harness, 
     assert trace.info.execution_duration == 0
     assert trace.info.experiment_id == result.report["experiment"]["id"]
     assert "hello" in trace.info.request_preview and "answer" in trace.info.response_preview
-    assert trace.info.tags.get("mlflow.traceName") is None
+    assert trace.info.tags["mlflow.traceName"] == harness
     assert trace.info.trace_metadata["mlflow.trace.session"] == "s"
     identity = json.loads(trace.info.tags["mlflow_import.qualified_session_id"])
     assert identity[:2] == ["v1", harness] and identity[-1] == "s" and len(identity[2]) == 64
@@ -411,7 +411,7 @@ def test_opencode_part_usage_cost_native_fields_and_immutable_metadata(live_serv
     assert trace.info.state.value == "OK"
     assert "literal prompt" in trace.info.request_preview
     assert "literal answer" in trace.info.response_preview
-    assert trace.info.tags.get("mlflow.traceName") is None
+    assert trace.info.tags["mlflow.traceName"] == "opencode"
     assert trace.info.token_usage == {
         "input_tokens": 100,
         "output_tokens": 10,

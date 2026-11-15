@@ -75,7 +75,8 @@ row update five milliseconds later, input `73202`, output `148`, total `73380`
 (including reasoning `30`). Canonical explicit totals `75104 + 75204 = 150308`
 and cache read `76928` remain in the retained accounting. Native cache and all
 cost columns are NULL even for recorded cost zero. The root span is
-`opencode_conversation`; native trace name and absent client request ID are NULL.
+`opencode_conversation`; native trace name is `opencode` via the `mlflow.traceName`
+tag, and absent client request ID is NULL.
 Native session and parent IDs are bare, while qualified source identity stays
 immutable in tags/artifacts. Previews select the last nonempty user/assistant
 text, newline-join parts (including synthetic user text), omit whitespace-only

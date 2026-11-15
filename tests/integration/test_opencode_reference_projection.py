@@ -67,7 +67,7 @@ def test_reference_projection_retains_raw_accounting_and_reruns(live_server, tmp
     assert info.request_time == start
     assert info.execution_duration == 15966
     assert info.client_request_id is None
-    assert info.tags.get("mlflow.traceName") is None
+    assert info.tags["mlflow.traceName"] == "opencode"
     assert info.request_preview == "first\nsynthetic context"
     assert info.response_preview == "answer\nlast"
     assert info.trace_metadata["mlflow.trace.session"] == session

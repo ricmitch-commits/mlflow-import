@@ -327,7 +327,8 @@ The inspected local MLflow schema contains these columns:
 | --- | --- |
 | `request_id`, `experiment_id` | MLflow trace identity and resolved destination experiment; preserve source IDs separately. |
 | `timestamp_ms`, `execution_time_ms`, `status` | Source turn start time, duration, and normalized outcome, as defined in Section 8.3. |
-| `client_request_id`, `trace_name` | Attributable source values only; absent values stay NULL. Root span name and operation key are separate fields. |
+| `client_request_id` | Attributable source value only; absent values stay NULL. The operation key is a separate field. |
+| `trace_name` | Canonical per-session harness (`opencode`, `claude`, `codex`, `pi`, or `gemini`) via the `mlflow.traceName` tag. Root span names remain separate. |
 | `request_preview`, `response_preview` | Explicit reference-equivalent previews; OpenCode newline-joins text parts (including synthetic user parts), truncated to 1000 UTF-16 units. Retain complete structured inputs/outputs separately. |
 | `session_id` | Bare native source session ID; qualified harness/source/session identity remains in `mlflow_import.qualified_session_id` creation tags and artifacts. |
 | `input_tokens`, `output_tokens`, `total_tokens` | Available normalized turn token usage, without double-counting cumulative or repeated totals. |

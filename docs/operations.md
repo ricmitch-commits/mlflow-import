@@ -104,7 +104,8 @@ stores, and ownership/operation tags to diagnose recovery. Request metadata carr
 only optional `parent_session_id` plus MLflow-owned/promoted API fields. OpenCode
 native cache/cost columns intentionally remain NULL; use canonical accounting in
 the turn/session artifacts for richer raw observations. Absent native client IDs
-and trace names are NULL; `opencode_conversation` is the root span name. Old
+are NULL. Imported trace names use the canonical per-session harness through the
+`mlflow.traceName` tag; `opencode_conversation` is the OpenCode root span name. Old
 ownership metadata is still read, with conflicting aliases rejected. A mapping
 version change replaces affected traces through the normal verified recovery
 workflow; it does not copy or move reference traces between experiments.

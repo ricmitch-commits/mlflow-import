@@ -9,7 +9,8 @@
 ### Mapping-v8 native projection migration
 
 The historical object-ingestion API now carries bare native session/parent IDs,
-source-only nullable client request identity, independent nullable trace name,
+source-only nullable client request identity, canonical per-session harness trace name
+(via the `mlflow.traceName` tag, independent of root span names),
 explicit previews and separate native analytics. OpenCode matches the 0.4.0
 plugin reference: semantic message duration, newline text previews, reasoning in
 native total, and NULL native cache/cost columns. Canonical `accounting-v2` retains

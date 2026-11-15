@@ -106,6 +106,7 @@ from mlflow_import.content.fingerprint import (
     source_fingerprint,
 )
 from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
+from mlflow_import.identity import harness_name
 from mlflow_import.mlflow.reconciliation import ARTIFACT_PATH_TAG
 from mlflow_import.source.model import SessionHeader, SourceRecord, TurnSummary
 from mlflow_import.source.model_identity import extract_model_identity
@@ -919,6 +920,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     the spec with a LAZY child cursor over the turn's records.
     """
     header = turn.session_header
+    harness = harness_name(header)
     summary = turn.summary
     inline_limit = resolve_inline_limit(context.inline_limit_bytes)
 
@@ -1000,9 +1002,8 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     native_session_id = header.session_id
     current_tags: dict[str, str] = {}
     if callable(getattr(turn, "iter_all_records", None)):
-        from mlflow_import.identity import harness_name, native_metadata, qualified_session
+        from mlflow_import.identity import native_metadata, qualified_session
 
-        harness = harness_name(header)
         metadata["mlflow_import.qualified_session_id"] = qualified_session(header)
         immutable = {
             "opencode.importer",
@@ -1144,6 +1145,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         root_output = None if root_output in ({}, []) else root_output
     return TraceSpec(
         client_request_id=request_id,
+        trace_name=harness,
         experiment_id=context.experiment_id,
         name=(
             ("opencode_conversation" if harness == "opencode" else f"{harness} {summary.turn_key}")

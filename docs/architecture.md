@@ -150,7 +150,8 @@ Every adapter targets the same requirements §8.0 `trace_info` contract through 
 | --- | --- |
 | `request_id`, `experiment_id` | MLflow-generated trace identity and resolved experiment; source IDs remain separate. |
 | `timestamp_ms`, `execution_time_ms`, `status` | Source turn start, interval, and normalized terminal outcome; retain raw precision and measured/derived/unknown provenance. |
-| `client_request_id`, `trace_name` | Attributable source values or NULL; operation key and root name are independent. |
+| `client_request_id` | Attributable source value or NULL; independent of the operation key. |
+| `trace_name` | Canonical per-session harness (`opencode`, `claude`, `codex`, `pi`, or `gemini`) via the `mlflow.traceName` tag; independent of the root span name. |
 | `request_preview`, `response_preview` | Explicit reference-native previews; verify exact values and absence separately from structured root payloads. |
 | `session_id` | Bare native source ID in `mlflow.trace.session`; qualified identity remains under Section 4's immutable tag. |
 | `input_tokens`, `output_tokens`, `total_tokens` | Authoritative turn usage under the accounting rules below, including source totals that differ from input plus output. |
@@ -165,7 +166,7 @@ Each trace has native `mlflow.trace.session` metadata, immutable source identity
 Initial creation tags hold immutable ownership, source/user/Git facts, versions and operation keys before spans upload. Only optional bare `parent_session_id` is arbitrary physical request metadata, alongside MLflow-owned finalization and promoted native session/usage/cost API keys. `compatibility.decode_ownership` and `request_ownership` normalize creation tags and legacy metadata/aliases, rejecting contradictory evidence. Searches union paginated tag and metadata ownership and deduplicate IDs. Refreshable fields alone use **mutable trace tags**; remove obsolete managed values while preserving unrelated tags. Keep full provenance in artifacts; validate field lengths before writes.
 
 `mapping-v8` separates native analytics from canonical `accounting-v2`. OpenCode
-roots are `opencode_conversation`, with NULL native trace name, source-only client
+roots are `opencode_conversation`, with `opencode` native trace name, source-only client
 request identity, plugin text previews, semantic message timing, input/output plus
 reasoning native total, and NULL native cache/cost fields. Raw explicit totals,
 cache and persisted costs remain in spans/artifacts. Other harnesses preserve
