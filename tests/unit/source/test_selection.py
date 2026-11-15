@@ -75,7 +75,7 @@ class TestTimeBounds:
         # The summary exposes exactly one time field — the session creation
         # instant. Message timestamps and time_updated never enter selection.
         time_fields = [item.name for item in dataclass_fields(SessionDiscoverySummary) if "time" in item.name]
-        assert time_fields == ["creation_time"]
+        assert time_fields == ["creation_time", "creation_time_ns"]
 
     def test_missing_creation_time_is_selectable_without_time_filters(self, summary: SessionDiscoverySummary) -> None:
         missing = replace(summary, creation_time=None)

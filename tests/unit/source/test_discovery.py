@@ -483,16 +483,13 @@ def test_discovery_selects_only_sessions_matching_every_supplied_filter(
         scans = {scan.session_id: scan for scan in reader.iter_session_scans()}
         turns = list(reader.iter_turns())
 
-    assert stats.session_scan_count == 2
+    assert stats.session_scan_count == 1
     assert stats.selected_session_count == 1
     assert stats.turn_entry_count == 1
     assert scans["ses-a"].selected is True
     assert scans["ses-a"].retirement_scope is True
-    # The unselected session still gets a scan entry (with its turn count),
-    # but none of its turns enter the plan.
-    assert scans["ses-b"].selected is False
-    assert scans["ses-b"].retirement_scope is False
-    assert scans["ses-b"].logical_turn_count == 1
+    # Header pushdown excludes unrelated transcript rows before freezing.
+    assert "ses-b" not in scans
     assert [turn.session_id for turn in turns] == ["ses-a"]
 
 
@@ -611,7 +608,9 @@ def test_discovery_writes_one_turn_entry_per_logical_turn(tmp_path: Path, restri
         assert entry.terminal_outcome == summary.terminal_outcome
         assert entry.start_time_ns == summary.start_time.nanoseconds
         assert entry.end_time_ns == summary.end_time.nanoseconds
-        assert entry.warnings == summary.warnings
+        assert (
+            tuple(code for code in entry.warnings if not code.startswith("coverage_unavailable_")) == summary.warnings
+        )
 
 
 def test_discovery_fingerprints_use_the_task4a_functions(tmp_path: Path, restrictive_tmp_path: Path) -> None:

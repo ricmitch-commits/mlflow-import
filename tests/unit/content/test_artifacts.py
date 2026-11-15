@@ -814,8 +814,13 @@ class TestArtifactIntegrationWithFingerprints:
 
         source = Path(artifacts_module.__file__).read_text(encoding="utf-8")
 
-        assert "import mlflow" not in source
-        assert "from mlflow" not in source
+        import ast
+
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                assert all(alias.name.split(".")[0] != "mlflow" for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] != "mlflow"
 
     def test_snapshot_fingerprint_matches_the_public_artifact_function(self) -> None:
         turn = _turn_pair()[0]

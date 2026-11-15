@@ -71,10 +71,15 @@ def open_live_connection(
     _validate_source_path(path)
     uri = _read_only_uri(path)
     try:
-        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        from mlflow_import.resources import reader_connect
+
+        connection = reader_connect(uri, uri=True, isolation_level=None)
     except sqlite3.Error as error:
         raise SnapshotError("source_unavailable", _SOURCE_OPEN_FAILED) from error
     try:
+        from mlflow_import.resources import configure_reader
+
+        configure_reader(connection)
         connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
         connection.execute("PRAGMA query_only = ON")
         try:

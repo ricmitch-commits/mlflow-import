@@ -39,8 +39,8 @@ emission order, zipped with the session stream through
 :class:`OrderedGroupReader` (one row of lookahead, bounded memory, a
 constant number of statements regardless of row counts). SQLite executes
 the unindexed joins through automatic transient indexes and the ORDER BY
-through its disk-backed sorter, so the export cost is a near-linear
-number of row visits instead of one full scan per session. The implicit
+through structural-locator ordering and indexed payload lookups, so the export
+does not sort transcript bytes or repeat a full scan per session. The implicit
 ``rowid`` discriminates duplicate session rows and nullable-ID child rows
 during the merge; tables without one (``WITHOUT ROWID``) fall back to the
 per-session queries, declared primary-key ordering where available, and
@@ -52,12 +52,14 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
 from mlflow_import.contracts import CanonicalRecordEnvelope
+from mlflow_import.errors import SourceCompatibilityError
 from mlflow_import.source.catalog import SchemaCatalog
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.model import (
     SchemaDescription,
     SchemaGeneration,
@@ -80,6 +82,7 @@ from mlflow_import.source.normalize import (
     evaluate_classification,
     fallback_source_identity,
     has_rowid,
+    located_rows,
     normalize_completion_timestamp,
     normalize_epoch_ms,
     permitted_observed_columns,
@@ -257,9 +260,9 @@ class CurrentAdapter:
         self.connection = connection
         self._export_warnings: list[str] = []
         self._tracker: IdentityTracker | None = None
-        self._known_session_ids: set[str] = set()
-        self._overlap_session_ids: frozenset[str] = frozenset()
-        self._active_session_blob_references: set[str] = set()
+        self._known_session_ids = DiskIds()
+        self._overlap_session_ids: Collection[str] = frozenset()
+        self._active_session_blob_references = DiskIds()
         self._columns: dict[str, tuple[str, ...]] = {}
         self._rowid_tables: dict[str, bool] = {}
         self._primary_key_columns: dict[str, tuple[str, ...]] = {}
@@ -294,7 +297,7 @@ class CurrentAdapter:
         writer: SnapshotWriter,
         redaction: RedactionCallback,
         session_id: str | None = None,
-        session_ids: frozenset[str] | None = None,
+        session_ids: Collection[str] | None = None,
     ) -> ExportStats:
         self.begin_export(selected_session_id=session_id, selected_session_ids=session_ids)
         for _key, row, child_key in self.iter_exportable_sessions():
@@ -317,15 +320,15 @@ class CurrentAdapter:
     def begin_export(
         self,
         *,
-        overlap_session_ids: frozenset[str] = frozenset(),
+        overlap_session_ids: Collection[str] = frozenset(),
         selected_session_id: str | None = None,
-        selected_session_ids: frozenset[str] | None = None,
+        selected_session_ids: Collection[str] | None = None,
     ) -> None:
         """Reset per-export state; overlapping mixed IDs warn on the header."""
         self._export_warnings = []
         self._tracker = IdentityTracker(self.schema_generation)
-        self._known_session_ids = set()
-        self._overlap_session_ids = frozenset(overlap_session_ids)
+        self._known_session_ids = DiskIds()
+        self._overlap_session_ids = overlap_session_ids
         self._selected_session_ids = (
             selected_session_ids
             if selected_session_ids is not None
@@ -333,7 +336,7 @@ class CurrentAdapter:
             if selected_session_id is not None
             else None
         )
-        self._active_session_blob_references = set()
+        self._active_session_blob_references = DiskIds()
         self._columns = {table: permitted_observed_columns(self.connection, table) for table in _ALL_CURRENT_TABLES}
         self._rowid_tables = {
             table: bool(columns) and has_rowid(self.connection, table) for table, columns in self._columns.items()
@@ -347,6 +350,17 @@ class CurrentAdapter:
         self._joined_children = bool(self._columns[SESSION_TABLE]) and self._rowid_tables.get(SESSION_TABLE, False)
         if self._joined_children:
             self._open_child_readers()
+
+    def _ordered_table_rows(self, table: str, select: str, suffix: str, parameters: Sequence[object]) -> Iterator[Any]:
+        locators = ("rowid",) if self._rowid_tables.get(table) else self._primary_key_columns.get(table, ())
+        if locators and all(key == "rowid" or key in self._columns[table] for key in locators):
+            locator_select = ", ".join(quote_identifier(key) for key in locators)
+            sql = f"SELECT {locator_select} FROM {quote_identifier(table)}{suffix}"
+            lookup = f"SELECT {select} FROM {quote_identifier(table)} WHERE " + " AND ".join(
+                f"{quote_identifier(key)} IS ?" for key in locators
+            )
+            return located_rows(self.connection, sql, parameters, lookup, len(locators))
+        return iter(self.connection.execute(f"SELECT {select} FROM {quote_identifier(table)}{suffix}", parameters))
 
     def iter_exportable_sessions(
         self,
@@ -367,17 +381,19 @@ class CurrentAdapter:
             select += ", rowid"
             order += ", rowid"
         where, parameters = self._session_predicate("id")
-        sql = f"SELECT {select} FROM {quote_identifier(SESSION_TABLE)}{where} ORDER BY {order}"
-        for row in self.connection.execute(sql, parameters):
+        rows = self._ordered_table_rows(SESSION_TABLE, select, f"{where} ORDER BY {order}", parameters)
+        for row in rows:
             values = dict(zip(columns, row[: len(columns)], strict=True))
             raw_id = values.get("id")
             if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
-                self._export_warnings.append(SESSION_MISSING_ID_WARNING)
-                continue
+                raise SourceCompatibilityError(
+                    "invalid_session_identity", "an authoritative session header has no identity"
+                )
             session_id = str(raw_id)
             if not tracker.register_explicit(SESSION_TABLE, session_id):
-                self._export_warnings.append(DUPLICATE_SESSION_ID_WARNING)
-                continue
+                raise SourceCompatibilityError(
+                    "duplicate_session_identity", "authoritative session headers have duplicate identities"
+                )
             self._known_session_ids.add(session_id)
             sort_key = session_row_sort_key(values)
             child_key = (*sort_key, row[len(columns)]) if self._joined_children else tuple(sort_key)
@@ -403,7 +419,7 @@ class CurrentAdapter:
                 warnings=(),
             ),
         )
-        self._active_session_blob_references = set()
+        self._active_session_blob_references = DiskIds()
         try:
             self._emit_messages(writer, session_id, child_key)
             self._emit_scoped(writer, session_id, child_key)
@@ -506,6 +522,14 @@ class CurrentAdapter:
         ):
             blob_width = len(blob_columns)
             blob_select = ", ".join(f"b.{quote_identifier(name)}" for name in blob_columns)
+            body_select = blob_select
+            blob_keys = (
+                ("rowid",) if self._rowid_tables.get(BLOB_TABLE) else self._primary_key_columns.get(BLOB_TABLE, ())
+            )
+            if not all(key == "rowid" or key in blob_columns for key in blob_keys):
+                blob_keys = ()
+            if blob_keys:
+                blob_select = ", ".join(f"b.{quote_identifier(key)}" for key in blob_keys)
             blob_select += f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
             blob_order = ", ".join((_SESSION_ORDER, "s.rowid", f"b.{quote_identifier('hash')}"))
             selected, parameters = self._session_predicate("s.id")
@@ -518,7 +542,13 @@ class CurrentAdapter:
             )
 
             def blob_pairs() -> Iterator[tuple[tuple[Any, ...], dict[str, object]]]:
-                cursor = self.connection.execute(blob_sql, parameters)
+                if blob_keys:
+                    lookup = f"SELECT {body_select} FROM {quote_identifier(BLOB_TABLE)} b WHERE " + " AND ".join(
+                        f"b.{quote_identifier(key)} IS ?" for key in blob_keys
+                    )
+                    cursor = located_rows(self.connection, blob_sql, parameters, lookup, len(blob_keys))
+                else:
+                    cursor = self.connection.execute(blob_sql, parameters)
                 for row in cursor:
                     session_key = session_order_key(row[blob_width], row[blob_width + 1])
                     yield ((*session_key, row[blob_width + 2]), dict(zip(blob_columns, row[:blob_width], strict=True)))
@@ -541,6 +571,12 @@ class CurrentAdapter:
         select = ", ".join(f"{alias}.{quote_identifier(name)}" for name in columns)
         if include_rowid:
             select += f", {alias}.rowid"
+        payload_select = select
+        locators = ("rowid",) if self._rowid_tables.get(table) else self._primary_key_columns.get(table, ())
+        if locators and all(key == "rowid" or key in columns for key in locators):
+            select = ", ".join(f"{alias}.{quote_identifier(key)}" for key in locators)
+        else:
+            locators = ()
         select += f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
         table_order = f", {order_by}" if order_by else ""
         rowid_order = f", {alias}.rowid" if include_rowid else ""
@@ -553,7 +589,13 @@ class CurrentAdapter:
         )
 
         def pairs() -> Iterator[tuple[tuple[Any, ...], dict[str, object]]]:
-            cursor = self.connection.execute(sql, parameters)
+            if locators:
+                lookup = f"SELECT {payload_select} FROM {quote_identifier(table)} {alias} WHERE " + " AND ".join(
+                    f"{alias}.{quote_identifier(key)} IS ?" for key in locators
+                )
+                cursor = located_rows(self.connection, sql, parameters, lookup, len(locators))
+            else:
+                cursor = self.connection.execute(sql, parameters)
             for row in cursor:
                 rowid_offset = 1 if include_rowid else 0
                 session_key = session_order_key(row[width + rowid_offset], row[width + rowid_offset + 1])
@@ -568,6 +610,8 @@ class CurrentAdapter:
         ids = self._selected_session_ids
         if ids is None:
             return "", ()
+        if isinstance(ids, DiskIds):
+            return ids.predicate(self.connection, expression)
         placeholders = ", ".join("?" for _ in ids)
         return f" WHERE {expression} IN ({placeholders})", tuple(ids)
 
@@ -697,11 +741,8 @@ class CurrentAdapter:
         if include_rowid:
             select += ", rowid"
         rowid_order = ", rowid" if include_rowid else ""
-        sql = (
-            f"SELECT {select} FROM {quote_identifier(MESSAGE_TABLE)}"
-            f" WHERE session_id = ? ORDER BY {_numeric_order('seq', 'id')}{rowid_order}"
-        )
-        for row in self.connection.execute(sql, (session_id,)):
+        suffix = f" WHERE session_id = ? ORDER BY {_numeric_order('seq', 'id')}{rowid_order}"
+        for row in self._ordered_table_rows(MESSAGE_TABLE, select, suffix, (session_id,)):
             values = dict(zip(columns, row[: len(columns)], strict=True))
             if include_rowid:
                 values[_ROWID_KEY] = row[len(columns)]
@@ -717,7 +758,7 @@ class CurrentAdapter:
             message_rowid = values.pop(_ROWID_KEY, None)
             raw_id = values.get("id")
             message_id = _text(raw_id)
-            if message_id is not None and not tracker.register_explicit(MESSAGE_TABLE, message_id):
+            if message_id is not None and not tracker.register_explicit(MESSAGE_TABLE, message_id, message_rowid):
                 continue
             decoded_column = decode_json_column(values.get("data"))
             decoded = decoded_column.decoded
@@ -889,9 +930,8 @@ class CurrentAdapter:
             select += ", rowid"
         order_clause = f" ORDER BY {order_by}" if order_by else ""
         if include_rowid:
-            order_clause += ", rowid"
-        sql = f"SELECT {select} FROM {quote_identifier(table)} WHERE session_id = ?{order_clause}"
-        for row in self.connection.execute(sql, (session_id,)):
+            order_clause = order_clause + ", rowid" if order_clause else " ORDER BY rowid"
+        for row in self._ordered_table_rows(table, select, f" WHERE session_id = ?{order_clause}", (session_id,)):
             values = dict(zip(columns, row[: len(columns)], strict=True))
             if include_rowid:
                 values[_ROWID_KEY] = row[len(columns)]
@@ -915,7 +955,7 @@ class CurrentAdapter:
         for values in self._scoped_rows(session_id, child_key, table, order_by):
             row_discriminator = values.pop(_ROWID_KEY, None)
             source_id = _text(values.get("id")) if "id" in values else None
-            if source_id is not None and not tracker.register_explicit(table, source_id):
+            if source_id is not None and not tracker.register_explicit(table, source_id, row_discriminator):
                 continue
             warnings: list[str] = []
             decoded: object | None = None
@@ -1026,7 +1066,7 @@ class CurrentAdapter:
                 if _text(values.get("hash")) in emitted_references
             )
         else:
-            referenced = sorted(emitted_references)
+            referenced = emitted_references
 
             def per_hash_rows() -> Iterator[dict[str, object]]:
                 select = ", ".join(quote_identifier(name) for name in columns)

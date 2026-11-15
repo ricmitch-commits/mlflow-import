@@ -245,6 +245,12 @@ class FakeTraceInfo:
     state: str = "IN_PROGRESS"
     tags: dict[str, str] = field(default_factory=dict)
     trace_metadata: dict[str, str] = field(default_factory=dict)
+    client_request_id: str | None = None
+    execution_duration: int | None = None
+    token_usage: dict[str, int] | None = None
+    cost: dict[str, float] | None = None
+    request_preview: str | None = None
+    response_preview: str | None = None
 
 
 @dataclass
@@ -343,6 +349,17 @@ class FakeTraceApi:
     def __init__(self, client: FakeMlflowClient) -> None:
         self._client = client
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def record_native_info(self, trace_id: str, spec: TraceCreateRequest) -> None:
+        info = self._client._traces[trace_id].info
+        info.client_request_id = spec.client_request_id
+        info.execution_duration = ((spec.end_time_ns or 0) - (spec.start_time_ns or 0)) // 1_000_000
+        info.token_usage = spec.native_usage
+        info.cost = spec.native_cost
+        if spec.trace_name is not None:
+            info.tags["mlflow.traceName"] = spec.trace_name
+        info.request_preview = spec.request_preview
+        info.response_preview = spec.response_preview
 
     def start_span_no_context(
         self,
@@ -751,6 +768,9 @@ def _numeric_suffix(value: str) -> int:
 def _matches_filter(trace: FakeTrace, filter_string: str | None) -> bool:
     if not filter_string:
         return True
+    identity = re.fullmatch(r"request_id\s*=\s*'([^']*)'", filter_string.strip())
+    if identity is not None:
+        return trace.trace_id == identity.group(1)
     match = _FILTER_PATTERN.match(filter_string.strip())
     if match is None:
         raise FakeMlflowException(f"unsupported filter string: {filter_string}", "INVALID_PARAMETER")
@@ -1382,6 +1402,10 @@ class FakeMlflowGateway:
                 "trace_verification_failed",
                 "the owned candidate trace could not be retrieved",
             )
+        from mlflow_import.compatibility import decode_ownership
+
+        trace = copy.copy(trace)
+        trace.metadata = decode_ownership(trace.tags, trace.metadata)
         if expected.ownership_errors:
             self.events.append(GatewayEvent("candidate_verify", (candidate.trace_id, False)))
             return CandidateVerification(
@@ -1524,6 +1548,10 @@ class FakeMlflowGateway:
         trace = self._traces.get(trace_id)
         if trace is None or trace.experiment_id != experiment_id:
             raise ItemImportError("ownership_conflict", "the trace identity changed before retirement")
+        from mlflow_import.compatibility import decode_ownership
+
+        trace = copy.copy(trace)
+        trace.metadata = decode_ownership(trace.tags, trace.metadata)
         if not self._has_exact_ownership_marker(trace):
             raise ItemImportError("ownership_conflict", "the importer ownership marker changed before retirement")
         _, warning_metadata_valid = _parse_warning_metadata(trace.metadata.get("opencode.warnings"))
@@ -1702,6 +1730,10 @@ class FakeMlflowGateway:
         trace = self._traces.get(trace_id)
         if trace is None or trace.experiment_id != experiment_id:
             raise ItemImportError("trace_retirement_failed", "the tracking target did not report the trace as retired")
+        from mlflow_import.compatibility import decode_ownership
+
+        trace = copy.copy(trace)
+        trace.metadata = decode_ownership(trace.tags, trace.metadata)
         if not self._has_exact_ownership_marker(trace):
             raise ItemImportError("ownership_conflict", "the importer ownership marker changed before retirement")
         if session_id is None or turn_key is None:

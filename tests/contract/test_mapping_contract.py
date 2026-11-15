@@ -132,9 +132,9 @@ def test_six_turn_specs_round_trip_through_the_fake_gateway(six_turn_session) ->
 
         # The ownership metadata the fake stores is the exact submitted
         # set (native session key included by the gateway contract).
-        assert created.verified_metadata["opencode.importer"] == IMPORTER_IDENTITY
-        assert created.verified_metadata["opencode.session_id"] == six_turn_session.session_id
-        assert created.verified_metadata["opencode.operation_key"] == spec.expected_operation_key
+        assert created.verified_tags["opencode.importer"] == IMPORTER_IDENTITY
+        assert created.verified_tags["opencode.session_id"] == six_turn_session.session_id
+        assert created.verified_tags["opencode.operation_key"] == spec.expected_operation_key
 
     assert len(set(created_ids)) == 6
     assert [event.kind for event in fake.events].count("trace_create") == 6

@@ -191,7 +191,7 @@ def test_catalog_version_survives_snapshot_replay_discovery_mapping_and_artifact
         )
         document = json.loads(artifact.getvalue())
 
-    assert request.metadata["opencode.catalog_version"] == catalog_version
+    assert request.root_tags["opencode.catalog_version"] == catalog_version
     assert document["artifact"]["catalog_version"] == catalog_version
 
 
@@ -211,7 +211,7 @@ def test_catalog_version_changes_artifact_snapshot_identity_but_not_database_pro
             (summary,) = iter_turn_summaries(adapter.iter_records("ses-wave2"))
             turn = build_replay_turn(snapshot, header, summary)
             request = map_turn_to_trace(turn, _context(snapshot.fingerprint, version)).to_create_request()
-            fingerprints.append(request.metadata["mlflow_import.source_fingerprint"])
+            fingerprints.append(request.root_tags["mlflow_import.source_fingerprint"])
             snapshots.append(request.artifact_snapshot_fingerprint)
             database_fingerprints.append(snapshot.fingerprint)
 
@@ -301,7 +301,14 @@ def test_explicit_error_and_lifecycle_outcomes_are_not_lost_and_success_supersed
                 1_772_000_002_100,
                 {"error": {"message": "synthetic failure"}, "content": []},
             ),
-            ("assistant-success", "assistant", 3, 1_772_000_003_000, 1_772_000_003_100, {"content": []}),
+            (
+                "assistant-success",
+                "assistant",
+                3,
+                1_772_000_003_000,
+                1_772_000_003_100,
+                {"content": [], "finish": "stop"},
+            ),
         ],
     )
     with _real_current_turn(source, tmp_path) as snapshot:
@@ -343,7 +350,14 @@ def test_all_failure_signals_survive_adapter_snapshot_replay_mapping_and_fake_ga
                     ],
                 },
             ),
-            ("assistant-success", "assistant", 3, 1_772_000_003_000, 1_772_000_003_100, {"content": []}),
+            (
+                "assistant-success",
+                "assistant",
+                3,
+                1_772_000_003_000,
+                1_772_000_003_100,
+                {"content": [], "finish": "stop"},
+            ),
         ],
     )
     connection = sqlite3.connect(source)
@@ -376,7 +390,7 @@ def test_all_failure_signals_survive_adapter_snapshot_replay_mapping_and_fake_ga
         gateway.verify_trace(created, request)
 
     assert request.root_status == "ERROR"
-    assert request.metadata["opencode.outcome"] == "lifecycle_failed"
+    assert request.root_tags["opencode.outcome"] == "lifecycle_failed"
     assert children["session_message:assistant-error"].status == "ERROR"
     tool = next(child for child in children.values() if child.span_type == "TOOL")
     assert tool.status == "ERROR"
@@ -439,7 +453,7 @@ def test_lifecycle_records_map_as_children_once_in_the_artifact(tmp_path: Path) 
         if record.get("source_id") == "pending-1"
     ]
     assert locations == ["pending-1"]
-    assert document["artifact"]["catalog_version"] == request.metadata["opencode.catalog_version"]
+    assert document["artifact"]["catalog_version"] == request.root_tags["opencode.catalog_version"]
 
 
 def test_colliding_message_and_part_ids_keep_qualified_parent_lineage(tmp_path: Path) -> None:
@@ -525,14 +539,14 @@ def test_uploaded_artifact_carries_exact_mapped_provenance(six_turn_session, tmp
     document = json.loads(gateway.stored_artifact(created.trace_id, verification.relative_path).decode("utf-8"))
     artifact = document["artifact"]
 
-    assert artifact["source_database_fingerprint"] == request.metadata["mlflow_import.source_database_fingerprint"]
-    assert artifact["source_fingerprint"] == request.metadata["mlflow_import.source_fingerprint"]
-    assert artifact["render_fingerprint"] == request.metadata["opencode.render_fingerprint"]
+    assert artifact["source_database_fingerprint"] == request.root_tags["mlflow_import.source_namespace"]
+    assert artifact["source_fingerprint"] == request.root_tags["mlflow_import.source_fingerprint"]
+    assert artifact["render_fingerprint"] == request.root_tags["opencode.render_fingerprint"]
     assert artifact["artifact_snapshot_fingerprint"] == request.artifact_snapshot_fingerprint
     assert artifact["artifact_path"] == request.artifact_relative_path
-    assert artifact["source_schema"] == request.metadata["mlflow_import.source_schema"]
-    assert artifact["mapping_version"] == request.metadata["opencode.mapping_version"]
-    assert artifact["redaction_mode"] == request.metadata["opencode.redaction_mode"]
+    assert artifact["source_schema"] == request.root_tags["mlflow_import.source_schema"]
+    assert artifact["mapping_version"] == request.root_tags["opencode.mapping_version"]
+    assert artifact["redaction_mode"] == request.root_tags["opencode.redaction_mode"]
 
 
 @pytest.mark.parametrize(
@@ -693,10 +707,10 @@ def test_pending_assistant_outcome_is_incomplete_from_source_to_trace(tmp_path: 
         created = gateway.create_trace(request)
         gateway.verify_trace(created, request)
 
-    assert request.root_status == "UNSET"
+    assert request.root_status == "ERROR"
     assert request.root_outputs is None
-    assert request.metadata["opencode.outcome"] == pending
-    assert created.root_status == "UNSET"
+    assert request.root_tags["opencode.outcome"] == pending
+    assert created.root_status == "ERROR"
 
 
 def test_later_success_supersedes_pending_assistant_outcome(tmp_path: Path) -> None:
@@ -712,7 +726,14 @@ def test_later_success_supersedes_pending_assistant_outcome(tmp_path: Path) -> N
                 1_772_000_002_100,
                 {"content": [], "status": "running"},
             ),
-            ("assistant-success", "assistant", 3, 1_772_000_003_000, 1_772_000_003_100, {"content": []}),
+            (
+                "assistant-success",
+                "assistant",
+                3,
+                1_772_000_003_000,
+                1_772_000_003_100,
+                {"content": [], "finish": "stop"},
+            ),
         ],
     )
     with _real_current_turn(source, tmp_path) as snapshot:

@@ -63,13 +63,14 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, cast
+from typing import IO, Any, cast
 
 from mlflow_import import __version__ as _IMPORTER_VERSION
+from mlflow_import import resources
 from mlflow_import.content.fingerprint import (
     build_effective_turn,
     render_fingerprint,
@@ -90,14 +91,21 @@ from mlflow_import.source.model import (
 from mlflow_import.source.model_identity import extract_model_identity
 from mlflow_import.source.ordering import session_sort_key
 from mlflow_import.source.outcomes import SESSION_EVENT_TABLES
+from mlflow_import.source.replay import NormalizedSnapshotAdapter, _restore_session_header
 from mlflow_import.source.selection import (
     SelectionEvidence,
     SelectionFilters,
     SessionDiscoverySummary,
     select_session,
 )
-from mlflow_import.source.snapshot import SourceSnapshot
-from mlflow_import.source.turns import build_replay_turn, iter_turn_summaries
+from mlflow_import.source.snapshot import (
+    SourceSnapshot,
+    _session_storage_fields,
+    dumps_snapshot_json,
+    loads_snapshot_json,
+)
+from mlflow_import.source.spool import PayloadSpool, read_payload
+from mlflow_import.source.turns import build_replay_turn, indexed_turn_summaries, iter_turn_summaries
 
 __all__ = [
     "ARTIFACT_SCHEMA_VERSION",
@@ -116,10 +124,10 @@ __all__ = [
 DISCOVERY_PLAN_SCHEMA_VERSION = "mlflow-import-discovery-plan-v1"
 """Schema version of the discovery plan; the reader rejects any other value."""
 
-ARTIFACT_SCHEMA_VERSION = "artifact-v2"
+ARTIFACT_SCHEMA_VERSION = "artifact-v3"
 """Artifact schema version recorded as a render-contract input in the plan."""
 
-MAPPING_VERSION = "mapping-v4"
+MAPPING_VERSION = "mapping-v8"
 """Turn-to-trace mapping version recorded as a render-contract input in the plan."""
 
 PLANNED_ACTION_IMPORT = "import"
@@ -243,7 +251,7 @@ class DiscoveryPlanWriter:
 
     def __init__(self, plan_path: Path) -> None:
         self._plan_path = plan_path
-        self._handle: IO[str] = plan_path.open("w", encoding="utf-8", newline="\n")
+        self._handle: IO[str] = resources.open_file(plan_path, "w", encoding="utf-8", newline="\n")
         try:
             os.chmod(plan_path, 0o600)
             self._handle.write(
@@ -285,10 +293,9 @@ class _TurnSummarySpool:
     """Restrictive disk-backed replay for one session's sanitized summaries."""
 
     def __init__(self, directory: Path) -> None:
-        descriptor, path = tempfile.mkstemp(prefix=".turn-summaries-", suffix=".jsonl", dir=directory)
-        os.chmod(path, 0o600)
-        self._path = Path(path)
-        self._handle: IO[str] | None = os.fdopen(descriptor, "w+", encoding="utf-8", newline="\n")
+        self._handle, self._path = resources.open_temp_file(
+            prefix=".turn-summaries-", suffix=".jsonl", dir=directory, mode="w+", encoding="utf-8", newline="\n"
+        )
         self._closed = False
 
     def write(self, summary: TurnSummary) -> None:
@@ -305,7 +312,7 @@ class _TurnSummarySpool:
             handle = self._handle
             close_after = False
         else:
-            handle = self._path.open(encoding="utf-8")
+            handle = resources.open_reader(self._path, "r", encoding="utf-8")
             close_after = True
         try:
             for line in handle:
@@ -334,7 +341,7 @@ class _TurnSummarySpool:
             if self._handle is not None:
                 self._handle.close()
         finally:
-            self._path.unlink(missing_ok=True)
+            resources.remove_file(self._path)
 
     def __enter__(self) -> _TurnSummarySpool:
         return self
@@ -480,12 +487,49 @@ class DiscoveryPlanReader:
 
     def __init__(self, plan_path: Path) -> None:
         self._plan_path = plan_path
+        self._frozen: tuple[Any, str] | None = None
+        self._session_id: str | None = None
+
+    def freeze(self) -> DiscoveryPlanReader:
+        """Index validated executable DTOs once; selected views never rescan JSONL."""
+        if self._frozen is None:
+            from mlflow_import.storage import _dump, current_store
+
+            store = current_store()
+            table = "plan_" + store.table()
+            store.db.execute(f"CREATE TABLE {table}(ordinal INTEGER PRIMARY KEY,session TEXT,kind TEXT,payload BLOB)")
+            store.db.execute(f"CREATE INDEX {table}_session ON {table}(session,kind,ordinal)")
+            for entry in self.iter_entries():
+                store.db.execute(
+                    f"INSERT INTO {table}(session,kind,payload) VALUES(?,?,?)",
+                    (entry.session_id, "session" if isinstance(entry, SessionScanEntry) else "turn", _dump(entry)),
+                )
+            self._frozen = store, table
+        return self
+
+    def for_session(self, session_id: str) -> DiscoveryPlanReader:
+        self.freeze()
+        result = DiscoveryPlanReader(self._plan_path)
+        result._frozen, result._session_id = self._frozen, session_id
+        return result
 
     def iter_entries(self) -> Iterator[SessionScanEntry | DiscoveryTurnEntry]:
         """Stream every plan entry, validating the plan as it is read."""
-        seen_scans: set[str] = set()
-        seen_turns: set[tuple[str, str]] = set()
-        with self._plan_path.open("r", encoding="utf-8") as handle:
+        if self._frozen is not None:
+            import pickle
+
+            store, table = self._frozen
+            predicate, args = (" WHERE session=?", (self._session_id,)) if self._session_id is not None else ("", ())
+            for (payload,) in store.db.execute(f"SELECT payload FROM {table}{predicate} ORDER BY ordinal", args):
+                yield pickle.loads(payload)
+            return
+        with (
+            closing(resources.sqlite_connect("")) as seen,
+            resources.open_reader(self._plan_path, "r", encoding="utf-8") as handle,
+        ):
+            seen.executescript("""PRAGMA cache_size=-512; PRAGMA temp_store=FILE;
+                CREATE TABLE scans(id TEXT PRIMARY KEY);
+                CREATE TABLE turns(session TEXT,key TEXT,PRIMARY KEY(session,key));""")
             header_seen = False
             for line in handle:
                 if not line.strip():
@@ -497,21 +541,20 @@ class DiscoveryPlanReader:
                     continue
                 entry = self._build_entry(payload)
                 if isinstance(entry, SessionScanEntry):
-                    seen_scans.add(entry.session_id)
+                    seen.execute("INSERT OR IGNORE INTO scans VALUES(?)", (entry.session_id,))
                     yield entry
                     continue
-                if entry.session_id not in seen_scans:
+                if seen.execute("SELECT 1 FROM scans WHERE id=?", (entry.session_id,)).fetchone() is None:
                     raise _malformed_plan(
                         "discovery_plan_turn_without_scan",
                         "a discovery turn entry has no matching session scan",
                     )
                 identity = (entry.session_id, entry.turn_key)
-                if identity in seen_turns:
+                if seen.execute("INSERT OR IGNORE INTO turns VALUES(?,?)", identity).rowcount == 0:
                     raise _malformed_plan(
                         "discovery_plan_duplicate_turn",
                         "the discovery plan contains a duplicate turn identity",
                     )
-                seen_turns.add(identity)
                 yield entry
         if not header_seen:
             raise _malformed_plan("discovery_plan_invalid", "the discovery plan is missing its header")
@@ -679,13 +722,14 @@ def discover_sessions(
     requested_session_id: str | None = None,
 ) -> DiscoveryStats:
     """Discover sessions and always clean deferred summary spools."""
-    scanned: list[tuple[SessionHeader, _SessionScanOutcome]] = []
+    scanned = _ScanCatalog(plan_path.parent, requested_session_id)
     try:
         return _discover_sessions(adapter, filters, plan_path, requested_session_id, scanned)
     finally:
         for _header, outcome in scanned:
             if outcome.summary_spool is not None:
                 outcome.summary_spool.close()
+        scanned.close()
 
 
 def _discover_sessions(
@@ -693,7 +737,7 @@ def _discover_sessions(
     filters: SelectionFilters,
     plan_path: Path,
     requested_session_id: str | None,
-    scanned: list[tuple[SessionHeader, _SessionScanOutcome]],
+    scanned: _ScanCatalog,
 ) -> DiscoveryStats:
     """Stream every compatible session into the sanitized plan at ``plan_path``.
 
@@ -748,17 +792,10 @@ def _discover_sessions(
             scanned.append((header, outcome))
             session_scan_count += 1
             warning_count += len(outcome.warnings)
-        selected_ids = _selection_closure(
-            {
-                header.session_id
-                for header, outcome in scanned
-                if outcome.selected and (requested_session_id is None or header.session_id == requested_session_id)
-            },
-            [header for header, _outcome in scanned],
-        )
+        scanned.expand_closure()
         try:
             for header, outcome in scanned:
-                selected = header.session_id in selected_ids
+                selected = scanned.selected(header.session_id)
                 selected_session_count += 1 if selected else 0
                 if outcome.session_scan is None or outcome.summary_spool is None or outcome.collector is None:
                     continue
@@ -847,6 +884,107 @@ class _SessionScanOutcome:
     collector: _SessionCollector | None = None
 
 
+class _ScanCatalog:
+    """Disk-backed deferred selection and relationship closure.
+
+    The previous deferred list retained every header and collector until closure.
+    This store keeps only relationship keys/selection in SQLite and sequentially
+    spools the frozen working values. Iteration restores one session at a time.
+    """
+
+    def __init__(self, directory: Path, requested: str | None) -> None:
+        self._root = resources.make_temp_dir(prefix=".source-scans-", dir=directory)
+        self._path = self._root / "scans.payloads"
+        self._spool = PayloadSpool(self._path)
+        self._db = resources.sqlite_connect(self._root / "index.db", isolation_level=None)
+        os.chmod(self._root / "index.db", 0o600)
+        self._db.executescript("""PRAGMA cache_size=-2048; PRAGMA temp_store=FILE;
+            CREATE TABLE scans(id TEXT PRIMARY KEY,parent TEXT,fork TEXT,locator TEXT,
+                direct INTEGER,selected INTEGER);
+            CREATE INDEX scan_parents ON scans(parent); CREATE INDEX scan_forks ON scans(fork);""")
+        self._requested = requested
+
+    def append(self, item: tuple[SessionHeader, _SessionScanOutcome]) -> None:
+        header, outcome = item
+        collector = outcome.collector
+        payload = {
+            "header": {"session": _session_storage_fields(header), "raw_columns": dict(header.raw_columns)},
+            "selected": outcome.selected,
+            "tombstone": outcome.tombstone,
+            "turn_entry_count": outcome.turn_entry_count,
+            "warnings": list(outcome.warnings),
+            "scan": _session_scan_payload(outcome.session_scan) if outcome.session_scan else None,
+            "summaries": str(outcome.summary_spool._path) if outcome.summary_spool else None,
+            "first": _timestamp_payload(collector._session_first_timestamp) if collector else None,
+            "last": _timestamp_payload(collector._session_last_timestamp) if collector else None,
+        }
+        direct = outcome.selected and (self._requested is None or header.session_id == self._requested)
+        self._db.execute(
+            "INSERT INTO scans VALUES(?,?,?,?,?,?)",
+            (
+                header.session_id,
+                header.parent_id,
+                header.fork_session_id,
+                self._spool.append(dumps_snapshot_json(payload)),
+                int(direct),
+                int(direct),
+            ),
+        )
+
+    def __iter__(self) -> Iterator[tuple[SessionHeader, _SessionScanOutcome]]:
+        for (locator,) in self._db.execute("SELECT locator FROM scans ORDER BY rowid"):
+            payload = cast(dict[str, object], loads_snapshot_json(read_payload(self._path, locator)))
+            header = _restore_session_header(dumps_snapshot_json(payload["header"]))
+            collector = _SessionCollector(header)
+            collector._session_first_timestamp = _timestamp_from_payload(payload["first"])
+            collector._session_last_timestamp = _timestamp_from_payload(payload["last"])
+            summaries = None
+            if payload["summaries"]:
+                summaries = _TurnSummarySpool.__new__(_TurnSummarySpool)
+                summaries._path = Path(cast(str, payload["summaries"]))
+                summaries._handle = None
+                summaries._closed = False
+            scan = payload["scan"]
+            yield (
+                header,
+                _SessionScanOutcome(
+                    bool(payload["selected"]),
+                    bool(payload["tombstone"]),
+                    cast(int, payload["turn_entry_count"]),
+                    tuple(cast(list[str], payload["warnings"])),
+                    _session_scan_from_payload(cast(dict[str, object], scan)) if scan else None,
+                    summaries,
+                    collector,
+                ),
+            )
+
+    def expand_closure(self) -> None:
+        self._db.executescript("""WITH RECURSIVE edges(child,parent) AS (
+            SELECT id,parent FROM scans WHERE parent IS NOT NULL UNION
+            SELECT id,fork FROM scans WHERE fork IS NOT NULL),
+            ancestors(id) AS (SELECT id FROM scans WHERE direct=1 UNION
+                SELECT e.parent FROM edges e JOIN ancestors a ON e.child=a.id),
+            descendants(id) AS (SELECT id FROM scans WHERE direct=1 UNION
+                SELECT e.child FROM edges e JOIN descendants d ON e.parent=d.id)
+            UPDATE scans SET selected=1 WHERE id IN (SELECT id FROM ancestors UNION SELECT id FROM descendants);""")
+
+    def selected(self, native: str) -> bool:
+        return bool(self._db.execute("SELECT selected FROM scans WHERE id=?", (native,)).fetchone()[0])
+
+    def close(self) -> None:
+        self._spool.close()
+        self._db.close()
+        try:
+            resources.remove_file(self._path)
+            resources.remove_file(self._root / "index.db")
+            self._root.rmdir()
+            if budget := resources.current_storage():
+                budget.forget(self._root)
+        except OSError:
+            # The enclosing invocation reports final private-run cleanup errors.
+            pass
+
+
 def _scan_session(
     snapshot: SourceSnapshot,
     adapter: SourceAdapter,
@@ -867,26 +1005,42 @@ def _scan_session(
     scan entry is appended immediately unless ``defer_writes`` is set; in
     deferred mode the restrictive spool remains open for ancestry selection.
     """
-    collector = _SessionCollector(header)
+    collector = _SessionCollector(header, collect_models=not isinstance(adapter, NormalizedSnapshotAdapter))
     collector.record_warnings(schema_warnings)
     summaries = _TurnSummarySpool(writer._plan_path.parent)
     try:
         logical_turn_count = 0
-        for turn_summary in iter_turn_summaries(collector.observe(adapter.iter_records(header.session_id))):
+        observed = collector.observe(adapter.iter_records(header.session_id))
+        turn_summaries = (
+            indexed_turn_summaries(snapshot, header.session_id, observed)
+            if isinstance(adapter, NormalizedSnapshotAdapter)
+            else iter_turn_summaries(observed)
+        )
+        for turn_summary in turn_summaries:
             summaries.write(turn_summary)
             logical_turn_count += 1
             collector.record_warnings(turn_summary.warnings)
         collector.drain(adapter.iter_session_scoped_records(header.session_id))
+        if isinstance(adapter, NormalizedSnapshotAdapter):
+            # Include inactive/replay-superseded observations without another
+            # transcript pass. Counts describe all retained occurrences.
+            row = snapshot.connection.execute(
+                "SELECT record_count FROM source_summaries WHERE session_id=?", (header.session_id,)
+            ).fetchone()
+            if row is not None:
+                collector.record_count = row[0]
 
         complete_scan = True
+        directory = header.directory or header.path
         summary = SessionDiscoverySummary(
             session_id=header.session_id,
             creation_time=header.time_created.utc if header.time_created is not None else None,
-            directory=Path(header.directory) if header.directory else None,
+            directory=Path(directory) if directory else None,
             model_identities=frozenset(collector.model_identities),
             logical_turn_count=logical_turn_count,
             warnings=collector.warnings,
             complete_scan=complete_scan,
+            creation_time_ns=header.time_created.nanoseconds if header.time_created else None,
         )
         selected = select_session(summary, filters, _selection_evidence(adapter, header.session_id, filters))
         tombstone = selected and complete_scan and logical_turn_count == 0
@@ -895,8 +1049,14 @@ def _scan_session(
         # fingerprint; the header-only replay view lets every session —
         # including one with zero logical turns — carry it through the same
         # public build_effective_turn seam (its cursors are never opened).
+        first_summary = next(iter(summaries), None)
+        context_turn = (
+            build_replay_turn(snapshot, header, first_summary)
+            if first_summary is not None and isinstance(snapshot, SourceSnapshot)
+            else _SessionHeaderReplayTurn(header)
+        )
         session_fingerprint = session_context_fingerprint(
-            build_effective_turn(_SessionHeaderReplayTurn(header), IDENTITY_REDACTOR, _DISCOVERY_REDACTION_MODE)
+            build_effective_turn(context_turn, IDENTITY_REDACTOR, _DISCOVERY_REDACTION_MODE)
         )
         session_scan = SessionScanEntry(
             session_id=header.session_id,
@@ -964,6 +1124,13 @@ def _turn_entry_for(
     for record in replay_turn.iter_records():
         _collect_record_model_identity(record, identities)
         _collect_record_warnings(record, warnings)
+    from mlflow_import.content.activity import project_activity
+    from mlflow_import.content.coverage import coverage
+
+    observed = coverage(header, project_activity(replay_turn))
+    warnings.extend(
+        "coverage_unavailable_" + item for item, value in observed["items"].items() if value["status"] == "unavailable"
+    )
     return DiscoveryTurnEntry(
         session_id=header.session_id,
         turn_index=turn_summary.turn_index,
@@ -1015,7 +1182,8 @@ class _SessionCollector:
     record count, and deduplicated warning codes.
     """
 
-    def __init__(self, header: SessionHeader) -> None:
+    def __init__(self, header: SessionHeader, *, collect_models: bool = True) -> None:
+        self._collect_models = collect_models
         self.model_identities: set[str] = set()
         self.record_count = 0
         self._warnings: list[str] = []
@@ -1035,7 +1203,7 @@ class _SessionCollector:
         """Yield each record once, collecting its identity and warnings."""
         for record in records:
             self.record_count += 1
-            if collect_model_identity:
+            if collect_model_identity and self._collect_models:
                 _collect_record_model_identity(record, self.model_identities)
             self._absorb_warnings(record.warnings)
             if record.source_table in SESSION_EVENT_TABLES:

@@ -22,6 +22,16 @@ def _build(tmp_path: Path, name: str) -> sqlite3.Connection:
 
 
 class TestGenerationClassification:
+    def test_incomplete_authoritative_v2_does_not_fall_back_to_legacy(self, tmp_path: Path) -> None:
+        connection = _build(tmp_path, "legacy")
+        try:
+            connection.execute("CREATE TABLE session_v2(id TEXT PRIMARY KEY)")
+            with pytest.raises(SourceCompatibilityError) as excinfo:
+                probe_schema(connection)
+            assert excinfo.value.code == "unsupported_schema"
+        finally:
+            connection.close()
+
     def test_legacy_fixture_probes_as_legacy(self, tmp_path: Path) -> None:
         connection = _build(tmp_path, "legacy")
         try:

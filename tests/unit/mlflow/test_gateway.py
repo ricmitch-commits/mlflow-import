@@ -954,7 +954,8 @@ def test_iter_owned_traces_walks_pagination_and_yields_only_owned(fake_mlflow_cl
     tokens = [call[1]["page_token"] for call in search_calls]
     assert len(search_calls) >= 3, "pagination must be walked page by page"
     assert tokens[0] is None
-    assert all(token for token in tokens[1:])
+    # Each ownership location/alias has its own first page and token chain.
+    assert any(token for token in tokens[1:])
 
 
 def test_iter_owned_traces_never_yields_unowned_traces(fake_mlflow_client: FakeMlflowClient) -> None:
@@ -1372,3 +1373,51 @@ def test_fake_gateway_keeps_payload_state_for_bdd_assertions() -> None:
 
     with pytest.raises(ItemImportError):
         fake.verify_trace(created, trace_spec(root_outputs={"answer": 43}))
+@pytest.mark.parametrize("field,value", [
+    ("client_request_id", "fabricated"),
+    ("request_preview", "wrong preview"),
+    ("response_preview", None),
+    ("cost", {"total_cost": 0.0}),
+    ("trace_name", "unexpected"),
+    ("native_session", "wrong-session"),
+    ("parent_session", "unexpected-parent"),
+    ("arbitrary_metadata", "unexpected"),
+    ("token_usage", {"input_tokens": 120, "output_tokens": 80, "total_tokens": 212,
+                     "cache_read_input_tokens": 40}),
+])
+def test_historical_native_verification_checks_values_and_nulls(
+    fake_mlflow_client, six_turn_session, field, value
+):
+    from mlflow_import.mlflow.mapping import map_turn_to_trace
+
+    gateway = _checked_gateway(fake_mlflow_client)
+    experiment = fake_mlflow_client.add_experiment("historical-null-checks")
+    request = replace(
+        map_turn_to_trace(six_turn_session.turns[0], six_turn_session.context).to_create_request(),
+        experiment_id=experiment.experiment_id,
+    )
+    created = gateway.create_trace(request)
+    gateway.verify_trace(created, request)
+    info = fake_mlflow_client.get_trace(created.trace_id).info
+    if field == "trace_name":
+        info.tags["mlflow.traceName"] = value
+    elif field in {"native_session", "parent_session", "arbitrary_metadata"}:
+        key = {"native_session": "mlflow.trace.session", "parent_session": "parent_session_id"}.get(field, "arbitrary")
+        info.trace_metadata[key] = value
+    else:
+        setattr(info, field, value)
+    with pytest.raises(ItemImportError):
+        gateway.verify_trace(created, request)
+
+
+def test_ownership_search_unions_nonempty_legacy_and_tag_pages(fake_mlflow_client):
+    gateway = _checked_gateway(fake_mlflow_client, search_page_size=1)
+    experiment = fake_mlflow_client.add_experiment("mixed-ownership")
+    legacy = gateway.create_trace(trace_spec(experiment_id=experiment.experiment_id))
+    tagged = gateway.create_trace(trace_spec(
+        experiment_id=experiment.experiment_id, owned=False,
+        root_tags={"mlflow_import.importer": "mlflow-import"},
+    ))
+    assert {item.trace_id for item in gateway.iter_owned_traces(experiment.experiment_id)} == {
+        legacy.trace_id, tagged.trace_id,
+    }

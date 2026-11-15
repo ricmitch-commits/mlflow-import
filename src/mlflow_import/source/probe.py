@@ -66,6 +66,8 @@ def probe_schema(
     problems: list[str] = []
     for catalog in catalogs:
         problem = _first_missing_structure(connection, existing, catalog)
+        if "session_v2" in existing and "session_v2" in catalog.tables and problem is not None:
+            raise SourceCompatibilityError("unsupported_schema", f"the authoritative current schema {problem}")
         if problem is None:
             matched.append(catalog)
         else:

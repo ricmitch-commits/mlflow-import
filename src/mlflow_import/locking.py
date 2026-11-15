@@ -41,6 +41,7 @@ Lock acquisition is SKIPPED for dry-run: the caller decides — pass
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -207,23 +208,19 @@ def acquire_import_lock(
         },
         sort_keys=True,
     )
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        raise ConfigurationError(
-            "import_lock_held",
-            "another importer already holds the lock for this tracking endpoint and experiment; "
-            f"the lock file is {path}; if no importer is running, the stale lock file must be "
-            "removed manually after operator confirmation",
-        ) from None
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ConfigurationError(
+                "import_lock_held", "another local importer holds the target experiment lock"
+            ) from None
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, payload.encode("utf-8"))
         yield ImportLock(path=path, experiment_name=experiment_name, endpoint_digest=endpoint_digest, acquired=True)
     finally:
-        # Release only the file this process created; a held or stale lock
-        # belonging to another process is never removed here.
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        # Keep the inode: unlinking permits a new writer to lock another
+        # inode while a waiter still owns the old one. The kernel releases
+        # the advisory lock after normal exit, exceptions, and process death.
+        os.close(descriptor)

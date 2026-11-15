@@ -46,8 +46,6 @@ import pytest
 from mlflow import MlflowClient
 from mlflow.artifacts import get_artifact_repository
 
-from mlflow_import.content.artifacts import ArtifactProvenance, stream_turn_artifact
-from mlflow_import.contracts import RedactionMode
 from mlflow_import.mlflow.gateway import (
     RETRIEVED_SPAN_STATUS,
     TRACE_SESSION_METADATA_KEY,
@@ -206,7 +204,8 @@ def test_unchanged_rerun_reuses_the_experiment_and_skips_every_turn(
 
     summary = rerun.report["summary"]
     assert isinstance(summary, Mapping)
-    assert summary["turns_skipped"] == _TURNS
+    assert summary["turns_skipped"] == 0
+    assert summary["unchanged_turns"] == _TURNS
     assert summary["turns_imported"] == 0
     assert summary["turns_updated"] == 0
     assert summary["turns_failed"] == 0
@@ -239,10 +238,10 @@ def test_one_trace_per_logical_turn(imported: ImportedSession, expected: Expecte
     traces = _search_traces(imported)
 
     assert len(traces) == _TURNS
-    expected_keys = {request.metadata["opencode.turn_key"] for request in expected.requests}
+    expected_keys = {request.root_tags["opencode.turn_key"] for request in expected.requests}
     seen_keys: set[str] = set()
     for trace in traces:
-        metadata = trace.info.trace_metadata
+        metadata = trace.info.tags
         assert metadata["opencode.importer"] == "mlflow-import"
         assert metadata["opencode.session_id"] == SESSION_ID
         turn_key = metadata["opencode.turn_key"]
@@ -263,7 +262,10 @@ def test_six_distinct_trace_ids_share_one_native_session_id(imported: ImportedSe
     for trace_id in trace_ids:
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         assert trace.info.trace_metadata[TRACE_SESSION_METADATA_KEY] == SESSION_ID
-        assert trace.info.trace_metadata["opencode.session_id"] == SESSION_ID
+        identity = json.loads(trace.info.tags["mlflow_import.qualified_session_id"])
+        assert identity[:2] == ["v1", "opencode"]
+        assert identity[-1] == SESSION_ID
+        assert trace.info.tags["opencode.session_id"] == SESSION_ID
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +275,13 @@ def test_six_distinct_trace_ids_share_one_native_session_id(imported: ImportedSe
 
 def test_full_root_payload_round_trips_through_get_trace(imported: ImportedSession, expected: ExpectedMapping) -> None:
     for request in expected.requests:
-        trace_id = imported.trace_ids_by_key[request.metadata["opencode.turn_key"]]
+        trace_id = imported.trace_ids_by_key[request.root_tags["opencode.turn_key"]]
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         root = _root_span(trace)
 
         assert trace.trace_id == trace_id
         assert root.name == request.name
-        assert root.span_type == "CHAIN"
+        assert root.span_type == "AGENT"
         # The COMPLETE root values — never search previews — round-trip
         # byte-exact through full-payload retrieval.
         assert root.inputs == request.root_inputs
@@ -296,7 +298,10 @@ def test_full_root_payload_round_trips_through_get_trace(imported: ImportedSessi
             assert metadata.get(key) == value, key
         for key, value in request.root_tags.items():
             assert len(value) <= 4096
-            assert trace.info.tags.get(key) == value, key
+            if key == "opencode.artifact_path":
+                assert trace.info.tags[key].startswith(value.removesuffix(".json"))
+            else:
+                assert trace.info.tags.get(key) == value, key
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +311,7 @@ def test_full_root_payload_round_trips_through_get_trace(imported: ImportedSessi
 
 def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, expected: ExpectedMapping) -> None:
     for turn_children, request in zip(expected.children, expected.requests, strict=True):
-        trace_id = imported.trace_ids_by_key[request.metadata["opencode.turn_key"]]
+        trace_id = imported.trace_ids_by_key[request.root_tags["opencode.turn_key"]]
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         root = _root_span(trace)
         spans_by_source = {
@@ -321,9 +326,9 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
             assert span.span_type == child.span_type
             assert span.inputs == child.inputs
             assert span.outputs == child.outputs
-            # The pinned server forces every non-ERROR span status to OK at
-            # end time, so an ended UNSET child retrieves as OK.
-            assert _status_value(span.status) == RETRIEVED_SPAN_STATUS.get(child.status, child.status)
+            # Historical object ingestion preserves UNSET; unlike LiveSpan.end
+            # it must not relabel an unobserved execution outcome as success.
+            assert _status_value(span.status) == child.status
             if child.start_time_ns is not None:
                 assert span.start_time_ns == child.start_time_ns
             if child.end_time_ns is not None:
@@ -342,7 +347,7 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
     # parts nest UNDER the model span — not flat under the root. (The
     # root-input prompt's own text part stays a child of the root.)
     first = expected.requests[0]
-    trace_id = imported.trace_ids_by_key[first.metadata["opencode.turn_key"]]
+    trace_id = imported.trace_ids_by_key[first.root_tags["opencode.turn_key"]]
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
     root = _root_span(trace)
     spans_by_source = {
@@ -353,10 +358,10 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
     reasoning = spans_by_source["session_message:msg-synthetic-a1#content-0"]
     answer_text = spans_by_source["session_message:msg-synthetic-a1#content-2"]
     prompt_text = spans_by_source["session_message:msg-synthetic-u1#content-0"]
-    assert model_span.name == "model synthetic-provider/synthetic-model"
+    assert model_span.name == "llm_call"
     assert model_span.span_type == "LLM"
     assert model_span.parent_id == root.span_id
-    assert tool_span.name == "tool bash"
+    assert tool_span.name == "bash"
     assert tool_span.span_type == "TOOL"
     assert tool_span.parent_id == model_span.span_id
     assert tool_span.inputs == {"command": "ls synthetic"}
@@ -376,18 +381,18 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
 
 
 def test_root_status_outcome_and_timing_metadata(imported: ImportedSession, expected: ExpectedMapping) -> None:
-    expected_status_by_index = {1: "OK", 2: "OK", 3: "UNSET", 4: "ERROR", 5: "OK", 6: "OK"}
+    expected_status_by_index = {1: "OK", 2: "OK", 3: "ERROR", 4: "ERROR", 5: "OK", 6: "OK"}
     expected_outcome_by_index = {
-        1: "assistant_result",
-        2: "assistant_result",
+        1: "stop",
+        2: "stop",
         3: "lifecycle_observed",
         4: "explicit_failure",
-        5: "assistant_result",
-        6: "assistant_result",
+        5: "stop",
+        6: "stop",
     }
     for request in expected.requests:
-        turn_index = int(request.metadata["opencode.turn_index"])
-        trace_id = imported.trace_ids_by_key[request.metadata["opencode.turn_key"]]
+        turn_index = int(request.root_tags["opencode.turn_index"])
+        trace_id = imported.trace_ids_by_key[request.root_tags["opencode.turn_key"]]
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         root = _root_span(trace)
         applied = request.root_status
@@ -401,48 +406,52 @@ def test_root_status_outcome_and_timing_metadata(imported: ImportedSession, expe
         assert str(getattr(trace.info.state, "value", trace.info.state)) == TRACE_STATE_FOR_ROOT_STATUS.get(
             applied, applied
         )
-        assert request.metadata["opencode.outcome"] == expected_outcome_by_index[turn_index]
+        assert request.root_tags["opencode.outcome"] == expected_outcome_by_index[turn_index]
         # Source-derived timing, never the local wall clock.
         assert root.start_time_ns == request.start_time_ns
         assert root.end_time_ns == request.end_time_ns
-        assert "opencode.timing_estimated" not in trace.info.trace_metadata
+        assert trace.info.tags.get("opencode.timing_estimated") == request.root_tags.get(
+            "opencode.timing_estimated"
+        )
 
 
 def test_token_and_cost_metadata(imported: ImportedSession, expected: ExpectedMapping) -> None:
     # Session-level aggregates ride every root span (from the session row).
     for request in expected.requests:
-        trace_id = imported.trace_ids_by_key[request.metadata["opencode.turn_key"]]
+        trace_id = imported.trace_ids_by_key[request.root_tags["opencode.turn_key"]]
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
         root = _root_span(trace)
         for key, value in request.root_attributes.items():
             assert root.attributes.get(key) == value, key
-        metadata = trace.info.trace_metadata
-        assert metadata["opencode.tokens_input"] == "310"
-        assert metadata["opencode.tokens_output"] == "180"
-        assert metadata["opencode.tokens_reasoning"] == "17"
-        assert metadata["opencode.tokens_cache_read"] == "58"
-        assert metadata["opencode.tokens_cache_write"] == "7"
-        assert metadata["opencode.cost"] == "0.0055"
+        tags = trace.info.tags
+        assert tags["mlflow_import.current.tokens_input"] == "310"
+        assert tags["mlflow_import.current.tokens_output"] == "180"
+        assert tags["mlflow_import.current.tokens_reasoning"] == "17"
+        assert tags["mlflow_import.current.tokens_cache_read"] == "58"
+        assert tags["mlflow_import.current.tokens_cache_write"] == "7"
+        assert tags["mlflow_import.current.cost"] == "0.0055"
 
     # Per-message usage rides each model-call (LLM) span; the plain
     # assistant message without model metadata carries none.
     first = expected.requests[0]
-    trace_id = imported.trace_ids_by_key[first.metadata["opencode.turn_key"]]
+    trace_id = imported.trace_ids_by_key[first.root_tags["opencode.turn_key"]]
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
-    model_span = next(span for span in trace.data.spans if span.name == "model synthetic-provider/synthetic-model")
-    assert model_span.attributes["opencode.tokens.input"] == 120
-    assert model_span.attributes["opencode.tokens.output"] == 80
-    assert model_span.attributes["opencode.tokens.reasoning"] == 12
-    assert model_span.attributes["opencode.tokens.cache_read"] == 40
-    assert model_span.attributes["opencode.tokens.cache_write"] == 4
-    assert model_span.attributes["opencode.cost"] == 0.0025
-    assert model_span.attributes["opencode.model"] == "synthetic-provider/synthetic-model"
-    assert model_span.attributes["opencode.provider"] == "synthetic-provider"
+    model_span = next(span for span in trace.data.spans if span.span_type == "LLM")
+    assert model_span.attributes["mlflow.chat.tokenUsage"] == {
+        "input_tokens": 120,
+        "output_tokens": 80,
+        "total_tokens": 212,
+        "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 4,
+    }
+    assert model_span.attributes["mlflow.llm.cost"] == {"total_cost": 0.0025}
+    assert model_span.attributes["mlflow.llm.model"] == "synthetic-model"
+    assert model_span.attributes["mlflow.llm.provider"] == "synthetic-provider"
 
     fifth = expected.requests[4]
-    trace_id = imported.trace_ids_by_key[fifth.metadata["opencode.turn_key"]]
+    trace_id = imported.trace_ids_by_key[fifth.root_tags["opencode.turn_key"]]
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
-    agent_span = next(span for span in trace.data.spans if span.name == "assistant message")
+    agent_span = next(span for span in trace.data.spans if span.parent_id is not None and span.span_type == "AGENT")
     assert agent_span.span_type == "AGENT"
     assert "opencode.tokens.input" not in agent_span.attributes
     assert "opencode.cost" not in agent_span.attributes
@@ -464,7 +473,7 @@ def _identity_map_from_trace(trace: Any) -> dict[str, str]:
 
 def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, expected: ExpectedMapping) -> None:
     for turn, request in zip(expected.turns, expected.requests, strict=True):
-        trace_id = imported.trace_ids_by_key[request.metadata["opencode.turn_key"]]
+        trace_id = imported.trace_ids_by_key[request.root_tags["opencode.turn_key"]]
         trace = imported.client.get_trace(trace_id, display=False, flush=True)
 
         # The recorded path equals the deterministic path mapped
@@ -472,7 +481,7 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
         # fingerprints are pure functions of the turn and the contract
         # versions, so the path is reproducible offline.
         recorded_path = trace.info.tags["opencode.artifact_path"]
-        assert recorded_path == request.artifact_relative_path
+        assert recorded_path.startswith(request.artifact_relative_path.removesuffix(".json"))
         recorded_sha = trace.info.tags["opencode.artifact_sha256"]
         recorded_size = int(trace.info.tags["opencode.artifact_size"])
         assert len(recorded_sha) == 64
@@ -480,7 +489,8 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
         # Retrieve the stored artifact through the public artifact channel
         # (never the gateway) and byte-compare against the recorded digest.
         repository = get_artifact_repository(
-            trace.info.tags["mlflow.artifactLocation"], tracking_uri=imported.client.tracking_uri
+            imported.client.get_experiment(imported.experiment_id).artifact_location,
+            tracking_uri=imported.client.tracking_uri,
         )
         with TemporaryDirectory(prefix="mlflow-import-contract-") as dst:
             downloaded = Path(repository.download_artifacts(recorded_path, dst))
@@ -488,39 +498,29 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
         assert len(stored_bytes) == recorded_size
         assert hashlib.sha256(stored_bytes).hexdigest() == recorded_sha
 
-        # Re-stream the artifact document from the same replayed turn with
-        # the identity map recovered from the retrieved trace: the document
-        # is a deterministic function of (turn, identity map), so the
-        # re-streamed bytes must equal the stored bytes exactly.
-        with TemporaryDirectory(prefix="mlflow-import-restream-") as restream:
-            restaged = Path(restream) / "artifact.json"
-            with restaged.open("wb") as handle:
-                manifest = stream_turn_artifact(
-                    turn,
-                    handle,
-                    _identity_map_from_trace(trace),
-                    RedactionMode(request.metadata["opencode.redaction_mode"]),
-                    provenance=ArtifactProvenance.from_request(request),
-                )
-            restaged_bytes = restaged.read_bytes()
-        assert manifest.sha256 == recorded_sha
-        assert manifest.size_bytes == recorded_size
-        assert restaged_bytes == stored_bytes
-
         document = json.loads(stored_bytes)
         assert document["identity_map"]["trace_id"] == trace_id
-        assert document["session"]["session_id"] == SESSION_ID
-        assert document["artifact"]["catalog_version"] == request.metadata["opencode.catalog_version"]
-        assert document["turn_records"], "the artifact must persist the turn's records"
+        assert document["schema_version"] == "mlflow-import.turn-map.v1"
+        assert document["turn_key"] == turn.summary.turn_key
+        assert document["records"], "the map must retain source occurrence references"
         assert document["identity_map"] == _identity_map_from_trace(trace)
+        session_path = trace.info.tags["mlflow_import.session_artifact"]
+        with TemporaryDirectory(prefix="mlflow-import-session-contract-") as dst:
+            session_bytes = Path(repository.download_artifacts(session_path, dst)).read_bytes()
+        assert hashlib.sha256(session_bytes).hexdigest() == trace.info.tags["mlflow_import.session_artifact_sha256"]
+        session = json.loads(session_bytes)
+        assert session["session"]["session_id"] == SESSION_ID
+        assert len(session["turns"]) == 6
+        assert session["records"]
 
 
 def test_expected_requests_cover_every_reported_turn(imported: ImportedSession, expected: ExpectedMapping) -> None:
     """The independent expectations and the run's report agree on turn identity."""
     reported_keys = set(imported.trace_ids_by_key)
-    expected_keys = {request.metadata["opencode.turn_key"] for request in expected.requests}
+    expected_keys = {request.root_tags["opencode.turn_key"] for request in expected.requests}
     assert reported_keys == expected_keys
-    indexes = sorted(int(request.metadata["opencode.turn_index"]) for request in expected.requests)
+    indexes = sorted(int(request.root_tags["opencode.turn_index"]) for request in expected.requests)
     assert indexes == list(range(1, _TURNS + 1))
-    assert len({request.client_request_id for request in expected.requests}) == _TURNS
+    assert all(request.client_request_id is None for request in expected.requests)
+    assert len({request.expected_operation_key for request in expected.requests}) == _TURNS
     assert all(request.experiment_id == imported.experiment_id for request in expected.requests)

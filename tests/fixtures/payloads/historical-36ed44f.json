@@ -1,0 +1,34 @@
+{
+  "origin": "git:36ed44f:docs/result-schema.md;src/opencode_mlflow/content/artifacts.py;src/opencode_mlflow/source/discovery.py",
+  "result": {
+    "schema_version": "opencode-mlflow.result.v1", "dry_run": true,
+    "experiment": {"name": "historical-synthetic", "id": null, "status": "planned"},
+    "source": {"schema_generation": "current", "fingerprint": null, "sessions_scanned": 1, "sessions_selected": 1, "logical_turn_count": 1, "record_count": 0},
+    "redaction": {"mode": "verbatim", "detector_counts": {}, "affected_field_count": 0, "affected_record_count": 0},
+    "summary": {"selected_sessions": 1, "selected_turns": 1, "turns_imported": 0, "turns_updated": 0, "turns_skipped": 1, "turns_failed": 0, "retired_traces": 0, "failed_items": 0, "warnings": []},
+    "sessions": [{"session_id": "historical-synthetic", "selected": true, "action": "skipped", "reason": "dry_run", "logical_turn_count": 1, "record_count": 0, "warnings": [], "error": null,
+      "turns": [{"session_id": "historical-synthetic", "turn_key": "turn-0000000000000000000000000000000000000000000000000000000000000000", "turn_index": 1, "action": "skipped", "reason": "dry_run", "planned_action": "imported", "trace_id": null, "source_present": true, "error_code": null, "error": null, "affected_trace_ids": [], "retired_trace_ids": [], "conflicting_trace_ids": [], "warnings": []}]}],
+    "errors": []
+  },
+  "trace": {
+    "trace_id": "historical-synthetic-trace", "experiment_id": "historical-synthetic-experiment", "tags": {},
+    "metadata": {
+      "opencode.importer": "opencode-mlflow", "opencode.session_id": "historical-synthetic",
+      "opencode.turn_index": "1", "opencode.turn_key": "turn-0000000000000000000000000000000000000000000000000000000000000000",
+      "opencode.source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "opencode.source_schema": "current", "opencode.importer_version": "0.1.0",
+      "opencode.mapping_version": "mapping-v4", "opencode.artifact_schema_version": "artifact-v2",
+      "opencode.redaction_mode": "verbatim", "opencode.catalog_version": "schema-catalog-v1",
+      "opencode.render_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "opencode.operation_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "mlflow.trace.session": "historical-synthetic"
+    }
+  },
+  "artifact": {
+    "artifact": {"artifact_schema_version": "artifact-v2", "mapping_version": "mapping-v4", "importer_version": "0.1.0", "adapter_generation": "current", "canonical_json": "canonical-json-v1", "redaction_mode": "verbatim"},
+    "identity_map": {"trace_id": "historical-synthetic-trace"},
+    "session": {"session_id": "historical-synthetic", "adapter_generation": "current", "warnings": []},
+    "session_records": [], "turn_records": [], "unassigned_records": [], "warnings": [],
+    "turn": {"session_id": "historical-synthetic", "turn_index": 1, "turn_key": "turn-0000000000000000000000000000000000000000000000000000000000000000", "record_count": 0, "user_record_count": 0, "assistant_record_count": 0}
+  }
+}

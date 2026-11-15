@@ -91,7 +91,7 @@ def test_lock_file_is_restricted_to_the_owner(tmp_path: Path) -> None:
         mode = stat_mode(lock.path)
 
     assert mode == 0o600
-    assert not lock.path.exists()
+    assert lock.path.exists()
 
 
 def stat_mode(path: Path) -> int:
@@ -112,20 +112,16 @@ def test_held_lock_fails_immediately_without_breaking(tmp_path: Path) -> None:
         assert first.path.exists()
         assert first.acquired is True
 
-    assert not first.path.exists()
+    assert first.path.exists()
 
 
-def test_stale_lock_from_a_dead_process_is_never_broken_automatically(tmp_path: Path) -> None:
+def test_stale_lock_file_does_not_block_a_new_kernel_lock(tmp_path: Path) -> None:
     lock = lock_path("http://tracking.example.com", "team/opencode", tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
     lock.write_text('{"experiment_name": "team/opencode"}', encoding="utf-8")
 
-    with pytest.raises(ConfigurationError) as excinfo:
-        with acquire_import_lock("http://tracking.example.com", "team/opencode", tmp_path):
-            raise AssertionError("a stale lock must require operator confirmation")
-
-    assert excinfo.value.code == "import_lock_held"
-    # The stale lock survives: recovery requires explicit operator removal.
+    with acquire_import_lock("http://tracking.example.com", "team/opencode", tmp_path) as acquired:
+        assert acquired.acquired
     assert lock.exists()
 
 
@@ -135,7 +131,7 @@ def test_lock_is_released_after_exceptions(tmp_path: Path) -> None:
             assert lock.path.exists()
             raise RuntimeError("synthetic failure inside the lock")
 
-    assert not lock.path.exists()
+    assert lock.path.exists()
 
     # The next acquisition succeeds on the released path.
     with acquire_import_lock("http://tracking.example.com", "team/opencode", tmp_path):

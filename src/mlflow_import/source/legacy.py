@@ -24,32 +24,34 @@ Export shape (pinned by the adapter contract tests):
   todos whose session does not exist are reported (warnings), never
   assigned.
 
-Child-table access is a streaming merge-join, not a query per parent:
-messages, parts, and todos are each read through ONE whole-table cursor
-joined to its parent chain and ordered in emission order, and zipped
+Child-table access is a streaming merge-join, not a scan per parent:
+messages, parts, and todos each have ONE ordered structural-locator cursor
+joined to its parent chain and zipped
 with the session stream through :class:`OrderedGroupReader` (one row of
-lookahead, bounded memory, a constant number of statements regardless of
-row counts). SQLite executes the unindexed joins through automatic
-transient indexes and the ORDER BY through its disk-backed sorter, so
-the export cost is a near-linear number of row visits instead of one
-full scan per parent. The implicit ``rowid`` discriminates duplicate
+lookahead, bounded memory). Payloads are fetched by indexed rowid/declared-key
+lookups in the same source transaction, so transcript bodies never occupy the
+whole-selection sorter. SQLite's transient working memory remains bounded by
+the process heap ceiling. The export cost is near-linear row visits instead of
+one full scan per parent. The implicit ``rowid`` discriminates duplicate
 parent rows during the merge; tables without one (``WITHOUT ROWID``)
 fall back to per-session/per-parent queries, and parts of missing-ID
 parents are always fetched with the NULL-safe per-parent query. Declared
 primary keys are the best catalog-stable discriminator for such tables;
-schemas without either a rowid or a declared key retain SQLite's source
-order for otherwise identical ties.
+tables without a permitted rowid or complete declared key fail explicitly
+rather than sorting transcript payloads or projecting excluded key columns.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
 from mlflow_import.contracts import CanonicalRecordEnvelope
+from mlflow_import.errors import SourceCompatibilityError
 from mlflow_import.source.catalog import SchemaCatalog
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.model import (
     RecordClassificationName,
     SchemaDescription,
@@ -73,6 +75,7 @@ from mlflow_import.source.normalize import (
     fallback_source_identity,
     has_rowid,
     join_projection_identity,
+    located_rows,
     normalize_completion_timestamp,
     normalize_epoch_ms,
     permitted_observed_columns,
@@ -239,8 +242,8 @@ class LegacyAdapter:
         self.connection = connection
         self._export_warnings: list[str] = []
         self._tracker: IdentityTracker | None = None
-        self._known_session_ids: set[str] = set()
-        self._suppressed_session_ids: frozenset[str] = frozenset()
+        self._known_session_ids = DiskIds()
+        self._suppressed_session_ids: Collection[str] = frozenset()
         self._columns: dict[str, tuple[str, ...]] = {}
         self._rowid_tables: dict[str, bool] = {}
         self._primary_key_columns: dict[str, tuple[str, ...]] = {}
@@ -275,7 +278,7 @@ class LegacyAdapter:
         writer: SnapshotWriter,
         redaction: RedactionCallback,
         session_id: str | None = None,
-        session_ids: frozenset[str] | None = None,
+        session_ids: Collection[str] | None = None,
     ) -> ExportStats:
         self.begin_export(selected_session_id=session_id, selected_session_ids=session_ids)
         for _key, row, child_key in self.iter_exportable_sessions():
@@ -301,15 +304,15 @@ class LegacyAdapter:
     def begin_export(
         self,
         *,
-        suppressed_session_ids: frozenset[str] = frozenset(),
+        suppressed_session_ids: Collection[str] = frozenset(),
         selected_session_id: str | None = None,
-        selected_session_ids: frozenset[str] | None = None,
+        selected_session_ids: Collection[str] | None = None,
     ) -> None:
         """Reset per-export state; suppressed sessions are never emitted."""
         self._export_warnings = []
         self._tracker = IdentityTracker(self.schema_generation)
-        self._known_session_ids = set()
-        self._suppressed_session_ids = frozenset(suppressed_session_ids)
+        self._known_session_ids = DiskIds()
+        self._suppressed_session_ids = suppressed_session_ids
         self._selected_session_ids = (
             selected_session_ids
             if selected_session_ids is not None
@@ -346,6 +349,31 @@ class LegacyAdapter:
         if self._joined_children:
             self._open_child_readers()
 
+    def _ordered_rows(
+        self,
+        table: str,
+        select: str,
+        from_and_order: str,
+        parameters: Sequence[object],
+        *,
+        alias: str = "",
+        grouping: str = "",
+    ) -> Iterator[tuple[Any, ...]]:
+        """Order permitted structural locators, then fetch one exact payload."""
+        locators = ("rowid",) if self._rowid_tables.get(table) else self._primary_key_columns.get(table, ())
+        if not locators or any(key != "rowid" and key not in self._columns[table] for key in locators):
+            raise SourceCompatibilityError("unsupported_schema", "a source table has no permitted stable row locator")
+        prefix = f"{alias}." if alias else ""
+        keys = [prefix + quote_identifier(key) for key in locators]
+        ordered_sql = f"SELECT {', '.join(keys)}{grouping} {from_and_order}"
+        lookup = (
+            f"SELECT {select} FROM {quote_identifier(table)}"
+            + (f" {alias}" if alias else "")
+            + " WHERE "
+            + " AND ".join(f"{key} IS ?" for key in keys)
+        )
+        return located_rows(self.connection, ordered_sql, parameters, lookup, len(locators))
+
     def iter_exportable_sessions(
         self,
     ) -> Iterator[tuple[tuple[int, int, str], dict[str, object], tuple[Any, ...]]]:
@@ -367,19 +395,21 @@ class LegacyAdapter:
             select += ", rowid"
             order += ", rowid"
         where, parameters = self._session_predicate("id")
-        sql = f"SELECT {select} FROM {quote_identifier(SESSION_TABLE)}{where} ORDER BY {order}"
-        for row in self.connection.execute(sql, parameters):
+        source = f"FROM {quote_identifier(SESSION_TABLE)}{where} ORDER BY {order}"
+        for row in self._ordered_rows(SESSION_TABLE, select, source, parameters):
             values = dict(zip(columns, row[: len(columns)], strict=True))
             raw_id = values.get("id")
             if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
-                self._export_warnings.append(SESSION_MISSING_ID_WARNING)
-                continue
+                raise SourceCompatibilityError(
+                    "invalid_session_identity", "an authoritative session header has no identity"
+                )
             session_id = str(raw_id)
             if session_id in self._suppressed_session_ids:
                 continue
             if not tracker.register_explicit(SESSION_TABLE, session_id):
-                self._export_warnings.append(DUPLICATE_SESSION_ID_WARNING)
-                continue
+                raise SourceCompatibilityError(
+                    "duplicate_session_identity", "authoritative session headers have duplicate identities"
+                )
             self._known_session_ids.add(session_id)
             sort_key = session_row_sort_key(values)
             child_key = (*sort_key, row[len(columns)]) if self._joined_children else tuple(sort_key)
@@ -448,25 +478,27 @@ class LegacyAdapter:
         if message_columns:
             message_width = len(message_columns)
             message_select = ", ".join(f"m.{quote_identifier(name)}" for name in message_columns)
-            message_select += f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
+            message_grouping = f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
             message_order = (
                 _SESSION_ORDER
                 + ", s.rowid, "
                 + _numeric_order("time_created", "id", qualifier="m", max_abs=MAX_NORMALIZABLE_EPOCH_MS)
             )
             if message_has_rowid:
-                message_select += ", m.rowid"
+                message_grouping += ", m.rowid"
                 message_order += ", m.rowid"
             selected, parameters = self._session_predicate("s.id")
             selected = selected.replace(" WHERE ", " AND ", 1)
             message_sql = (
-                f"SELECT {message_select} FROM {quote_identifier(MESSAGE_TABLE)} m"
+                f"FROM {quote_identifier(MESSAGE_TABLE)} m"
                 f" JOIN {quote_identifier(SESSION_TABLE)} s ON m.session_id = s.id"
                 f"{selected} ORDER BY {message_order}"
             )
 
             def message_pairs() -> Iterator[tuple[tuple[Any, ...], tuple[dict[str, object], Any]]]:
-                cursor = self.connection.execute(message_sql, parameters)
+                cursor = self._ordered_rows(
+                    MESSAGE_TABLE, message_select, message_sql, parameters, alias="m", grouping=message_grouping
+                )
                 for row in cursor:
                     session_key = session_order_key(row[message_width], row[message_width + 1])
                     message_values = dict(zip(message_columns, row[:message_width], strict=True))
@@ -480,7 +512,7 @@ class LegacyAdapter:
             part_select = ", ".join(f"p.{quote_identifier(name)}" for name in part_columns)
             if part_has_rowid:
                 part_select += ", p.rowid"
-            part_select += (
+            part_grouping = (
                 f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid, m.rowid"
                 ", m.time_created, m.id"
             )
@@ -499,14 +531,16 @@ class LegacyAdapter:
             selected, parameters = self._session_predicate("s.id")
             selected = selected.replace(" WHERE ", " AND ", 1)
             part_sql = (
-                f"SELECT {part_select} FROM {quote_identifier(PART_TABLE)} p"
+                f"FROM {quote_identifier(PART_TABLE)} p"
                 f" JOIN {quote_identifier(MESSAGE_TABLE)} m ON p.message_id IS m.id AND p.session_id = m.session_id"
                 f" JOIN {quote_identifier(SESSION_TABLE)} s ON m.session_id = s.id"
                 f"{selected} ORDER BY {part_order}"
             )
 
             def part_pairs() -> Iterator[tuple[tuple[Any, ...], dict[str, object]]]:
-                cursor = self.connection.execute(part_sql, parameters)
+                cursor = self._ordered_rows(
+                    PART_TABLE, part_select, part_sql, parameters, alias="p", grouping=part_grouping
+                )
                 for row in cursor:
                     rowid_offset = 1 if part_has_rowid else 0
                     session_key = session_order_key(row[part_width + rowid_offset], row[part_width + rowid_offset + 1])
@@ -531,10 +565,7 @@ class LegacyAdapter:
             # Preserve ambiguous NULL-parent parts once, before any prompt,
             # as unassigned records rather than attributing them arbitrarily.
             ambiguous_sql = (
-                "SELECT "
-                + ", ".join(f"p.{quote_identifier(name)}" for name in part_columns)
-                + (", p.rowid" if part_has_rowid else "")
-                + f", s.time_created, s.id, s.rowid FROM {quote_identifier(PART_TABLE)} p"
+                f"FROM {quote_identifier(PART_TABLE)} p"
                 + f" JOIN {quote_identifier(SESSION_TABLE)} s ON p.session_id = s.id"
                 + f" JOIN (SELECT session_id FROM {quote_identifier(MESSAGE_TABLE)} WHERE id IS NULL"
                 + " GROUP BY session_id HAVING COUNT(*) > 1) a ON a.session_id = p.session_id"
@@ -549,7 +580,14 @@ class LegacyAdapter:
 
             def ambiguous_pairs() -> Iterator[tuple[tuple[Any, ...], dict[str, object]]]:
                 parameters = self._session_predicate("s.id")[1]
-                for row in self.connection.execute(ambiguous_sql, parameters):
+                for row in self._ordered_rows(
+                    PART_TABLE,
+                    part_select,
+                    ambiguous_sql,
+                    parameters,
+                    alias="p",
+                    grouping=", s.time_created, s.id, s.rowid",
+                ):
                     rowid_offset = 1 if part_has_rowid else 0
                     key = (
                         *session_order_key(row[part_width + rowid_offset], row[part_width + rowid_offset + 1]),
@@ -568,7 +606,7 @@ class LegacyAdapter:
             todo_has_rowid = self._rowid_tables.get(TODO_TABLE, False)
             if todo_has_rowid:
                 todo_select += ", t.rowid"
-            todo_select += f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
+            todo_grouping = f", s.{quote_identifier('time_created')}, s.{quote_identifier('id')}, s.rowid"
             # The optional todo table's columns are not probe-validated, so
             # ordering references only the columns it actually has.
             todo_table_order = _scoped_numeric_order(
@@ -600,13 +638,15 @@ class LegacyAdapter:
             selected, parameters = self._session_predicate("s.id")
             selected = selected.replace(" WHERE ", " AND ", 1)
             todo_sql = (
-                f"SELECT {todo_select} FROM {quote_identifier(TODO_TABLE)} t"
+                f"FROM {quote_identifier(TODO_TABLE)} t"
                 f" JOIN {quote_identifier(SESSION_TABLE)} s ON t.session_id = s.id"
                 f"{selected} ORDER BY {todo_order}"
             )
 
             def todo_pairs() -> Iterator[tuple[tuple[Any, ...], dict[str, object]]]:
-                cursor = self.connection.execute(todo_sql, parameters)
+                cursor = self._ordered_rows(
+                    TODO_TABLE, todo_select, todo_sql, parameters, alias="t", grouping=todo_grouping
+                )
                 for row in cursor:
                     rowid_offset = 1 if todo_has_rowid else 0
                     session_key = session_order_key(row[todo_width + rowid_offset], row[todo_width + rowid_offset + 1])
@@ -624,6 +664,8 @@ class LegacyAdapter:
         ids = self._selected_session_ids
         if ids is None:
             return "", ()
+        if isinstance(ids, DiskIds):
+            return ids.predicate(self.connection, expression)
         placeholders = ", ".join("?" for _ in ids)
         return f" WHERE {expression} IN ({placeholders})", tuple(ids)
 
@@ -720,11 +762,11 @@ class LegacyAdapter:
             select += ", rowid"
         rowid_order = ", rowid" if message_has_rowid else ""
         sql = (
-            f"SELECT {select} FROM {quote_identifier(MESSAGE_TABLE)}"
+            f"FROM {quote_identifier(MESSAGE_TABLE)}"
             " WHERE session_id = ? ORDER BY "
             f"{_numeric_order('time_created', 'id', max_abs=MAX_NORMALIZABLE_EPOCH_MS)}{rowid_order}"
         )
-        for row in self.connection.execute(sql, (session_id,)):
+        for row in self._ordered_rows(MESSAGE_TABLE, select, sql, (session_id,)):
             values = dict(zip(columns, row[: len(columns)], strict=True))
             message_rowid = row[len(columns)] if message_has_rowid else None
             yield values, message_rowid
@@ -761,11 +803,11 @@ class LegacyAdapter:
             select += ", rowid"
         rowid_order = ", rowid" if part_has_rowid else ""
         sql = (
-            f"SELECT {select} FROM {quote_identifier(PART_TABLE)}"
+            f"FROM {quote_identifier(PART_TABLE)}"
             " WHERE message_id IS ? AND session_id = ? ORDER BY "
             f"{_numeric_order('time_created', 'id', max_abs=MAX_NORMALIZABLE_EPOCH_MS)}{rowid_order}"
         )
-        for row in self.connection.execute(sql, (message_raw_id, session_id)):
+        for row in self._ordered_rows(PART_TABLE, select, sql, (message_raw_id, session_id)):
             values = dict(zip(columns, row[: len(columns)], strict=True))
             if part_has_rowid:
                 values[_ROWID_KEY] = row[len(columns)]
@@ -783,8 +825,10 @@ class LegacyAdapter:
                 if part_has_rowid:
                     select += ", rowid"
                 rowid_order = ", rowid" if part_has_rowid else ""
-                rows = self.connection.execute(
-                    f"SELECT {select} FROM {quote_identifier(PART_TABLE)}"
+                rows = self._ordered_rows(
+                    PART_TABLE,
+                    select,
+                    f"FROM {quote_identifier(PART_TABLE)}"
                     f" WHERE message_id IS NULL AND session_id = ?"
                     " ORDER BY "
                     f"{_numeric_order('time_created', 'id', max_abs=MAX_NORMALIZABLE_EPOCH_MS)}{rowid_order}",
@@ -796,7 +840,7 @@ class LegacyAdapter:
         for values, message_rowid in self._message_rows(session_id, child_key):
             raw_id = values.get("id")
             message_id = _text(raw_id)
-            if message_id is not None and not tracker.register_explicit(MESSAGE_TABLE, message_id):
+            if message_id is not None and not tracker.register_explicit(MESSAGE_TABLE, message_id, message_rowid):
                 continue
             decoded_column = decode_json_column(values.get("data"))
             decoded = decoded_column.decoded
@@ -904,7 +948,7 @@ class LegacyAdapter:
             )
 
             if part_id is not None:
-                if not tracker.register_explicit(PART_TABLE, part_id):
+                if not tracker.register_explicit(PART_TABLE, part_id, row_discriminator):
                     continue
                 source_identity = None
                 join_projection_key = None
@@ -1001,12 +1045,12 @@ class LegacyAdapter:
                     )
                     if part
                 )
-            rowid_order = ", rowid" if todo_has_rowid else ""
+            order_by = ", ".join(part for part in (order_by, "rowid" if todo_has_rowid else "") if part)
             order_clause = f" ORDER BY {order_by}" if order_by else ""
-            sql = f"SELECT {select} FROM {quote_identifier(TODO_TABLE)} WHERE session_id = ?{order_clause}{rowid_order}"
+            sql = f"FROM {quote_identifier(TODO_TABLE)} WHERE session_id = ?{order_clause}"
             todo_rows = (
                 self._row_values_with_optional_rowid(columns, row, todo_has_rowid)
-                for row in self.connection.execute(sql, (session_id,))
+                for row in self._ordered_rows(TODO_TABLE, select, sql, (session_id,))
             )
         for values in todo_rows:
             row_discriminator = values.pop(_ROWID_KEY, None)

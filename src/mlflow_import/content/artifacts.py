@@ -60,9 +60,9 @@ update happens through the gateway's documented public trace-update
 operation (Task 9's capability contract), never here.
 
 Temporary-file policy: :func:`temporary_artifact_file` creates its file
-atomically with mode ``0o600`` (``tempfile.mkstemp`` opens through
-``os.open`` with ``O_CREAT | O_EXCL`` and exactly that mode — there is
-no create-then-chmod window), yields it for streaming, and deletes it
+atomically with mode ``0o600`` (exclusive private creation admits the
+allocation before opening it — there is no create-then-chmod window),
+yields it for streaming, and deletes it
 best-effort after the caller's upload/verification block exits.
 
 Payload limits: the gateway capability probe reports the maximum inline
@@ -83,7 +83,6 @@ from __future__ import annotations
 import hashlib
 import re
 import string
-import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -206,7 +205,9 @@ class ArtifactProvenance:
 
     @classmethod
     def from_request(cls, request: object) -> ArtifactProvenance | None:
-        metadata = getattr(request, "metadata", {})
+        from mlflow_import.compatibility import request_ownership
+
+        metadata = request_ownership(request)
         if not isinstance(metadata, Mapping):
             metadata = {}
         # Requests produced by the Wave 1 hand-built test seam do not carry
@@ -230,7 +231,7 @@ class ArtifactProvenance:
         )
 
 
-def _optional_metadata(metadata: Mapping[object, object], key: str) -> str | None:
+def _optional_metadata(metadata: Mapping[str, object], key: str) -> str | None:
     value = metadata.get(key)
     return value if isinstance(value, str) else None
 
@@ -280,9 +281,8 @@ def temporary_artifact_file(
 ) -> Iterator[tuple[Path, BinaryIO]]:
     """Open a new restrictive temporary file for one streamed artifact.
 
-    The file is created atomically with mode ``0o600``:
-    :func:`tempfile.mkstemp` opens it through ``os.open`` with
-    ``O_CREAT | O_EXCL`` and exactly that mode, so no create-then-chmod
+    The file is created atomically with mode ``0o600`` using an exclusive
+    file-object factory and scoped private creation permissions, so no create-then-chmod
     window ever exists. The context yields ``(path, handle)``; the
     caller streams the artifact into ``handle`` and must flush before
     reading the file back. On exit the handle is closed and the file is
@@ -290,9 +290,9 @@ def temporary_artifact_file(
     upload/verification block, and cleanup failures are swallowed
     (never re-raised past the upload result).
     """
-    file_descriptor, name = tempfile.mkstemp(prefix=prefix, dir=directory)
-    path = Path(name)
-    handle = open(file_descriptor, "wb", closefd=True)
+    from .. import resources
+
+    handle, path = resources.open_temp_file(prefix=prefix, dir=directory)
     try:
         yield path, handle
     finally:
@@ -300,7 +300,7 @@ def temporary_artifact_file(
             handle.close()
         finally:
             try:
-                path.unlink()
+                resources.remove_file(path)
             except OSError:
                 pass
 

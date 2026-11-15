@@ -19,13 +19,16 @@ fingerprints and artifacts.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 from typing import Any, Protocol, cast, runtime_checkable
 
 from mlflow_import.source.catalog import OPENCODE_SCHEMA_CATALOG_V1
 from mlflow_import.source.model import (
+    OccurrenceRef,
     RecordClassificationName,
     SchemaDescription,
     SchemaGeneration,
@@ -39,6 +42,7 @@ from mlflow_import.source.snapshot import (
     SourceSnapshot,
     loads_snapshot_json,
 )
+from mlflow_import.source.spool import read_payload
 
 
 @runtime_checkable
@@ -102,22 +106,34 @@ class NormalizedSnapshotAdapter:
         return self._snapshot
 
     def iter_session_headers(self) -> Iterator[SessionHeader]:
-        cursor = self._snapshot.connection.execute("SELECT canonical_session_row FROM snapshot_sessions ORDER BY rowid")
+        cursor = self._snapshot.connection.execute(
+            "SELECT canonical_session_row FROM snapshot_sessions ORDER BY creation_ns IS NULL,creation_ns,session_id"
+        )
         for (canonical_session_row,) in cursor:
-            yield self._header_with_source_fingerprint(_restore_session_header(cast(str, canonical_session_row)))
+            yield self._header_with_source_fingerprint(
+                _restore_session_header(
+                    read_payload(self._snapshot.snapshot_path.with_suffix(".payloads"), canonical_session_row)
+                )
+            )
 
     def session_header(self, session_id: str) -> SessionHeader | None:
         """Load only the requested header; do not retain every session payload."""
         row = self._snapshot.connection.execute(
             "SELECT canonical_session_row FROM snapshot_sessions WHERE session_id = ? LIMIT 1", (session_id,)
         ).fetchone()
-        return self._header_with_source_fingerprint(_restore_session_header(row[0])) if row is not None else None
+        return (
+            self._header_with_source_fingerprint(
+                _restore_session_header(read_payload(self._snapshot.snapshot_path.with_suffix(".payloads"), row[0]))
+            )
+            if row is not None
+            else None
+        )
 
     def _header_with_source_fingerprint(self, header: SessionHeader) -> SessionHeader:
         """Attach the snapshot's non-secret database identity at replay time."""
         if header.source_fingerprint is not None:
             return header
-        return replace(header, source_fingerprint=self._snapshot.fingerprint)
+        return replace(header, source_fingerprint=self._snapshot.source_namespace or self._snapshot.fingerprint)
 
     def selection_evidence(self, session_id: str) -> SelectionEvidence | None:
         """Load invocation-specific pre-redaction match booleans only."""
@@ -135,10 +151,33 @@ class NormalizedSnapshotAdapter:
         placeholders = _placeholders(self._scoped_tables)
         sql = (
             "SELECT session_id, source_table, source_id, canonical_record, raw_permitted_fields"
-            f" FROM snapshot_records WHERE session_id = ? AND source_table NOT IN ({placeholders})"
-            " ORDER BY rowid"
+            f" FROM snapshot_records WHERE session_id = ? AND active=1 AND source_table NOT IN ({placeholders})"
+            " ORDER BY COALESCE(anchor_ordinal,path_ordinal,rowid),anchor_ordinal IS NOT NULL,path_ordinal,rowid"
         )
         yield from self._iter_stored_records(sql, (session_id, *sorted(self._scoped_tables)))
+
+    def occurrences(self, session_id: str) -> Iterator[OccurrenceRef]:
+        """Stream actual indexed locators without decoding any transcript payload."""
+        for row in self._snapshot.connection.execute(
+            "SELECT rowid,session_id,source_table,source_id,entity_id,parent_entity_id,invocation_id,call_id,"
+            " payload_offset,payload_length,occurrence_kind,active FROM snapshot_records"
+            " WHERE session_id=? ORDER BY rowid",
+            (session_id,),
+        ):
+            yield OccurrenceRef(
+                occurrence=row[0],
+                session_id=row[1],
+                source_table=row[2],
+                source_id=row[3],
+                entity_id=row[4],
+                parent_entity_id=row[5],
+                invocation_id=row[6],
+                call_id=row[7],
+                payload_offset=row[8],
+                payload_length=row[9],
+                kind=row[10],
+                active=bool(row[11]),
+            )
 
     def iter_session_scoped_records(self, session_id: str) -> Iterator[SourceRecord]:
         placeholders = _placeholders(self._scoped_tables)
@@ -149,16 +188,22 @@ class NormalizedSnapshotAdapter:
         )
         yield from self._iter_stored_records(sql, (session_id, *sorted(self._scoped_tables)))
 
-    def _iter_stored_records(self, sql: str, parameters: tuple[str, ...]) -> Iterator[SourceRecord]:
-        cursor = self._snapshot.connection.execute(sql, parameters)
-        for session_id, source_table, source_id, canonical_record, raw_permitted_fields in cursor:
-            yield _restore_source_record(
-                session_id=session_id,
-                source_table=cast(str, source_table),
-                source_id=cast("str | None", source_id),
-                canonical_record=cast(str, canonical_record),
-                raw_permitted_fields=cast(str, raw_permitted_fields),
-            )
+    def _iter_stored_records(
+        self, sql: str, parameters: tuple[object, ...], connection: sqlite3.Connection | None = None
+    ) -> Iterator[SourceRecord]:
+        cursor = (connection or self._snapshot.connection).execute(sql, parameters)
+        path = self._snapshot.snapshot_path.with_suffix(".payloads")
+        from mlflow_import.resources import open_reader
+
+        with open_reader(path) if path.exists() else nullcontext(None) as payloads:
+            for session_id, source_table, source_id, canonical_record, raw_permitted_fields in cursor:
+                yield _restore_source_record(
+                    session_id=session_id,
+                    source_table=cast(str, source_table),
+                    source_id=cast("str | None", source_id),
+                    canonical_record=read_payload(path, canonical_record, payloads),
+                    raw_permitted_fields=read_payload(path, raw_permitted_fields, payloads),
+                )
 
 
 def _session_scoped_tables(generation: SchemaGeneration) -> frozenset[str]:
@@ -233,6 +278,10 @@ def _restore_source_record(
         timestamp=_restore_timestamp_value(record_fields.get("timestamp")),
         completion_timestamp=_restore_timestamp_value(record_fields.get("completion_timestamp")),
         classification=cast("RecordClassificationName | None", classification),
+        occurrence_id=_optional_str(record_fields.get("occurrence_id")),
+        entity_id=_optional_str(record_fields.get("entity_id")),
+        invocation_id=_optional_str(record_fields.get("invocation_id")),
+        call_id=_optional_str(record_fields.get("call_id")),
     )
     # The row's session_id column is authoritative and NOT NULL; cross-check
     # the stored record section against it so a corrupted row fails loudly

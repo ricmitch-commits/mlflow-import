@@ -53,6 +53,7 @@ import json
 import math
 import re
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 
 from mlflow_import.contracts import (
     PROTECTED_IDENTITY_FIELDS,
@@ -103,6 +104,48 @@ def canonical_json(value: object) -> bytes:
     parts: list[str] = []
     _write_value(value, parts)
     return "".join(parts).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class StreamingArray:
+    """Explicit one-pass wire array; never an implicit arbitrary-iterator coercion."""
+
+    values: Iterable[object]
+
+
+def iter_canonical_json(value: object) -> Iterator[bytes]:
+    """Stream canonical arrays/maps; private disk maps use an external key sort."""
+    from mlflow_import.storage import DiskList, DiskMap
+
+    if isinstance(value, DuplicateKeyObject):
+        yield canonical_json(value)
+    elif isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("canonical object keys must be strings")
+        keys = (
+            DiskList(value, store=value.store).sorted_by(lambda key: key.encode("utf-8", "surrogatepass"))
+            if isinstance(value, DiskMap)
+            else sorted(value, key=lambda key: key.encode("utf-8", "surrogatepass"))
+        )
+        yield b"{"
+        separator = b""
+        for key in keys:
+            yield separator
+            yield canonical_json(key)
+            yield b":"
+            yield from iter_canonical_json(value[key])
+            separator = b","
+        yield b"}"
+    elif isinstance(value, (list, tuple, StreamingArray)):
+        yield b"["
+        separator = b""
+        for item in value.values if isinstance(value, StreamingArray) else value:
+            yield separator
+            yield from iter_canonical_json(item)
+            separator = b","
+        yield b"]"
+    else:
+        yield canonical_json(value)
 
 
 def canonical_json_compatible(value: object) -> object:
@@ -210,17 +253,10 @@ def _write_float(value: float, parts: list[str]) -> None:
 def _dump_string(value: str) -> str:
     if _NEEDS_ESCAPE.search(value) is None:
         return f'"{value}"'
-    escaped: list[str] = ['"']
-    for character in value:
-        short = _STRING_ESCAPES.get(character)
-        if short is not None:
-            escaped.append(short)
-        elif character < " " or "\ud800" <= character <= "\udfff":
-            escaped.append(f"\\u{ord(character):04x}")
-        else:
-            escaped.append(character)
-    escaped.append('"')
-    return "".join(escaped)
+    # Copy ordinary runs in C rather than visiting every character in Python.
+    # This preserves canonical-json-v1 bytes, including lone-surrogate escapes.
+    escaped = _NEEDS_ESCAPE.sub(lambda match: _STRING_ESCAPES.get(match[0]) or f"\\u{ord(match[0]):04x}", value)
+    return f'"{escaped}"'
 
 
 def _format_finite_float(value: float) -> str:

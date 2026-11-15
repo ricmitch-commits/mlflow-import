@@ -1,6 +1,7 @@
 """Live parity for missing timing and partial-child rollback."""
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -12,7 +13,7 @@ from tests.support.import_fakes import build_current_source_db
 pytestmark = pytest.mark.integration
 
 
-def test_live_missing_source_timestamps_never_create_a_trace(live_server, restrictive_tmp_path):
+def test_live_missing_source_timestamps_are_explicit_synthetic_containers(live_server, restrictive_tmp_path):
     source = build_current_source_db(
         restrictive_tmp_path, sessions=[("missing", 1000)], messages=[("u", "missing", "user", 1, "{}")]
     )
@@ -25,9 +26,11 @@ def test_live_missing_source_timestamps_never_create_a_trace(live_server, restri
         experiment_name=unique_experiment_name("missing-time"),
         tmp_root=restrictive_tmp_path,
     )
-    assert run.exit_status == 1
-    assert turn_entries(run.report)[0]["error"]["code"] == "source_timestamp_missing"
-    assert live_server.client.search_traces(locations=[run.report["experiment"]["id"]]) == []
+    assert run.exit_status == 0
+    trace = live_server.client.get_trace(turn_entries(run.report)[0]["trace_id"], display=False)
+    root = next(span for span in trace.data.spans if span.parent_id is None)
+    assert root.attributes["mlflow_import.timing"] == "synthetic-container"
+    assert trace.info.state.value == "ERROR"
 
 
 def test_live_child_failure_ends_and_rolls_back_known_partial_trace(live_server, restrictive_tmp_path):
@@ -53,6 +56,16 @@ def test_live_child_failure_ends_and_rolls_back_known_partial_trace(live_server,
     retired = []
 
     class InspectingGateway(MlflowGateway):
+        def create_trace(self, request):
+            # This intentionally exercises the legacy detached-span seam,
+            # including its SDK metadata behavior, rather than historical ingestion.
+            from mlflow_import.compatibility import request_ownership
+
+            return super().create_trace(replace(
+                request, historical=False,
+                metadata={key: value for key, value in request_ownership(request).items() if len(value) <= 250},
+            ))
+
         def retire_trace(self, experiment_id, trace_id, **kwargs):
             trace = live_server.client.get_trace(trace_id, display=False, flush=True)
             root = next(s for s in trace.data.spans if s.parent_id is None)

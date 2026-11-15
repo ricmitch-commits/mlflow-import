@@ -12,15 +12,13 @@ NAME = "codex"
 
 def default_sources() -> tuple[Path, ...]:
     root = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-    return tuple(sorted(root.glob("sessions/*/*/*/rollout-*.jsonl"))) + tuple(
-        sorted(root.glob("archived_sessions/*.jsonl"))
-    )
+    return (root,)
 
 
 def detect(path: Path) -> bool:
-    return (
-        path.is_dir() and ("codex" in path.parts or "sessions" in path.parts or "archived_sessions" in path.parts)
-    ) or (path.suffix == ".jsonl" and ("rollout-" in path.name or "archived_sessions" in path.parts))
+    from .jsonl_common import detect as detect_schema
+
+    return detect_schema(path, NAME)
 
 
 def exporter(path: Path) -> JsonlExporter:

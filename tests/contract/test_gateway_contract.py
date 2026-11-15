@@ -53,7 +53,9 @@ from tests.support.fake_gateway import FakeMlflowClient, child_spec, trace_spec
 pytestmark = pytest.mark.contract
 
 _SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "mlflow_import"
-_ALLOWED_MLFLOW_IMPORT_ROOTS = frozenset({"mlflow", "mlflow.tracking", "mlflow.artifacts"})
+_ALLOWED_MLFLOW_IMPORT_ROOTS = frozenset(
+    {"mlflow", "mlflow.tracking", "mlflow.artifacts", "mlflow.entities", "mlflow.tracing.client"}
+)
 _GATEWAY_MODULES = ("gateway.py", "capabilities.py")
 
 
@@ -180,8 +182,8 @@ def test_gateway_call_shapes_match_the_recorded_signatures(tmp_path: Path) -> No
 
     retrievals = [call[1] for call in client.calls if call[0] == "get_trace"]
     assert all(kwargs["display"] is False for kwargs in retrievals)
-    assert any(kwargs["trace_id"] == created.trace_id and kwargs["flush"] is True for kwargs in retrievals), (
-        "verify_trace and the artifact sink must retrieve the full payload deterministically"
+    assert any(kwargs["trace_id"] == created.trace_id for kwargs in retrievals), (
+        "verify_trace and the artifact sink retrieve full payloads after the explicit create flush"
     )
 
     deletions = [call[1] for call in client.calls if call[0] == "delete_traces"]

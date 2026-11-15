@@ -74,7 +74,9 @@ def decoded_source_outcome(decoded: object) -> str | None:
     lifecycle_error = decoded.get("lifecycle_error_outcome")
     if isinstance(lifecycle_error, str) and lifecycle_error:
         return lifecycle_error
-    values = [decoded.get(name) for name in ("outcome", "status", "finish")]
+    values = [
+        decoded.get(name) for name in ("outcome", "status", "finish", "stopReason", "stop_reason", "finish_reason")
+    ]
     strings = [value for value in values if isinstance(value, str) and value]
     for value in strings:
         if classify_outcome(value) == "ERROR":
@@ -97,7 +99,9 @@ def declared_source_outcome(decoded: object) -> str | None:
     lifecycle_error = decoded.get("lifecycle_error_outcome")
     if isinstance(lifecycle_error, str) and lifecycle_error:
         return lifecycle_error
-    values = [decoded.get(name) for name in ("outcome", "status", "finish")]
+    values = [
+        decoded.get(name) for name in ("outcome", "status", "finish", "stopReason", "stop_reason", "finish_reason")
+    ]
     strings = [value for value in values if isinstance(value, str) and value]
     for value in strings:
         if classify_outcome(value) == "ERROR":

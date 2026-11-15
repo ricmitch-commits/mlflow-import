@@ -175,6 +175,7 @@ class TestContractSurface:
             "connection_secret",
             "known_token_prefix",
             "opaque_binary",
+            "user_identity",
         )
 
     def test_detector_constants_are_compiled_patterns(self) -> None:

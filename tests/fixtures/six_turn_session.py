@@ -184,6 +184,7 @@ _MESSAGES: tuple[tuple[str, str, int, int, object], ...] = (
             "providerID": "synthetic-provider",
             "tokens": {"input": 120, "output": 80, "reasoning": 12, "cache": {"read": 40, "write": 4}},
             "cost": 0.0025,
+            "finish": "stop",
         },
     ),
     # Turn 2: an earlier plain assistant result, then a split final model result.
@@ -208,6 +209,7 @@ _MESSAGES: tuple[tuple[str, str, int, int, object], ...] = (
             "model": _MODEL,
             "tokens": {"input": 90, "output": 60, "reasoning": 0, "cache": {"read": 10, "write": 2}},
             "cost": 0.0015,
+            "finish": "stop",
         },
     ),
     # Turn 3: no assistant result at all.
@@ -236,7 +238,7 @@ _MESSAGES: tuple[tuple[str, str, int, int, object], ...] = (
         "assistant",
         12,
         1772000090000,
-        {"content": [{"type": "text", "text": "synthetic plain answer five"}]},
+        {"content": [{"type": "text", "text": "synthetic plain answer five"}], "finish": "stop"},
     ),
     # Turn 6: a single-part model-call result.
     ("msg-synthetic-u6", "user", 13, 1772000100000, {"content": [{"type": "text", "text": "synthetic prompt six"}]}),
@@ -250,6 +252,7 @@ _MESSAGES: tuple[tuple[str, str, int, int, object], ...] = (
             "model": _MODEL,
             "tokens": {"input": 60, "output": 30, "reasoning": 5, "cache": {"read": 8, "write": 1}},
             "cost": 0.001,
+            "finish": "stop",
         },
     ),
 )

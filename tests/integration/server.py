@@ -125,7 +125,7 @@ def terminate_server(proc: subprocess.Popen[bytes]) -> None:
     proc.wait(timeout=10)
 
 
-def _launch_disposable_server(run_root: Path) -> tuple[subprocess.Popen[bytes], str]:
+def _launch_disposable_server(run_root: Path, *, proxy_artifacts: bool = False) -> tuple[subprocess.Popen[bytes], str]:
     """Launch a disposable MLflow server from the installed distribution.
 
     Retries with a fresh port when the server exits before becoming healthy
@@ -147,11 +147,17 @@ def _launch_disposable_server(run_root: Path) -> tuple[subprocess.Popen[bytes], 
             f"sqlite:///{database}",
             "--artifacts-destination",
             f"file://{artifacts}",
+            "--default-artifact-root",
+            f"file://{artifacts}",
             "--host",
             "127.0.0.1",
             "--port",
             str(port),
         ]
+        if proxy_artifacts:
+            # Preserve the existing same-host benchmark profile by default.
+            index = command.index("--default-artifact-root")
+            del command[index : index + 2]
         env = {**os.environ, "MLFLOW_DISABLE_AGENT_HINT": "1"}
         with log_path.open("wb") as log_file:
             proc = subprocess.Popen(
@@ -190,7 +196,7 @@ class LiveServer:
 
 
 @contextmanager
-def live_mlflow_server() -> Iterator[LiveServer]:
+def live_mlflow_server(requested_uri: str | None = None, *, proxy_artifacts: bool = False) -> Iterator[LiveServer]:
     """Yield a live MLflow server: requested via ``MLFLOW_TRACKING_URI`` or self-launched.
 
     Honors an externally requested server via ``MLFLOW_TRACKING_URI``
@@ -201,12 +207,26 @@ def live_mlflow_server() -> Iterator[LiveServer]:
     session (module-level span export follows the *global* tracking URI,
     not any individual client's URI), restoring the saved value on exit.
     """
-    saved_otel = {name: os.environ.pop(name) for name in OTEL_HIJACK_ENV_VARS if name in os.environ}
+    ambient = (
+        *OTEL_HIJACK_ENV_VARS,
+        "MLFLOW_EXPERIMENT_ID",
+        "MLFLOW_EXPERIMENT_NAME",
+        "MLFLOW_TRACKING_USERNAME",
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_TOKEN",
+        "MLFLOW_TRACKING_AWS_SIGV4",
+        "MLFLOW_TRACKING_CLIENT_CERT_PATH",
+        "MLFLOW_TRACKING_SERVER_CERT_PATH",
+        "MLFLOW_TRACE_USER",
+        "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING",
+    )
+    saved_otel = {name: os.environ.pop(name) for name in ambient if name in os.environ}
+    os.environ["MLFLOW_ENABLE_ASYNC_TRACE_LOGGING"] = "false"
     server: subprocess.Popen[bytes] | None = None
     run_root: Path | None = None
     saved_uri = mlflow.get_tracking_uri()
     try:
-        requested = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
+        requested = (os.environ.get("MLFLOW_TRACKING_URI", "") if requested_uri is None else requested_uri).strip()
         if requested:
             if not requested.startswith(("http://", "https://")):
                 pytest.fail(
@@ -227,7 +247,7 @@ def live_mlflow_server() -> Iterator[LiveServer]:
             base.mkdir(parents=True, exist_ok=True)
             run_root = base / f"mlflow-import-integration-{uuid.uuid4().hex[:12]}"
             run_root.mkdir()
-            server, uri = _launch_disposable_server(run_root)
+            server, uri = _launch_disposable_server(run_root, proxy_artifacts=proxy_artifacts)
         mlflow.set_tracking_uri(uri)
         yield LiveServer(uri=uri, client=MlflowClient(tracking_uri=uri), process=server, run_root=run_root)
     finally:
@@ -237,3 +257,5 @@ def live_mlflow_server() -> Iterator[LiveServer]:
         if run_root is not None:
             shutil.rmtree(run_root, ignore_errors=True)
         os.environ.update(saved_otel)
+        if "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING" not in saved_otel:
+            os.environ.pop("MLFLOW_ENABLE_ASYNC_TRACE_LOGGING", None)

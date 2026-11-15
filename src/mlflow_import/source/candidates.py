@@ -7,12 +7,15 @@ record tables are consulted later, after the candidate IDs have been selected.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from collections.abc import Collection
 from pathlib import Path
 
+from mlflow_import.errors import SourceCompatibilityError
+from mlflow_import.retry import check_budget
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.model import SchemaDescription
 from mlflow_import.source.normalize import normalize_epoch_ms
-from mlflow_import.source.selection import SelectionFilters, matches_directory
+from mlflow_import.source.selection import SelectionFilters, matches_directory, time_bounds
 
 
 def candidate_session_ids(
@@ -20,9 +23,13 @@ def candidate_session_ids(
     description: SchemaDescription,
     filters: SelectionFilters,
     session_id: str | None = None,
-) -> frozenset[str] | None:
+    *,
+    include_relatives: bool = True,
+    seed_ids: Collection[str] | None = None,
+    warnings: set[str] | None = None,
+) -> DiskIds | None:
     """Return header-filtered session IDs, or ``None`` when no pushdown applies."""
-    if not any(
+    if seed_ids is None and not any(
         (
             session_id,
             filters.from_time,
@@ -38,10 +45,12 @@ def candidate_session_ids(
         "current": ("session_v2",),
         "mixed": ("session_v2", "session"),
     }[description.generation]
-    found: set[str] = set()
-    all_session_ids: set[str] = set()
-    parents: dict[str, set[str]] = {}
-    children: dict[str, set[str]] = {}
+    result = DiskIds()
+    lower, upper = time_bounds(filters)
+    index = result.db
+    index.executescript("""CREATE TABLE headers(id TEXT PRIMARY KEY,owner TEXT,matched INTEGER DEFAULT 0);
+        CREATE TABLE edges(child TEXT,parent TEXT,PRIMARY KEY(child,parent));
+        CREATE INDEX edge_parent ON edges(parent);""")
     for table in tables:
         columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
         if "id" not in columns:
@@ -53,32 +62,56 @@ def candidate_session_ids(
         ]
         quoted = ", ".join(f'"{name}"' for name in selected)
         for row in connection.execute(f'SELECT {quoted} FROM "{table}"'):
+            check_budget()
             values = dict(zip(selected, row, strict=True))
             native_id = values.get("id")
             if native_id is None or not str(native_id).strip():
-                continue
+                raise SourceCompatibilityError(
+                    "invalid_session_identity", "an authoritative session header has no identity"
+                )
             native_id = str(native_id)
-            all_session_ids.add(native_id)
+            # V2 header precedence applies to pruning and relationship edges.
+            if index.execute("INSERT OR IGNORE INTO headers(id,owner) VALUES(?,?)", (native_id, table)).rowcount == 0:
+                if index.execute("SELECT owner FROM headers WHERE id=?", (native_id,)).fetchone()[0] == table:
+                    raise SourceCompatibilityError(
+                        "duplicate_session_identity", "authoritative session headers have duplicate identities"
+                    )
+                continue
             for parent_id in (values.get("parent_id"), values.get("fork_session_id")):
                 if parent_id is None or not str(parent_id).strip():
                     continue
                 parent = str(parent_id)
-                parents.setdefault(native_id, set()).add(parent)
-                children.setdefault(parent, set()).add(native_id)
+                index.execute("INSERT OR IGNORE INTO edges VALUES(?,?)", (native_id, parent))
+            if seed_ids is not None:
+                if native_id in seed_ids:
+                    index.execute("UPDATE headers SET matched=1 WHERE id=?", (native_id,))
+                continue
             if session_id is not None and native_id != session_id:
                 continue
             created = _created_time(values.get("time_created"))
-            if filters.from_time is not None and (created is None or created < filters.from_time):
+            if created is None and (lower is not None or upper is not None) and warnings is not None:
+                warnings.add("missing_session_creation_time")
+            if lower is not None and (created is None or created < lower):
                 continue
-            if filters.to_time is not None and (created is None or created > filters.to_time):
+            if upper is not None and (created is None or created > upper):
                 continue
             directory = values.get("directory") or values.get("path")
             if filters.directory is not None and (
                 not isinstance(directory, str) or not matches_directory(Path(directory), filters.directory)
             ):
                 continue
-            found.add(native_id)
-    return frozenset(_ancestry_closure(found, all_session_ids, parents, children))
+            index.execute("UPDATE headers SET matched=1 WHERE id=?", (native_id,))
+    if include_relatives:
+        index.executescript("""WITH RECURSIVE ancestors(id) AS (
+            SELECT id FROM headers WHERE matched=1 UNION
+            SELECT e.parent FROM edges e JOIN ancestors a ON e.child=a.id),
+            descendants(id) AS (SELECT id FROM headers WHERE matched=1 UNION
+            SELECT e.child FROM edges e JOIN descendants d ON e.parent=d.id)
+            INSERT INTO ids SELECT id FROM headers WHERE id IN
+                (SELECT id FROM ancestors UNION SELECT id FROM descendants);""")
+    else:
+        index.execute("INSERT INTO ids SELECT id FROM headers WHERE matched=1")
+    return result
 
 
 def _ancestry_closure(
@@ -115,6 +148,6 @@ def _ancestry_closure(
     return included
 
 
-def _created_time(value: object) -> datetime | None:
+def _created_time(value: object) -> int | None:
     timestamp, _warnings = normalize_epoch_ms(value)
-    return timestamp.utc if timestamp is not None else None
+    return timestamp.nanoseconds if timestamp is not None else None

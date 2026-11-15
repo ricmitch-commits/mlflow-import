@@ -14,14 +14,18 @@ name.
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import time
+from argparse import Namespace
 from collections.abc import Sequence
 
-from mlflow_import.config import PROG, build_parser, parse_config
+from mlflow_import import resources
+from mlflow_import.config import PROG, build_parser, config_from_arguments, parse_arguments
 from mlflow_import.errors import ImporterError
 from mlflow_import.importer import ImportDependencies, build_dependencies, exit_status, run_import
-from mlflow_import.reporting import render_human, render_json
+from mlflow_import.reporting import iter_human, iter_json
+from mlflow_import.retry import retry_budget
 
 __all__ = ["PROG", "build_parser", "main"]
 
@@ -39,8 +43,25 @@ def main(argv: Sequence[str] | None = None, dependencies: ImportDependencies | N
     format is the only thing written.
     """
     effective_argv = sys.argv[1:] if argv is None else argv
+    # Syntax/help needs no workspace. Source-format validation may build a
+    # header inventory, so it shares the invocation ledger and deadline too.
     try:
-        config = parse_config(effective_argv)
+        arguments = parse_arguments(effective_argv)
+    except SystemExit as error:
+        return error.code if isinstance(error.code, int) else 2
+    status = 2
+    try:
+        with resources.temporary_storage(), retry_budget():
+            status = _main(arguments, dependencies)
+        return status
+    except ImporterError as error:
+        failure = _report_failure(error)
+        return max(status, failure) if error.code == "temporary_storage_cleanup_failed" else failure
+
+
+def _main(arguments: Namespace, dependencies: ImportDependencies | None) -> int:
+    try:
+        config = config_from_arguments(arguments)
     except ImporterError as error:
         return _report_failure(error)
     except SystemExit as error:  # argparse: --help exits 0, usage errors exit 2
@@ -49,13 +70,31 @@ def main(argv: Sequence[str] | None = None, dependencies: ImportDependencies | N
     started = time.perf_counter() if config.log_level == "DEBUG" else None
     if config.log_level == "DEBUG":
         _write_debug("mlflow-import: import pipeline started")
-    result = run_import(config, effective_dependencies)
+    try:
+        result = run_import(config, effective_dependencies)
+    except ImporterError as error:
+        return _report_failure(error)
     if started is not None:
         elapsed = time.perf_counter() - started
         _write_debug(f"mlflow-import: import pipeline complete elapsed_s={elapsed:.3f}")
-    output = render_human(result) if config.output == "human" else render_json(result)
-    print(output)
-    return exit_status(result)
+    status = exit_status(result)
+    try:
+        if config.output == "human":
+            for line in iter_human(result):
+                print(line)
+        else:
+            for chunk in iter_json(result):
+                sys.stdout.write(chunk)
+            sys.stdout.write("\n")
+    finally:
+        try:
+            result.close()
+        except (OSError, RuntimeError, sqlite3.Error, ImporterError):
+            print(
+                f"{PROG}: error (result_cleanup_failed): private result storage could not be removed", file=sys.stderr
+            )
+            status = max(status, 1)
+    return status
 
 
 def _report_failure(error: ImporterError) -> int:

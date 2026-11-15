@@ -146,25 +146,9 @@ def _build_current_fixture(tmp_path: Path) -> Path:
 
 def _snapshot_writer_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:", isolation_level=None)
-    connection.executescript(
-        """
-        CREATE TABLE snapshot_sessions (
-            session_id TEXT NOT NULL,
-            schema TEXT NOT NULL,
-            canonical_session_row TEXT NOT NULL,
-            directory_filter_match INTEGER NOT NULL,
-            model_filter_match INTEGER NOT NULL
-        );
-        CREATE TABLE snapshot_records (
-            session_id TEXT NOT NULL,
-            order_key TEXT NOT NULL,
-            source_table TEXT NOT NULL,
-            source_id TEXT,
-            canonical_record TEXT NOT NULL,
-            raw_permitted_fields TEXT NOT NULL
-        );
-        """
-    )
+    from mlflow_import.source.snapshot import _SNAPSHOT_SCHEMA
+
+    connection.executescript(_SNAPSHOT_SCHEMA)
     return connection
 
 
@@ -276,11 +260,20 @@ class TestSnapshotCreation:
             assert snapshot.snapshot_path.parent.parent == tmp_path
             assert snapshot.snapshot_path.name == "snapshot.db"
 
-    def test_snapshot_contains_only_the_two_normalized_tables(self, tmp_path: Path) -> None:
+    def test_snapshot_contains_normalized_tables_and_identity_indexes(self, tmp_path: Path) -> None:
         source = _build_current_fixture(tmp_path)
         exporter = ScriptedExporter(sessions=[_session()], records=[_record("msg-1")])
         with create_normalized_snapshot(source, tmp_path, exporter, identity_redaction) as snapshot:
-            assert _snapshot_tables(snapshot.connection) == ["snapshot_records", "snapshot_sessions"]
+            assert _snapshot_tables(snapshot.connection) == [
+                "agent_links",
+                "calls",
+                "entities",
+                "model_identities",
+                "snapshot_records",
+                "snapshot_sessions",
+                "source_identity_headers",
+                "source_summaries",
+            ]
 
     def test_snapshot_exposes_fingerprint_description_and_stats(self, tmp_path: Path) -> None:
         source = _build_current_fixture(tmp_path)
@@ -563,8 +556,10 @@ class TestSnapshotRedaction:
             row = snapshot.connection.execute(
                 "SELECT canonical_record, raw_permitted_fields FROM snapshot_records"
             ).fetchone()
-            stored_record = json.loads(row[0])
-            stored_fields = json.loads(row[1])
+            from mlflow_import.source.spool import read_payload
+
+            stored_record = json.loads(read_payload(snapshot.snapshot_path.with_suffix(".payloads"), row[0]))
+            stored_fields = json.loads(read_payload(snapshot.snapshot_path.with_suffix(".payloads"), row[1]))
 
         # Identity-like keys in arbitrary decoded transcript content are not
         # structural envelope fields and therefore receive no exemption.
@@ -582,7 +577,9 @@ class TestSnapshotRedaction:
         exporter = ScriptedExporter(sessions=[_session()], records=[_record("msg-1")])
         with create_normalized_snapshot(source, tmp_path, exporter, identity_redaction) as snapshot:
             row = snapshot.connection.execute("SELECT canonical_record FROM snapshot_records").fetchone()
-        stored = json.loads(row[0])
+            from mlflow_import.source.spool import read_payload
+
+            stored = json.loads(read_payload(snapshot.snapshot_path.with_suffix(".payloads"), row[0]))
         assert stored["decoded"] == {"content": [{"type": "text", "text": "synthetic prompt"}]}
         assert stored["raw_text"] == '{"content": [{"type": "text", "text": "synthetic prompt"}]}'
 

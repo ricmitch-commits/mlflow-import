@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import stat as stat_module
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -57,6 +58,24 @@ _TIMESTAMP_UNIT_NANOSECONDS: Mapping[str, int] = {
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 _FINGERPRINT_VERSION = "mlflow-import-source-fingerprint-v1"
+
+
+def iso_fractional_ns(value: str) -> int:
+    """Sub-microsecond correction to datetime's ISO parsing, including offsets."""
+    zone = re.search(r"(?:Z|([+-])\d{2}(?::?\d{2})?(?::?\d{2})?(?:[.,]\d+)?)$", value)
+    time_part = value[: zone.start()] if zone else value
+    offset_part = zone[0] if zone else ""
+
+    def tail(part: str) -> int:
+        fraction = re.search(r"[.,](\d+)", part)
+        if fraction is None:
+            return 0
+        digits = fraction[1]
+        if len(digits) > 9 and any(digit != "0" for digit in digits[9:]):
+            raise ValueError("timestamp precision exceeds nanoseconds")
+        return int(digits[6:9].ljust(3, "0"))
+
+    return tail(time_part) - (-1 if offset_part.startswith("-") else 1) * tail(offset_part)
 
 
 @dataclass(frozen=True)
@@ -218,6 +237,10 @@ class SourceRecord:
     timestamp: TimestampValue | None = None
     completion_timestamp: TimestampValue | None = None
     classification: RecordClassificationName | None = None
+    occurrence_id: str | None = None
+    entity_id: str | None = None
+    invocation_id: str | None = None
+    call_id: str | None = None
 
     @classmethod
     def from_row(
@@ -257,6 +280,24 @@ def _decode_raw_json(raw_json: str | None) -> tuple[object | None, tuple[str, ..
         return None, ("malformed_json",)
     warnings: tuple[str, ...] = ("duplicate_json_key",) if decoded.has_duplicate_keys else ()
     return decoded.value, warnings
+
+
+@dataclass(frozen=True)
+class OccurrenceRef:
+    """Content-free, snapshot-local occurrence/entity/call and byte locator."""
+
+    occurrence: int
+    session_id: str
+    source_table: str
+    source_id: str | None
+    entity_id: str | None
+    parent_entity_id: str | None
+    invocation_id: str | None
+    call_id: str | None
+    payload_offset: int | None
+    payload_length: int | None
+    kind: str
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -316,6 +357,50 @@ def source_database_fingerprint(schema_generation: SchemaGeneration, path: Path)
             str(info.st_mtime_ns),
         )
     )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def owning_source_root(path: Path, harness: str = "opencode", *, known_only: bool = False) -> Path | None:
+    """Resolve a configured/conventional store boundary without reading content."""
+    path = Path(os.path.abspath(path.expanduser()))
+    root = path if path.is_dir() else path.parent
+    from mlflow_import.sources import get_adapter
+
+    owned_root: Path | None = None
+    for candidate in get_adapter(harness).default_locations():
+        candidate = Path(os.path.abspath(candidate.expanduser()))
+        candidate_root = candidate.parent if harness == "opencode" else candidate
+        if root == candidate_root or candidate_root in root.parents:
+            if owned_root is None or len(candidate_root.parts) > len(owned_root.parts):
+                owned_root = candidate_root
+    if owned_root is not None:
+        root = owned_root
+    anchors = {
+        "claude": {"projects"},
+        "codex": {"sessions", "archived_sessions"},
+        "pi": {"sessions"},
+        "gemini": {"tmp"},
+    }.get(harness, set())
+    if owned_root is None:
+        for ancestor in (root, *root.parents):
+            if ancestor.name in anchors:
+                if harness == "gemini" and ancestor.parent.name != ".gemini":
+                    continue
+                root = ancestor.parent if harness == "codex" else ancestor
+                owned_root = root
+                break
+    return root if not known_only or owned_root is not None else None
+
+
+def source_namespace(path: Path, harness: str = "opencode") -> str:
+    """Stable root-derived identity; explicit/default views share qualified roots.
+
+    A moved store changes this fallback. Arbitrary OS temporary directories are
+    not mistaken for Gemini runtime stores merely because they are named tmp.
+    """
+    root = owning_source_root(path, harness)
+    assert root is not None
+    material = "mlflow-import-source-root-v1\0" + harness + "\0" + os.path.abspath(root)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 

@@ -32,8 +32,10 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
+from mlflow_import.errors import SourceCompatibilityError
 from mlflow_import.json_values import decode_lossless_json
 from mlflow_import.source.catalog import SECURITY_EXCLUDED_COLUMNS, RecordClassification, SchemaCatalog
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.model import (
     RecordClassificationName,
     SchemaGeneration,
@@ -500,6 +502,26 @@ def stable_key_order(
     return ", ".join(f"({qualified(name)} IS NULL), COALESCE(CAST({qualified(name)} AS TEXT), '')" for name in present)
 
 
+def located_rows(
+    connection: sqlite3.Connection,
+    ordered_sql: str,
+    parameters: Sequence[object],
+    payload_sql: str,
+    locator_width: int,
+) -> Iterator[tuple[Any, ...]]:
+    """Sort only structural locators, then read one exact payload in that order.
+
+    The exporter holds the same read transaction for both queries. Carrying JSON
+    or blobs in the sorter makes a bounded SQLite workspace proportional to the
+    entire selected transcript rather than the small ordering index.
+    """
+    for location in connection.execute(ordered_sql, parameters):
+        payload = connection.execute(payload_sql, tuple(location[:locator_width])).fetchone()
+        if payload is None:
+            raise SourceCompatibilityError("source_changed", "an ordered source locator no longer resolves")
+        yield (*payload, *location[locator_width:])
+
+
 class OrderedGroupReader:
     """Consecutive-group reader over an ordered ``(key, value)`` stream.
 
@@ -618,17 +640,30 @@ class IdentityTracker:
     schema_generation: SchemaGeneration
 
     def __post_init__(self) -> None:
-        self._seen_explicit: set[tuple[str, str, str]] = set()
-        self._occurrences: dict[tuple[str, str | None, str | None, str, str, str], int] = {}
-        self._seen_join_keys: set[str] = set()
+        self._index = DiskIds()
+        self._index.db.execute("CREATE TABLE counters(key TEXT PRIMARY KEY,count INTEGER)")
+        self._index.db.execute("CREATE TABLE explicit_locations(key TEXT PRIMARY KEY,location TEXT)")
 
-    def register_explicit(self, source_table: str, source_id: str) -> bool:
-        """Mark an explicit ID seen; ``False`` means a duplicate projection."""
+    def register_explicit(self, source_table: str, source_id: str, physical_identity: object | None = None) -> bool:
+        """Deduplicate one physical projection; reject distinct rows sharing a required ID."""
         key = (self.schema_generation, source_table, source_id)
-        if key in self._seen_explicit:
-            return False
-        self._seen_explicit.add(key)
-        return True
+        if physical_identity is not None:
+            encoded = json.dumps(key, separators=(",", ":"))
+            location = _digest_component(physical_identity)
+            previous = self._index.db.execute(
+                "SELECT location FROM explicit_locations WHERE key=?", (encoded,)
+            ).fetchone()
+            if previous and previous[0] != location:
+                raise SourceCompatibilityError(
+                    "duplicate_record_identity", "distinct physical rows claim one required logical identity"
+                )
+            self._index.db.execute("INSERT OR IGNORE INTO explicit_locations VALUES(?,?)", (encoded, location))
+        return (
+            self._index.db.execute(
+                "INSERT OR IGNORE INTO ids VALUES(?)", ("explicit:" + json.dumps(key, separators=(",", ":")),)
+            ).rowcount
+            > 0
+        )
 
     def next_occurrence(
         self,
@@ -653,16 +688,15 @@ class IdentityTracker:
             row_digest,
             _digest_component(row_discriminator),
         )
-        count = self._occurrences.get(key, 0) + 1
-        self._occurrences[key] = count
+        encoded = json.dumps(key, separators=(",", ":"))
+        row = self._index.db.execute("SELECT count FROM counters WHERE key=?", (encoded,)).fetchone()
+        count = row[0] + 1 if row else 1
+        self._index.db.execute("INSERT OR REPLACE INTO counters VALUES(?,?)", (encoded, count))
         return count
 
     def register_join_projection(self, join_key: str) -> bool:
         """Mark a join projection seen; ``False`` means a repeat to collapse."""
-        if join_key in self._seen_join_keys:
-            return False
-        self._seen_join_keys.add(join_key)
-        return True
+        return self._index.db.execute("INSERT OR IGNORE INTO ids VALUES(?)", ("join:" + join_key,)).rowcount > 0
 
 
 def catalogued_columns(catalog: SchemaCatalog, table: str) -> tuple[str, ...]:

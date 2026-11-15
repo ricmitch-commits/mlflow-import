@@ -72,18 +72,19 @@ creation instead.
 from __future__ import annotations
 
 import hashlib
-import tempfile
-from collections.abc import Callable, Iterator, Mapping
+import json
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlflow
 from mlflow import MlflowClient
 from mlflow.artifacts import get_artifact_repository
 
+from mlflow_import import resources
 from mlflow_import.content.artifacts import ArtifactProvenance
 from mlflow_import.errors import CapabilityError, ConfigurationError, ItemImportError, PartialTraceCreateError
 from mlflow_import.mlflow.capabilities import (
@@ -92,6 +93,8 @@ from mlflow_import.mlflow.capabilities import (
     VersionTransport,
     probe_capabilities,
 )
+from mlflow_import.retry import check_budget
+from mlflow_import.storage import DiskList, DiskMap
 
 if TYPE_CHECKING:
     from mlflow_import.mlflow.reconciliation import CandidateContract, CandidateVerification, OwnedTraceCandidate
@@ -379,7 +382,7 @@ class TraceCreateRequest:
     ``None`` keeps the verbatim-field derivation.
     """
 
-    client_request_id: str
+    client_request_id: str | None
     experiment_id: str
     name: str
     native_session_id: str
@@ -395,6 +398,12 @@ class TraceCreateRequest:
     artifact_snapshot_fingerprint: str
     artifact_relative_path: str
     root_status: str | None = None
+    historical: bool = False
+    trace_name: str | None = None
+    request_preview: str | None = None
+    response_preview: str | None = None
+    native_usage: Mapping[str, object] | None = None
+    native_cost: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -480,11 +489,29 @@ def validate_required_metadata(spec: TraceCreateRequest) -> None:
     fields fail as an item error while no trace identity exists.  Descriptive
     fields may use the mapper's bounded artifact-reference representation.
     """
-    values = dict(spec.metadata)
+    from mlflow_import.compatibility import request_ownership
+
+    values = request_ownership(spec)
     values[TRACE_SESSION_METADATA_KEY] = spec.native_session_id
-    for key in _EXACT_METADATA_KEYS | {TRACE_SESSION_METADATA_KEY}:
+    keys = _EXACT_METADATA_KEYS | {TRACE_SESSION_METADATA_KEY}
+    if spec.historical:
+        if set(spec.metadata) - {
+            "parent_session_id", "mlflow.trace.session", "mlflow.trace.tokenUsage", "mlflow.trace.cost"
+        }:
+            raise ItemImportError(
+                "request_metadata_invalid", "historical request metadata is outside its native contract"
+            )
+        keys = keys | set(spec.metadata)
+        if len(spec.client_request_id or "") > 50:
+            raise ItemImportError(
+                "native_request_id_too_long", "the source request identity exceeds the pinned native field limit"
+            )
+    for key in keys:
         value = values.get(key)
-        if isinstance(value, str) and len(value) > TRACE_METADATA_VALUE_LIMIT:
+        limit = TRACE_METADATA_VALUE_LIMIT
+        if spec.historical and key in spec.root_tags and key not in spec.metadata and key != TRACE_SESSION_METADATA_KEY:
+            limit = TRACE_TAG_VALUE_LIMIT
+        if isinstance(value, str) and len(value) > limit:
             raise ItemImportError(
                 "ownership_metadata_too_long",
                 "a required ownership metadata value exceeds the tracking server limit",
@@ -596,16 +623,18 @@ class TraceArtifactSink:
         source = Path(local_file)
         digest = hashlib.sha256()
         size = 0
-        with tempfile.TemporaryDirectory(prefix="mlflow-import-upload-") as tmp:
+        with resources.temporary_directory(prefix="mlflow-import-upload-") as tmp:
             staged = Path(tmp) / rel.name
-            with source.open("rb") as src, staged.open("wb") as dst:
+            with resources.open_reader(source) as src, resources.open_file(staged, "wb") as dst:
                 while chunk := src.read(chunk_size):
                     digest.update(chunk)
                     size += len(chunk)
                     dst.write(chunk)
             repository = self._trace_artifact_repository(trace_id)
             parent = str(rel.parent)
+            check_budget()
             repository.log_artifact(str(staged), artifact_path=parent if parent != "." else None)
+            check_budget()
         return ArtifactVerification(
             trace_id=trace_id,
             relative_path=str(rel),
@@ -623,9 +652,9 @@ class TraceArtifactSink:
         repository = self._trace_artifact_repository(trace_id)
         digest = hashlib.sha256()
         seen = 0
-        with tempfile.TemporaryDirectory(prefix="mlflow-import-verify-") as tmp:
-            downloaded = Path(repository.download_artifacts(str(rel), tmp))
-            with downloaded.open("rb") as f:
+        with resources.temporary_directory(prefix="mlflow-import-verify-") as tmp:
+            downloaded = resources.copy_artifact(repository, str(rel), tmp, size)
+            with resources.open_reader(downloaded) as f:
                 while chunk := f.read(VERIFY_CHUNK_BYTES):
                     digest.update(chunk)
                     seen += len(chunk)
@@ -639,7 +668,7 @@ class TraceArtifactSink:
 
     def _trace_artifact_repository(self, trace_id: str) -> Any:
         """Resolve the trace's public artifact repository from its location tag."""
-        trace = self._client.get_trace(trace_id, display=False, flush=True)
+        trace = self._client.get_trace(trace_id, display=False)
         uri = trace.info.tags.get(TRACE_ARTIFACT_LOCATION_TAG)
         if not uri:
             raise ItemImportError(
@@ -712,6 +741,14 @@ class MlflowGateway:
         self._version_transport = version_transport
         self._preflight: CapabilityReport | None = None
         self._preflight_dry_run: bool | None = None
+        self._artifact_checks: MutableMapping[tuple[str, str, str, int], bool] = DiskMap()
+        self._session_objects: MutableMapping[tuple[str, str], tuple[str, str, int]] = DiskMap()
+        self._trace_experiments: MutableMapping[str, str] = DiskMap()
+        self._foreign_conflicts: DiskMap[str, list[dict[str, Any]]] = DiskMap()
+        self._foreign_seen: DiskMap[tuple[str, str], bool] = DiskMap()
+        self.confirmed_retirements: DiskMap[str, bool] = DiskMap()
+        self._resource_budget = resources.current_storage()
+        self._candidate_payload: Any | None = None
 
     # -- capability probe ---------------------------------------------------
 
@@ -732,6 +769,7 @@ class MlflowGateway:
         gates later mutations: a normal-mode mutation requires a
         compatible normal-mode probe.
         """
+        self._ensure_resource_epoch()
         effective_dry_run = self._dry_run if dry_run is None else dry_run
         report = probe_capabilities(
             self._client,
@@ -742,6 +780,26 @@ class MlflowGateway:
         self._preflight = report
         self._preflight_dry_run = effective_dry_run
         return report
+
+    def _ensure_resource_epoch(self) -> None:
+        budget = resources.current_storage()
+        if budget is self._resource_budget:
+            return
+        # A caller may reuse a gateway constructed before this invocation. Its
+        # disposable caches must neither grow outside the new ledger nor carry
+        # verification authority across invocations.
+        for name in (
+            "_artifact_checks",
+            "_trace_experiments",
+            "_session_objects",
+            "_foreign_conflicts",
+            "_foreign_seen",
+            "confirmed_retirements",
+        ):
+            setattr(self, name, DiskMap())
+        self._resource_budget = budget
+        self._preflight = None
+        self._preflight_dry_run = None
 
     # -- experiment resolution -------------------------------------------------
 
@@ -754,6 +812,9 @@ class MlflowGateway:
         """
         found = self._client.get_experiment_by_name(name)
         if found is not None:
+            if getattr(found, "lifecycle_stage", "active") != "active":
+                raise ConfigurationError("experiment_deleted", "the requested experiment is deleted")
+            self._validate_artifact_location(found.artifact_location)
             return ExperimentRef(
                 name=name,
                 experiment_id=found.experiment_id,
@@ -764,11 +825,53 @@ class MlflowGateway:
                 "experiment_not_found",
                 "the requested MLflow experiment does not exist and creation was not requested",
             )
+        artifact_location = None
+        if resources.current_storage() is not None:
+            # The server does not expose its current default artifact root via
+            # the public API. Experiment 0 is only a location hint, not proof
+            # of today's default. Pin an explicit unique child for a new
+            # creation so an unqualified default can never be inherited.
+            from uuid import uuid4
+
+            default = self._client.get_experiment("0")
+            self._validate_artifact_location(default.artifact_location)
+            artifact_location = default.artifact_location.rstrip("/") + "/mlflow-import-experiments/" + uuid4().hex
+            self._validate_artifact_location(artifact_location)
         if self._dry_run:
-            return ExperimentRef(name=name, experiment_id=None, planned_creation=True)
+            return ExperimentRef(
+                name=name, experiment_id=None, artifact_location=artifact_location, planned_creation=True
+            )
         self._require_mutation_allowed()
-        experiment_id = self._client.create_experiment(name)
-        return ExperimentRef(name=name, experiment_id=experiment_id, created=True)
+        try:
+            experiment_id = (
+                self._client.create_experiment(name, artifact_location=artifact_location)
+                if artifact_location is not None
+                else self._client.create_experiment(name)
+            )
+        except Exception:
+            # A concurrent creation or a lost response is resolved by exact
+            # name before another non-idempotent create can be considered.
+            found = self._client.get_experiment_by_name(name)
+            if found is None:
+                raise
+            if getattr(found, "lifecycle_stage", "active") != "active":
+                raise ConfigurationError("experiment_deleted", "the requested experiment is deleted") from None
+            self._validate_artifact_location(found.artifact_location)
+            return ExperimentRef(
+                name=name, experiment_id=found.experiment_id, artifact_location=found.artifact_location
+            )
+        return ExperimentRef(name=name, experiment_id=experiment_id, artifact_location=artifact_location, created=True)
+
+    def _validate_artifact_location(self, location: str) -> None:
+        if resources.current_storage() is None:
+            return
+        resources.validate_artifact_uri(location)
+        repository = self._sink._repository_factory(location, tracking_uri=self.tracking_uri)
+        resources.validate_artifact_repository(repository)
+        if resources.is_remote_artifact_repository(repository):
+            # Consume the bounded read-only listing now, including empty roots.
+            for _ in resources.iter_artifacts(repository, ""):
+                pass
 
     # -- trace lifecycle ---------------------------------------------------------
 
@@ -798,6 +901,8 @@ class MlflowGateway:
         self._require_mutation_allowed()
         validate_required_metadata(spec)
         validate_source_timing(spec)
+        if spec.historical and type(self._trace_api) is PublicTraceApi:
+            return self._create_historical_trace(spec)
         root_metadata = dict(spec.metadata)
         root_metadata[TRACE_SESSION_METADATA_KEY] = spec.native_session_id
         artifact_provenance = ArtifactProvenance.from_request(spec)
@@ -807,7 +912,9 @@ class MlflowGateway:
         with self._pinned_tracking_uri():
             root = self._trace_api.start_span_no_context(
                 name=spec.name,
-                span_type=_ROOT_SPAN_TYPE if spec.name == "opencode_conversation" else _LEGACY_ROOT_SPAN_TYPE,
+                span_type=_ROOT_SPAN_TYPE
+                if spec.historical or spec.name == "opencode_conversation"
+                else _LEGACY_ROOT_SPAN_TYPE,
                 parent_span=None,
                 inputs=spec.root_inputs,
                 attributes=dict(spec.root_attributes),
@@ -819,6 +926,10 @@ class MlflowGateway:
             self._require_real_span(root)
             trace_id = root.trace_id
             root_span_id = root.span_id
+            if spec.historical:
+                record_info = getattr(self._trace_api, "record_native_info", None)
+                if record_info is not None:
+                    record_info(trace_id, spec)
             active: LiveSpanLike | None = None
             try:
                 for child in spec.child_specs():
@@ -890,6 +1001,7 @@ class MlflowGateway:
                     ),
                     error,
                 ) from error
+        self._trace_experiments[trace_id] = spec.experiment_id
         return CreatedTrace(
             trace_id=trace_id,
             root_span_id=root_span_id,
@@ -899,6 +1011,147 @@ class MlflowGateway:
             verified_tags=MappingProxyType(dict(spec.root_tags)),
             artifact_provenance=artifact_provenance,
         )
+
+    def _create_historical_trace(self, spec: TraceCreateRequest) -> CreatedTrace:
+        """Pinned public TraceInfo/Span API: complete native fields without SDK defaults."""
+        import secrets
+
+        from mlflow.entities import Span, TraceInfo, TraceLocation, TraceState
+        from mlflow.tracing.client import TracingClient
+
+        trace_id = "tr-" + secrets.token_hex(16)
+        root_id = secrets.token_hex(8)
+        ids: dict[str, str] = {}
+        metadata = {**spec.metadata, TRACE_SESSION_METADATA_KEY: spec.native_session_id}
+        for analytics, key in (
+            (spec.native_usage, "mlflow.trace.tokenUsage"),
+            (spec.native_cost, "mlflow.trace.cost"),
+        ):
+            observed = dict(analytics or {})
+            keys = (
+                ("input_cost", "output_cost", "total_cost")
+                if key == "mlflow.trace.cost"
+                else (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_creation_input_tokens_above_1hr",
+                )
+            )
+            # Public TraceInfo analytics accept explicit nulls. Finalization
+            # clears auto-derived/missing components instead of inventing zero
+            # or allowing the server's moving pricing table to supply them.
+            metadata[key] = json.dumps({name: observed.get(name) for name in keys}, separators=(",", ":"))
+        status = spec.root_status or "ERROR"
+        created = CreatedTrace(
+            trace_id=trace_id,
+            root_span_id=root_id,
+            span_ids_by_source=ids,
+            verified_metadata=metadata,
+            root_status=status,
+            verified_tags=spec.root_tags,
+            artifact_provenance=ArtifactProvenance.from_request(spec),
+        )
+
+        def span_value(
+            span_id: str,
+            parent_id: str | None,
+            name: str,
+            kind: str,
+            inputs: object,
+            outputs: object,
+            attributes: Mapping[str, object],
+            start: int | None,
+            end: int | None,
+            state: str,
+        ) -> Span:
+            attrs = {
+                **attributes,
+                "mlflow.spanType": kind,
+                "mlflow.traceRequestId": trace_id,
+                **({"mlflow.spanInputs": inputs} if inputs is not None else {}),
+                **({"mlflow.spanOutputs": outputs} if outputs is not None else {}),
+            }
+            return Span.from_dict(
+                {
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                    "parent_span_id": parent_id,
+                    "name": name,
+                    "start_time_unix_nano": start,
+                    "end_time_unix_nano": end,
+                    "status": {
+                        "code": {"ERROR": "STATUS_CODE_ERROR", "OK": "STATUS_CODE_OK"}.get(state, "STATUS_CODE_UNSET")
+                    },
+                    "attributes": {key: json.dumps(value, ensure_ascii=False) for key, value in attrs.items()},
+                }
+            )
+
+        spans = [
+            span_value(
+                root_id,
+                None,
+                spec.name,
+                "AGENT",
+                spec.root_inputs,
+                spec.root_outputs,
+                spec.root_attributes,
+                spec.start_time_ns,
+                spec.end_time_ns,
+                status,
+            )
+        ]
+        for child in spec.child_specs():
+            span_id = secrets.token_hex(8)
+            parent = root_id if child.parent_source_key is None else ids[child.parent_source_key]
+            ids[child.source_key] = span_id
+            spans.append(
+                span_value(
+                    span_id,
+                    parent,
+                    child.name,
+                    child.span_type,
+                    child.inputs,
+                    child.outputs,
+                    child.attributes,
+                    child.start_time_ns,
+                    child.end_time_ns,
+                    child.status,
+                )
+            )
+        client = TracingClient(tracking_uri=self.tracking_uri)
+        try:
+            native_info = TraceInfo(
+                trace_id=trace_id,
+                trace_location=TraceLocation.from_experiment_id(spec.experiment_id),
+                request_time=(spec.start_time_ns or 0) // 1_000_000,
+                execution_duration=((spec.end_time_ns or 0) - (spec.start_time_ns or 0)) // 1_000_000,
+                state=TraceState.ERROR if status == "ERROR" else TraceState.OK,
+                client_request_id=spec.client_request_id,
+                trace_metadata=metadata,
+                tags={
+                    **spec.root_tags,
+                    **({"mlflow.traceName": spec.trace_name} if spec.trace_name is not None else {}),
+                },
+                request_preview=spec.request_preview,
+                response_preview=spec.response_preview,
+            )
+            check_budget()
+            client.start_trace(native_info)
+            check_budget()
+            client.log_spans(location=spec.experiment_id, spans=spans)
+            # The pinned server derives min/max from all spans when a trace
+            # has no usage/cost observations. A source event can precede the
+            # initiating user; finalize the authoritative turn timing through
+            # the same public API, preserving its generated previews.
+            check_budget()
+            client.start_trace(native_info)
+        except Exception as error:
+            raise PartialTraceCreateError(created, error) from error
+        self._trace_experiments[trace_id] = spec.experiment_id
+        return created
 
     def verify_trace(self, created: CreatedTrace, expected: TraceCreateRequest) -> None:
         """Verify a created trace against its request through FULL retrieval.
@@ -921,7 +1174,10 @@ class MlflowGateway:
         limits are compared exactly; longer values only require the key's
         presence, because the pinned server silently truncates them.
         """
-        trace = self._client.get_trace(created.trace_id, display=False, flush=True)
+        trace = self._candidate_payload
+        self._candidate_payload = None
+        if trace is None or trace.trace_id != created.trace_id:
+            trace = self._client.get_trace(created.trace_id, display=False)
         if trace.trace_id != created.trace_id:
             raise ItemImportError(
                 "trace_verification_failed",
@@ -976,9 +1232,12 @@ class MlflowGateway:
                 raise ItemImportError("trace_verification_failed", "a child span output did not round-trip")
             if span.parent_id != expected_parent_id:
                 raise ItemImportError("trace_verification_failed", "a child span parent did not round-trip")
-            if _span_status_value(span.status) != RETRIEVED_SPAN_STATUS.get(
-                expected_child.status, expected_child.status
-            ):
+            child_status = (
+                expected_child.status
+                if expected.historical and type(self._trace_api) is PublicTraceApi
+                else RETRIEVED_SPAN_STATUS.get(expected_child.status, expected_child.status)
+            )
+            if _span_status_value(span.status) != child_status:
                 raise ItemImportError("trace_verification_failed", "a child span status did not round-trip")
             if span.start_time_ns != expected_child.start_time_ns:
                 raise ItemImportError("trace_verification_failed", "a child span start time did not round-trip")
@@ -1043,17 +1302,61 @@ class MlflowGateway:
             raise ItemImportError("trace_verification_failed", "the native session metadata did not round-trip")
         self._verify_labeled_values(expected.root_tags, trace.info.tags, TRACE_TAG_VALUE_LIMIT, "tag")
         self._verify_labeled_values(expected.metadata, metadata, TRACE_METADATA_VALUE_LIMIT, "metadata")
+        if expected.historical:
+            allowed = {
+                "parent_session_id", "mlflow.trace.session", "mlflow.trace.tokenUsage",
+                "mlflow.trace.cost", "mlflow.trace.infoFinalized",
+            }
+            if set(metadata) - allowed:
+                raise ItemImportError("trace_verification_failed", "unexpected physical request metadata")
+            for key in ("parent_session_id",):
+                if metadata.get(key) != expected.metadata.get(key):
+                    raise ItemImportError(
+                        "trace_verification_failed", "the immutable native metadata projection differs"
+                    )
+            info = trace.info
+            if info.tags.get("mlflow.traceName") != expected.trace_name:
+                raise ItemImportError("trace_verification_failed", "the native trace name differs")
+            if info.request_preview != expected.request_preview or info.response_preview != expected.response_preview:
+                raise ItemImportError("trace_verification_failed", "the native text previews differ")
+            if info.client_request_id != expected.client_request_id:
+                raise ItemImportError("trace_verification_failed", "the native client request identity differs")
+            if info.experiment_id != expected.experiment_id:
+                raise ItemImportError("trace_verification_failed", "the native experiment differs")
+            if expected.start_time_ns is not None and info.request_time != expected.start_time_ns // 1_000_000:
+                raise ItemImportError("trace_verification_failed", "the native start time differs")
+            if expected.start_time_ns is not None and expected.end_time_ns is not None:
+                duration = (expected.end_time_ns - expected.start_time_ns) // 1_000_000
+                if info.execution_duration != duration:
+                    raise ItemImportError("trace_verification_failed", "the native duration differs")
+            for value, actual in ((expected.native_usage, info.token_usage), (expected.native_cost, info.cost)):
+                normalized = {key: item for key, item in (actual or {}).items() if item is not None}
+                if normalized != dict(value or {}):
+                    raise ItemImportError("trace_verification_failed", "the native usage or cost differs")
 
     def iter_owned_traces(self, experiment_id: str) -> Iterator[OwnedTrace]:
         """Yield every importer-owned trace in the experiment, page by page.
 
-        Searches with the exact server-side ownership metadata filter when
-        the target accepts it (falling back to unfiltered pages otherwise),
+        Searches every tag/metadata ownership alias when the target accepts
+        filters (falling back to unfiltered pages otherwise),
         walks the pagination tokens to exhaustion, and re-verifies the
         exact ownership marker on every candidate locally — an unowned
         trace is never yielded.
         """
-        filter_string: str | None = _OWNERSHIP_FILTER
+        seen: DiskMap[str, bool] = DiskMap()
+        for location in ("metadata", "tags"):
+            for key, value in (
+                ("opencode.importer", "mlflow-import"),
+                ("mlflow_import.importer", "mlflow-import"),
+                ("opencode.importer", "opencode-mlflow"),
+            ):
+                filter_string = f"{location}.`{key}` = '{value}'"
+                for trace in self._iter_owned_search(experiment_id, filter_string):
+                    if trace.trace_id not in seen:
+                        seen[trace.trace_id] = True
+                        yield trace
+
+    def _iter_owned_search(self, experiment_id: str, filter_string: str | None) -> Iterator[OwnedTrace]:
         try:
             page = self._search_page(experiment_id, filter_string, page_token=None)
         except Exception:  # noqa: BLE001 - a rejected filter falls back to local filtering
@@ -1084,6 +1387,136 @@ class MlflowGateway:
                 raise CapabilityError("mlflow_pagination_cycle", "the trace search repeated a pagination token")
             seen_tokens.add(token)
             page = self._search_page(experiment_id, filter_string, page_token=token)
+
+    def iter_session_traces(self, experiment_id: str, native_id: str, qualified_id: str) -> Iterator[OwnedTrace]:
+        """Bounded paged lookup of a canonical identity and its native legacy alias."""
+        from mlflow_import.compatibility import resolves_conflict
+
+        seen: DiskMap[str, bool] = DiskMap()
+        searches = (
+            ("mlflow.trace.session", qualified_id),
+            ("mlflow.trace.session", native_id),
+            ("opencode.session_id", native_id),
+            ("mlflow_import.session_id", native_id),
+        )
+        for location, key, identity in (
+            (location, key, identity) for location in ("metadata", "tags") for key, identity in searches
+        ):
+            escaped = identity.replace("\\", "\\\\").replace("'", "\\'")
+            filter_string = f"{location}.`{key}` = '{escaped}'"
+            token = None
+            tokens: DiskMap[str, bool] = DiskMap()
+            while True:
+                page = self._search_page(experiment_id, filter_string, token)
+                for trace in page:
+                    if trace.trace_id not in seen:
+                        seen[trace.trace_id] = True
+                        if not resolves_conflict(trace.info.trace_metadata, trace.info.tags, qualified_id, native_id):
+                            continue
+                        self._trace_experiments[trace.trace_id] = experiment_id
+                        yield OwnedTrace(
+                            trace_id=trace.trace_id,
+                            request_time_ms=trace.info.request_time,
+                            tags=dict(trace.info.tags),
+                            metadata=dict(trace.info.trace_metadata),
+                        )
+                token = getattr(page, "token", None)
+                if not token:
+                    break
+                if token in tokens:
+                    raise CapabilityError("mlflow_pagination_cycle", "the scoped trace search repeated a page token")
+                tokens[token] = True
+
+    def remember_foreign(self, qualified_id: str, native_id: str, trace: OwnedTrace) -> None:
+        from mlflow_import.compatibility import identity_digest
+
+        key = qualified_id, trace.trace_id
+        if key in self._foreign_seen:
+            return
+        self._foreign_seen[key] = True
+        bucket = self._foreign_conflicts.get(qualified_id)
+        if bucket is None:
+            bucket = DiskList(store=self._foreign_conflicts.store)
+            self._foreign_conflicts[qualified_id] = bucket
+        bucket.append(
+            {
+                "trace_id": trace.trace_id,
+                "session_id": native_id,
+                "qualified_id": qualified_id,
+                "turn_key": "",
+                "foreign": True,
+                "identity_sha256": identity_digest(trace.metadata, trace.tags),
+                "identity": self.conflict_identity(trace.trace_id),
+            }
+        )
+
+    def foreign_conflicts(self, qualified_id: str) -> Sequence[dict[str, Any]]:
+        return self._foreign_conflicts.get(qualified_id, ())
+
+    def conflict_identity(self, trace_id: str) -> dict[str, Any]:
+        from mlflow_import.compatibility import identity_projection
+
+        info = self.trace_info(trace_id)
+        return identity_projection(info.trace_metadata, info.tags)
+
+    def authorize_retirement(self, experiment_id: str, retirement: Mapping[str, Any], ready: Mapping[str, Any]) -> None:
+        """Resolve journal claims against independently inventoried source identity."""
+        from mlflow_import.compatibility import identity_projection, resolves_conflict
+
+        proof = retirement["identity"]
+        if not resolves_conflict(proof, {}, ready["qualified_id"], ready["session_id"]):
+            raise ItemImportError("attempt_scope_conflict", "the retirement is outside the selected recovery scope")
+        if ready["policy"] != "overwrite" and (
+            retirement.get("foreign")
+            or not ready["instance_id"]
+            or proof.get("mlflow_import.import_instance_id") != ready["instance_id"]
+        ):
+            raise ItemImportError("attempt_scope_conflict", "the retirement is outside the selected recovery instance")
+        if not self.trace_exists(retirement["trace_id"]):
+            return
+        trace = self._client.get_trace(retirement["trace_id"], display=False)
+        tags = trace.info.tags
+        from mlflow_import.compatibility import decode_ownership
+
+        metadata = decode_ownership(tags, trace.info.trace_metadata)
+        if (
+            trace.info.experiment_id != experiment_id
+            or identity_projection(trace.info.trace_metadata, tags) != proof
+            or not resolves_conflict(trace.info.trace_metadata, tags, ready["qualified_id"], ready["session_id"])
+            or (
+                ready["policy"] != "overwrite"
+                and (
+                    retirement.get("foreign")
+                    or not ready["instance_id"]
+                    or metadata.get("mlflow_import.import_instance_id") != ready["instance_id"]
+                )
+            )
+        ):
+            raise ItemImportError("attempt_scope_conflict", "the retirement is outside the selected recovery scope")
+
+    def retire_conflict(self, experiment_id: str, retirement: Mapping[str, Any]) -> None:
+        from mlflow_import.compatibility import identity_digest
+
+        self._require_mutation_allowed()
+        trace_id = str(retirement["trace_id"])
+        trace = self._client.get_trace(trace_id, display=False)
+        if (
+            trace.info.experiment_id != experiment_id
+            or identity_digest(trace.info.trace_metadata, trace.info.tags) != retirement["identity_sha256"]
+        ):
+            raise ItemImportError("session_conflict_changed", "the exact foreign conflict identity changed")
+        self._delete_confirmed(experiment_id, trace_id)
+
+    def _delete_confirmed(self, experiment_id: str, trace_id: str) -> None:
+        try:
+            check_budget()
+            self._client.delete_traces(experiment_id=experiment_id, trace_ids=[trace_id])
+        except Exception:
+            if self.trace_exists(trace_id):
+                raise
+        if self.trace_exists(trace_id):
+            raise ItemImportError("trace_retirement_failed", "an exact planned retirement remains visible")
+        self.confirmed_retirements[trace_id] = True
 
     def verify_owned_candidate(
         self,
@@ -1151,14 +1584,18 @@ class MlflowGateway:
                 reason="ownership_incomplete",
                 error_code="ownership_conflict",
             )
-        trace = self._client.get_trace(candidate.trace_id, display=False, flush=True)
+        trace = SimpleNamespace(
+            trace_id=candidate.trace_id, info=self.trace_info(candidate.trace_id, expected.experiment_id)
+        )
         if trace.trace_id != candidate.trace_id:
             raise ItemImportError(
                 "trace_verification_failed",
                 "the retrieved candidate trace id does not match the indexed candidate",
             )
         tags = trace.info.tags
-        metadata = trace.info.trace_metadata
+        from mlflow_import.compatibility import decode_ownership
+
+        metadata = decode_ownership(tags, trace.info.trace_metadata)
         if not self._has_exact_ownership_marker(tags, metadata):
             return CandidateVerification(
                 trace_id=candidate.trace_id,
@@ -1206,7 +1643,13 @@ class MlflowGateway:
         expected_fields: tuple[tuple[str, str | None, str | None], ...] = (
             (OWNERSHIP_IMPORTER_KEY, _candidate_importer_marker(tags, metadata), expected.importer_marker),
             (OWNERSHIP_SESSION_KEY, metadata.get(OWNERSHIP_SESSION_KEY), expected.session_id),
-            (OWNERSHIP_TURN_INDEX_KEY, metadata.get(OWNERSHIP_TURN_INDEX_KEY), str(expected.turn_index)),
+            (
+                OWNERSHIP_TURN_INDEX_KEY,
+                metadata.get(OWNERSHIP_TURN_INDEX_KEY),
+                metadata.get(OWNERSHIP_TURN_INDEX_KEY)
+                if tags.get(ARTIFACT_PATH_TAG, "").startswith("mlflow-import/v2/")
+                else str(expected.turn_index),
+            ),
             (OWNERSHIP_TURN_KEY, metadata.get(OWNERSHIP_TURN_KEY), expected.turn_key),
             (
                 OWNERSHIP_SOURCE_FINGERPRINT_KEY,
@@ -1293,7 +1736,7 @@ class MlflowGateway:
         conflict, never permission to delete by id.
         """
         try:
-            trace = self._client.get_trace(trace_id, display=False, flush=True)
+            trace = self._client.get_trace(trace_id, display=False)
         except Exception as error:  # noqa: BLE001 - an unverifiable target is unsafe to delete
             raise ItemImportError(
                 "ownership_conflict",
@@ -1339,11 +1782,355 @@ class MlflowGateway:
     ) -> ArtifactVerification:
         """Upload a named artifact at exactly ``relative_path`` (see the sink)."""
         self._require_mutation_allowed()
+        if relative_path.startswith("mlflow-import/v2/"):
+            info = self.trace_info(trace_id)
+            return self.publish_experiment_file(info.experiment_id, relative_path, local_file, trace_id=trace_id)
         return self._sink.upload_named_json(trace_id, relative_path, local_file, chunk_size)
 
     def verify_named_json(self, trace_id: str, relative_path: str, sha256: str, size: int) -> None:
         """Verify a named artifact's exact bytes (see the sink)."""
+        if relative_path.startswith("mlflow-import/v2/"):
+            info = self.trace_info(trace_id)
+            self.verify_experiment_file(info.experiment_id, relative_path, sha256, size)
+            tags = info.tags
+            try:
+                session_path = tags["mlflow_import.session_artifact"]
+                session_digest = tags["mlflow_import.session_artifact_sha256"]
+                session_size = int(tags["mlflow_import.session_artifact_size"])
+                base = relative_path.partition("/turns/")[0]
+                if (
+                    session_path != f"{base}/sessions/{session_digest}.json"
+                    or len(session_digest) != 64
+                    or session_size < 0
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as error:
+                raise ItemImportError(
+                    "artifact_verification_failed", "the V2 session artifact reference is incomplete"
+                ) from error
+            self.verify_experiment_file(info.experiment_id, session_path, session_digest, session_size)
+            return
         self._sink.verify_named_json(trace_id, relative_path, sha256, size)
+
+    def reconcile_tags(
+        self, trace_id: str, desired: Mapping[str, str], *, prefix: str, keys: frozenset[str] = frozenset()
+    ) -> bool:
+        """Diff managed tags, delete removed fields, and verify the exact result."""
+        self._require_mutation_allowed()
+        actual = self.trace_info(trace_id).tags
+        changed = False
+        for key in actual:
+            if (key.startswith(prefix) or key in keys) and key not in desired:
+                self._client.delete_trace_tag(trace_id, key)
+                changed = True
+        for key, value in desired.items():
+            if actual.get(key) != value:
+                self._client.set_trace_tag(trace_id, key, value)
+                changed = True
+        verified = self.trace_info(trace_id).tags
+        if any(verified.get(key) != value for key, value in desired.items()) or any(
+            (key.startswith(prefix) or key in keys) and key not in desired for key in verified
+        ):
+            raise ItemImportError("tag_verification_failed", "the managed trace tags did not round-trip")
+        return changed
+
+    def current_tags_match(self, trace_id: str, desired: Mapping[str, str]) -> bool:
+        actual = self.trace_info(trace_id).tags
+        return self.mutable_tags(actual) == self.mutable_tags(desired)
+
+    @staticmethod
+    def mutable_tags(tags: Mapping[str, str]) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in tags.items()
+            if key.startswith("mlflow_import.current.")
+            or key
+            in {"mlflow_import.turn_index", "mlflow_import.source_revision", "mlflow_import.metadata_fingerprint"}
+        }
+
+    def reconcile_current_tags(self, trace_id: str, desired: Mapping[str, str]) -> bool:
+        return self.reconcile_tags(
+            trace_id,
+            self.mutable_tags(desired),
+            prefix="mlflow_import.current.",
+            keys=frozenset(
+                {"mlflow_import.turn_index", "mlflow_import.source_revision", "mlflow_import.metadata_fingerprint"}
+            ),
+        )
+
+    def verify_candidate_payload(self, candidate: OwnedTraceCandidate, request: TraceCreateRequest) -> None:
+        """Verify full reused span/native values, never trust fingerprint tags alone."""
+        from mlflow_import.compatibility import decode_ownership
+
+        trace = self._client.get_trace(candidate.trace_id, display=False)
+        path = trace.info.tags.get("opencode.artifact_path", "")
+        if not path.startswith("mlflow-import/v2/"):
+            raise ItemImportError("legacy_payload_requires_replacement", "the legacy payload requires migration")
+        repository = self.experiment_repository(request.experiment_id)
+        with resources.temporary_directory(prefix="mlflow-import-map-") as root:
+            downloaded = resources.copy_artifact(repository, path, root, 8 * 1024 * 1024)
+            with resources.open_reader(downloaded) as handle:
+                payload = handle.read(8 * 1024 * 1024 + 1)
+        if len(payload) > 8 * 1024 * 1024:
+            raise ItemImportError("turn_map_too_large", "the recorded map exceeds the qualified envelope")
+        identity_map = json.loads(payload)["identity_map"]
+        root = next(span for span in trace.data.spans if span.parent_id is None)
+        created = CreatedTrace(
+            trace_id=candidate.trace_id,
+            root_span_id=root.span_id,
+            span_ids_by_source={
+                key.removeprefix("span:"): value for key, value in identity_map.items() if key.startswith("span:")
+            },
+            verified_metadata=request.metadata,
+            root_status=request.root_status or "UNSET",
+        )
+        # Mutable session tags and historical map locations are independently
+        # reconciled and must not force an immutable payload replacement.
+        ownership = decode_ownership(trace.info.tags, trace.info.trace_metadata)
+        mutable = self.mutable_tags(request.root_tags)
+        expected = replace(
+            request,
+            root_tags={
+                **{key: value for key, value in request.root_tags.items() if key not in mutable},
+                "opencode.artifact_path": path,
+                "opencode.turn_index": ownership["opencode.turn_index"],
+            },
+        )
+        self._candidate_payload = trace
+        try:
+            self.verify_trace(created, expected)
+        finally:
+            self._candidate_payload = None
+
+    def trace_info(self, trace_id: str, experiment_id: str | None = None) -> Any:
+        """Fetch native info/tags without downloading the one-turn span payload."""
+        experiment_id = experiment_id or self._trace_experiments.get(trace_id)
+        if experiment_id is not None:
+            escaped = trace_id.replace("'", "\\'")
+            page = self._search_page(experiment_id, f"request_id = '{escaped}'", None)
+            if len(page) == 1 and page[0].trace_id == trace_id:
+                return page[0].info
+        trace = self._client.get_trace(trace_id, display=False)
+        self._trace_experiments[trace_id] = trace.info.experiment_id
+        return trace.info
+
+    def experiment_repository(self, experiment_id: str) -> Any:
+        """The pinned, run-free experiment artifact repository binding."""
+        experiment = self._client.get_experiment(experiment_id)
+        if resources.current_storage() is not None:
+            resources.validate_artifact_uri(experiment.artifact_location)
+        repository = self._sink._repository_factory(experiment.artifact_location, tracking_uri=self.tracking_uri)
+        if resources.current_storage() is not None:
+            resources.validate_artifact_repository(repository)
+        return repository
+
+    def pending_sessions(self, experiment_id: str, prefix: str) -> Iterator[str]:
+        """Recovery is discovered independently of current transcript filters."""
+        from mlflow_import.mlflow.attempts import AttemptJournal
+
+        repository = self.experiment_repository(experiment_id)
+        for item in resources.iter_artifacts(repository, prefix):
+            if item.is_dir:
+                journal = AttemptJournal(self, experiment_id, item.path)
+                for states in journal.attempts():
+                    if "complete" not in states and "aborted" not in states:
+                        yield str(states["prepared"]["session_id"])
+
+    def trace_exists(self, trace_id: str) -> bool:
+        """Only a protocol not-found response proves absence."""
+        try:
+            self._client.get_trace(trace_id, display=False)
+        except Exception as error:
+            if getattr(error, "error_code", None) == "RESOURCE_DOES_NOT_EXIST":
+                return False
+            raise
+        return True
+
+    def replacement_reference(self, trace_id: str) -> dict[str, object]:
+        """Capture full remote span bytes and the verified canonical artifact references."""
+        from mlflow_import.compatibility import decode_ownership
+        from mlflow_import.content.canonical import canonical_json
+
+        trace = self._client.get_trace(trace_id, display=False)
+        tags = trace.info.tags
+        return {
+            "schema_version": "mlflow-import.replacement.v2",
+            "trace_id": trace_id,
+            "payload_sha256": hashlib.sha256(canonical_json(trace.data.to_dict())).hexdigest(),
+            "metadata": decode_ownership(tags, trace.info.trace_metadata),
+            "experiment_id": trace.info.experiment_id,
+            "native": self._native_reference(trace.info),
+            "map": [
+                tags["opencode.artifact_path"],
+                tags["opencode.artifact_sha256"],
+                int(tags["opencode.artifact_size"]),
+            ],
+            "session": [
+                tags["mlflow_import.session_artifact"],
+                tags["mlflow_import.session_artifact_sha256"],
+                int(tags["mlflow_import.session_artifact_size"]),
+            ],
+        }
+
+    def verify_replacement_reference(self, reference: Mapping[str, object]) -> None:
+        from mlflow_import.compatibility import decode_ownership
+        from mlflow_import.content.canonical import canonical_json
+
+        trace = self._client.get_trace(str(reference["trace_id"]), display=False)
+        if (
+            hashlib.sha256(canonical_json(trace.data.to_dict())).hexdigest() != reference["payload_sha256"]
+            or (
+                decode_ownership(trace.info.tags, trace.info.trace_metadata)
+                if reference.get("schema_version") == "mlflow-import.replacement.v2"
+                else dict(trace.info.trace_metadata)
+            ) != reference["metadata"]
+            or trace.info.experiment_id != reference["experiment_id"]
+            or ("native" in reference and self._native_reference(trace.info) != reference["native"])
+        ):
+            raise ItemImportError("replacement_verification_failed", "a ready replacement no longer matches")
+        for name in ("map", "session"):
+            path, checksum, size = cast(list[Any], reference[name])
+            # Reverification before retirement must not trust a cache from an
+            # earlier staging check in this invocation.
+            self.verify_experiment_file(trace.info.experiment_id, path, checksum, size)
+        path, _, size = cast(list[Any], reference["map"])
+        from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
+
+        if size > MAX_PRICING_MAP_BYTES:
+            raise ItemImportError(
+                "replacement_verification_failed", "the replacement map exceeds the supported envelope"
+            )
+        with resources.temporary_directory(prefix="mlflow-import-reference-") as root:
+            local = resources.copy_artifact(self.experiment_repository(trace.info.experiment_id), path, root, size)
+            with resources.open_reader(local) as handle:
+                payload = handle.read(MAX_PRICING_MAP_BYTES + 1)
+            if len(payload) > MAX_PRICING_MAP_BYTES:
+                raise ItemImportError(
+                    "replacement_verification_failed", "the replacement map exceeds the supported envelope"
+                )
+            value = json.loads(payload)
+        ownership = decode_ownership(trace.info.tags, trace.info.trace_metadata)
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != "mlflow-import.turn-map.v1"
+            or value.get("identity_map", {}).get("trace_id") != reference["trace_id"]
+            or value.get("turn_key") != ownership.get("mlflow_import.turn_key")
+            or value.get("turn_fingerprint") != ownership.get("opencode.render_fingerprint")
+        ):
+            raise ItemImportError(
+                "replacement_verification_failed", "the replacement map has a different source identity"
+            )
+
+    @staticmethod
+    def _native_reference(info: Any) -> dict[str, object]:
+        return {
+            "request_time": info.request_time,
+            "execution_duration": info.execution_duration,
+            "client_request_id": info.client_request_id,
+            "state": str(info.state.value),
+            "request_preview": info.request_preview,
+            "response_preview": info.response_preview,
+            "usage": info.token_usage,
+            "cost": info.cost,
+            "trace_name": info.tags.get("mlflow.traceName"),
+            "session_id": info.trace_metadata.get("mlflow.trace.session"),
+            "parent_session_id": info.trace_metadata.get("parent_session_id"),
+        }
+
+    def read_pricing_basis(self, reference: Mapping[str, Any]) -> dict[str, Any]:
+        """Read only checksummed importer turn-map provenance from a verified donor."""
+        self.verify_replacement_reference(reference)
+        if not self.pricing_donor_eligible(reference):
+            return {}
+        path, _, size = reference["map"]
+        from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
+
+        if size > MAX_PRICING_MAP_BYTES:
+            raise ItemImportError("turn_map_too_large", "the pricing donor map exceeds the qualified envelope")
+        with resources.temporary_directory(prefix="mlflow-import-basis-") as root:
+            local = resources.copy_artifact(self.experiment_repository(reference["experiment_id"]), path, root, size)
+            with resources.open_reader(local) as handle:
+                value = json.load(handle)
+        from mlflow_import.content.accounting import applied_bases
+
+        return applied_bases(value.get("accounting", {}))
+
+    @staticmethod
+    def pricing_donor_eligible(reference: Mapping[str, Any]) -> bool:
+        metadata = reference.get("metadata", {})
+        if (
+            metadata.get("mlflow_import.importer") != "mlflow-import"
+            or metadata.get("opencode.importer") != "mlflow-import"
+            or not all(
+                metadata.get("mlflow_import." + key)
+                for key in ("harness", "source_namespace", "session_id", "turn_key")
+            )
+        ):
+            return False
+        try:
+            identity = json.loads(
+                metadata.get("mlflow_import.qualified_session_id", metadata.get(TRACE_SESSION_METADATA_KEY, "null"))
+            )
+        except (ValueError, TypeError):
+            return False
+        return bool(
+            identity
+            == [
+                "v1",
+                metadata["mlflow_import.harness"],
+                metadata["mlflow_import.source_namespace"],
+                metadata["mlflow_import.session_id"],
+            ]
+        )
+
+    def publish_experiment_file(
+        self, experiment_id: str, path: str, source: Path, *, trace_id: str = ""
+    ) -> ArtifactVerification:
+        """Publish immutable bytes; an existing verified object is never rewritten."""
+        self._require_mutation_allowed()
+        rel = _safe_relative_path(path)
+        digest = hashlib.sha256()
+        size = 0
+        with resources.open_reader(source) as handle:
+            while chunk := handle.read(VERIFY_CHUNK_BYTES):
+                digest.update(chunk)
+                size += len(chunk)
+        sha256 = digest.hexdigest()
+        repository = self.experiment_repository(experiment_id)
+        exists = resources.artifact_exists(repository, path)
+        if not exists:
+            with resources.temporary_directory(prefix="mlflow-import-publish-") as root:
+                staged = Path(root) / rel.name
+                resources.copy_file(source, staged)
+                check_budget()
+                try:
+                    repository.log_artifact(str(staged), artifact_path=str(rel.parent))
+                except Exception:
+                    # Re-read the same immutable key after an ambiguous upload;
+                    # never advance to a new generation blindly.
+                    self.verify_experiment_file(experiment_id, path, sha256, size)
+                    return ArtifactVerification(trace_id=trace_id, relative_path=path, sha256=sha256, size=size)
+                check_budget()
+        self.verify_experiment_file(experiment_id, path, sha256, size)
+        return ArtifactVerification(trace_id=trace_id, relative_path=path, sha256=sha256, size=size)
+
+    def verify_experiment_file(self, experiment_id: str, path: str, sha256: str, size: int) -> None:
+        _safe_relative_path(path)
+        key = (experiment_id, path, sha256, size)
+        if key in self._artifact_checks:
+            return
+        repository = self.experiment_repository(experiment_id)
+        digest = hashlib.sha256()
+        seen = 0
+        with resources.temporary_directory(prefix="mlflow-import-verify-") as root:
+            downloaded = resources.copy_artifact(repository, path, root, size)
+            with resources.open_reader(downloaded) as handle:
+                while chunk := handle.read(VERIFY_CHUNK_BYTES):
+                    seen += len(chunk)
+                    digest.update(chunk)
+        if seen != size or digest.hexdigest() != sha256:
+            raise ItemImportError("artifact_verification_failed", "the experiment artifact checksum differs")
+        self._artifact_checks[key] = True
 
     # -- retirement --------------------------------------------------------
 
@@ -1385,7 +2172,7 @@ class MlflowGateway:
             # the gateway boundary.
             with self._pinned_tracking_uri():
                 mlflow.flush_trace_async_logging()
-            final_trace = self._client.get_trace(trace_id, display=False, flush=True)
+            final_trace = self._client.get_trace(trace_id, display=False)
             self._validate_retirement_target(
                 final_trace,
                 experiment_id,
@@ -1401,12 +2188,7 @@ class MlflowGateway:
                 "ownership_conflict",
                 "the trace ownership could not be re-verified before retirement",
             ) from error
-        deleted = self._client.delete_traces(experiment_id=experiment_id, trace_ids=[trace_id])
-        if deleted != 1:
-            raise ItemImportError(
-                "trace_retirement_failed",
-                "the tracking server did not report the trace as retired",
-            )
+        self._delete_confirmed(experiment_id, trace_id)
 
     @classmethod
     def _validate_retirement_target(
@@ -1423,7 +2205,9 @@ class MlflowGateway:
         if trace.trace_id != trace_id or getattr(trace.info, "experiment_id", None) != experiment_id:
             raise ItemImportError("ownership_conflict", "the trace identity changed before retirement")
         tags = trace.info.tags
-        metadata = trace.info.trace_metadata
+        from mlflow_import.compatibility import decode_ownership
+
+        metadata = decode_ownership(tags, trace.info.trace_metadata)
         if not cls._has_exact_ownership_marker(tags, metadata):
             raise ItemImportError("ownership_conflict", "the importer ownership marker changed before retirement")
         from mlflow_import.mlflow.reconciliation import (
@@ -1493,7 +2277,9 @@ class MlflowGateway:
         )
 
         tags = trace.info.tags
-        metadata = trace.info.trace_metadata
+        from mlflow_import.compatibility import decode_ownership
+
+        metadata = decode_ownership(tags, trace.info.trace_metadata)
         keys = (
             OWNERSHIP_IMPORTER_KEY,
             OWNERSHIP_SESSION_KEY,
@@ -1509,16 +2295,27 @@ class MlflowGateway:
             OWNERSHIP_RENDER_FINGERPRINT_KEY,
             OWNERSHIP_OPERATION_KEY,
             "opencode.warnings",
+            "mlflow.trace.session",
+            "parent_session_id",
+            "mlflow_import.qualified_session_id",
+            "mlflow_import.harness",
+            "mlflow_import.source_namespace",
+            "mlflow_import.import_instance_id",
         )
         supplied = expected_metadata or {}
         return {
-            key: supplied[key] if key in supplied else _retirement_metadata_value(tags, metadata, key) for key in keys
+            **supplied,
+            **{
+                key: supplied[key] if key in supplied else _retirement_metadata_value(tags, metadata, key)
+                for key in keys
+            },
         }
 
     # -- internals -----------------------------------------------------------
 
     def _search_page(self, experiment_id: str, filter_string: str | None, page_token: str | None) -> Any:
         """One search page in the experiment (the non-deprecated ``locations`` form)."""
+        check_budget()
         return self._client.search_traces(
             locations=[experiment_id],
             filter_string=filter_string,
@@ -1532,16 +2329,16 @@ class MlflowGateway:
         """The exact ownership marker in trace tags or metadata — never a guess."""
         tags = trace.info.tags
         metadata = trace.info.trace_metadata
-        return bool(
-            tags.get(OWNERSHIP_TAG_KEY) == OWNERSHIP_IMPORTER_VALUE
-            or metadata.get(OWNERSHIP_TAG_KEY) == OWNERSHIP_IMPORTER_VALUE
-        )
+        from mlflow_import.compatibility import importer_marker
+
+        return importer_marker(tags, metadata) is not None
 
     @staticmethod
     def _has_exact_ownership_marker(tags: Mapping[str, str], metadata: Mapping[str, str]) -> bool:
         """Require every present ownership marker to carry the exact value."""
-        values = [mapping[OWNERSHIP_TAG_KEY] for mapping in (tags, metadata) if OWNERSHIP_TAG_KEY in mapping]
-        return bool(values) and all(value == OWNERSHIP_IMPORTER_VALUE for value in values)
+        from mlflow_import.compatibility import importer_marker
+
+        return importer_marker(tags, metadata) is not None
 
     @staticmethod
     def _verify_labeled_values(
@@ -1599,6 +2396,10 @@ class MlflowGateway:
             mlflow.set_tracking_uri(saved)
 
     def _require_mutation_allowed(self) -> None:
+        from mlflow_import.retry import check_budget
+
+        check_budget()
+        self._ensure_resource_epoch()
         if self._dry_run:
             raise CapabilityError(
                 "dry_run_mutation",
@@ -1619,3 +2420,7 @@ class MlflowGateway:
                 "mlflow_preflight_required",
                 "a normal-mode mutation requires a normal-mode capability check",
             )
+        if budget := resources.current_storage():
+            if budget.failed:
+                raise resources.TemporaryStorageError(budget.phase2)
+            budget.phase2 = True

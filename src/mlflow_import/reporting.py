@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -50,6 +50,7 @@ from mlflow_import.mlflow.reconciliation import (
     ACTION_SKIPPED,
     ACTION_UPDATED,
 )
+from mlflow_import.storage import DiskList, DiskMap, current_store
 
 if TYPE_CHECKING:
     from mlflow_import.importer import ImportResult
@@ -105,6 +106,9 @@ class TurnResult:
     affected_trace_ids: tuple[str, ...] = ()
     retired_trace_ids: tuple[str, ...] = ()
     conflicting_trace_ids: tuple[str, ...] = ()
+    attempt_id: str | None = None
+    import_instance_id: str | None = None
+    attempt_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,10 @@ class SessionResult:
     selected: bool
     action: str
     reason: str | None = None
-    turns: tuple[TurnResult, ...] = ()
+    turns: Sequence[TurnResult] = ()
+    attempt_id: str | None = None
+    import_instance_id: str | None = None
+    attempt_state: str | None = None
 
 
 @dataclass
@@ -128,6 +135,10 @@ class _SessionDraft:
     logical_turn_count: int = 0
     record_count: int = 0
     warnings: tuple[str, ...] = ()
+    error_code: str | None = None
+    attempt_id: str | None = None
+    import_instance_id: str | None = None
+    attempt_state: str | None = None
 
 
 class ReportBuilder:
@@ -157,12 +168,13 @@ class ReportBuilder:
         self._sessions_scanned = 0
         self._sessions_selected = 0
         self._redaction_report = RedactionReport()
-        self._sessions: dict[str, _SessionDraft] = {}
+        self._store = current_store()
+        self._sessions: DiskMap[str, _SessionDraft] = DiskMap(store=self._store)
         self._retired_traces = 0
         self._unexamined_owned_traces = 0
         self._cleanup_failures = 0
-        self._errors: list[dict[str, str]] = []
-        self._warnings: list[dict[str, str]] = []
+        self._errors: list[dict[str, str]] = DiskList(store=self._store)
+        self._warnings: list[dict[str, str]] = DiskList(store=self._store)
 
     # -- section setters ------------------------------------------------------
 
@@ -227,6 +239,7 @@ class ReportBuilder:
                 logical_turn_count=logical_turn_count,
                 record_count=record_count,
                 warnings=warnings,
+                turns=DiskList(store=self._store),
             ),
         )
 
@@ -234,22 +247,47 @@ class ReportBuilder:
         """Append one turn-shaped entry to its session (registering unknown sessions)."""
         draft = self._sessions.get(turn.session_id)
         if draft is None:
-            draft = _SessionDraft(session_id=turn.session_id, selected=True)
+            draft = _SessionDraft(session_id=turn.session_id, selected=True, turns=DiskList(store=self._store))
             self._sessions[turn.session_id] = draft
         draft.turns.append(turn)
+
+    def add_session_error(self, session_id: str, code: str) -> None:
+        draft = self._sessions.setdefault(
+            session_id, _SessionDraft(session_id=session_id, selected=False, turns=DiskList(store=self._store))
+        )
+        draft.error_code = code
+        self._sessions[session_id] = draft
+
+    def set_session_attempt(self, session_id: str, values: Mapping[str, str]) -> None:
+        draft = self._sessions.get(session_id)
+        if draft is not None:
+            draft.attempt_id = values.get("attempt_id")
+            draft.import_instance_id = values.get("import_instance_id")
+            draft.attempt_state = values.get("attempt_state")
+            self._sessions[session_id] = draft
 
     # -- document assembly ------------------------------------------------------
 
     def build(self) -> dict[str, object]:
         """Build the result document with every top-level section present."""
-        sessions: list[dict[str, object]] = []
+        sessions: list[dict[str, object]] = DiskList(store=self._store)
         action_counts: Counter[str] = Counter()
         planned_counts: Counter[str] = Counter()
         failed_retirements = 0
+        unchanged_turns = 0
+        coverage_gaps: Counter[str] = Counter()
         for draft in self._sessions.values():
             for turn in draft.turns:
                 if turn.source_present:
-                    action_counts[turn.action] += 1
+                    coverage_gaps.update(
+                        code.removeprefix("coverage_unavailable_")
+                        for code in set(turn.warnings)
+                        if code.startswith("coverage_unavailable_")
+                    )
+                    if turn.action == ACTION_SKIPPED and turn.reason == "unchanged":
+                        unchanged_turns += 1
+                    else:
+                        action_counts[turn.action] += 1
                 elif turn.action == ACTION_FAILED:
                     # A failed trace retirement is a failed item: the
                     # summary's failed count covers every failed entry, so
@@ -262,11 +300,7 @@ class ReportBuilder:
         summary: dict[str, object] = {
             "selected_sessions": self._sessions_selected,
             "selected_turns": sum(d.logical_turn_count for d in self._sessions.values() if d.selected),
-            "unchanged_turns": sum(
-                t.action == ACTION_SKIPPED and t.reason == "unchanged" and t.source_present
-                for d in self._sessions.values()
-                for t in d.turns
-            ),
+            "unchanged_turns": unchanged_turns,
             "imported_turns": action_counts[ACTION_IMPORTED],
             "updated_turns": action_counts[ACTION_UPDATED],
             "skipped_turns": action_counts[ACTION_SKIPPED],
@@ -275,11 +309,19 @@ class ReportBuilder:
             "turns_updated": action_counts[ACTION_UPDATED],
             "turns_skipped": action_counts[ACTION_SKIPPED],
             "turns_failed": action_counts[ACTION_FAILED] + failed_retirements,
-            "failed_items": action_counts[ACTION_FAILED] + failed_retirements + self._cleanup_failures,
+            "failed_sessions": sum(d.error_code is not None for d in self._sessions.values()),
+            "failed_items": action_counts[ACTION_FAILED]
+            + failed_retirements
+            + self._cleanup_failures
+            + sum(d.error_code is not None for d in self._sessions.values()),
             "failed_retirements": failed_retirements,
             "retired_traces": self._retired_traces,
             "unexamined_owned_traces": self._unexamined_owned_traces,
-            "warnings": list(self._warnings),
+            "warnings": self._warnings,
+            "coverage": {
+                "version": "integration-baseline-2026-11-13-v1",
+                "unavailable_turn_counts": dict(sorted(coverage_gaps.items())),
+            },
         }
         if self._dry_run:
             summary["planned"] = {
@@ -313,7 +355,7 @@ class ReportBuilder:
             },
             "summary": summary,
             "sessions": sessions,
-            "errors": list(self._errors),
+            "errors": self._errors,
         }
 
 
@@ -334,6 +376,9 @@ def _turn_payload(turn: TurnResult) -> dict[str, object]:
         "retired_trace_ids": list(turn.retired_trace_ids),
         "conflicting_trace_ids": list(turn.conflicting_trace_ids),
         "warnings": [_warning_payload(code) for code in turn.warnings],
+        "attempt_id": turn.attempt_id,
+        "import_instance_id": turn.import_instance_id,
+        "attempt_state": turn.attempt_state,
     }
 
 
@@ -343,13 +388,18 @@ def _session_payload(draft: _SessionDraft, *, dry_run: bool = False) -> dict[str
     return {
         "session_id": result.session_id,
         "selected": result.selected,
-        "action": result.action,
-        "reason": REASON_DRY_RUN if dry_run and draft.selected else result.reason,
-        "turns": [_turn_payload(turn) for turn in result.turns],
+        "action": ACTION_FAILED if draft.error_code else result.action,
+        "reason": draft.error_code or (REASON_DRY_RUN if dry_run and draft.selected else result.reason),
+        "turns": DiskList((_turn_payload(turn) for turn in result.turns), store=getattr(draft.turns, "store", None)),
         "logical_turn_count": draft.logical_turn_count,
         "record_count": draft.record_count,
+        "attempt_id": result.attempt_id,
+        "import_instance_id": result.import_instance_id,
+        "attempt_state": result.attempt_state,
         "warnings": [_warning_payload(code) for code in draft.warnings],
-        "error": next((_error_payload(t.error_code) for t in draft.turns if t.error_code), None),
+        "error": _error_payload(draft.error_code)
+        if draft.error_code
+        else next((_error_payload(t.error_code) for t in draft.turns if t.error_code), None),
     }
 
 
@@ -361,7 +411,10 @@ def _session_result(draft: _SessionDraft) -> SessionResult:
             selected=False,
             action=ACTION_SKIPPED,
             reason=REASON_NOT_SELECTED,
-            turns=tuple(draft.turns),
+            turns=draft.turns,
+            attempt_id=draft.attempt_id,
+            import_instance_id=draft.import_instance_id,
+            attempt_state=draft.attempt_state,
         )
     actions = {turn.action for turn in draft.turns}
     if ACTION_FAILED in actions:
@@ -374,7 +427,17 @@ def _session_result(draft: _SessionDraft) -> SessionResult:
         action = ACTION_RETIRED
     else:
         action = ACTION_SKIPPED
-    return SessionResult(session_id=draft.session_id, selected=True, action=action, turns=tuple(draft.turns))
+    reason = "no_importable_turns" if draft.logical_turn_count == 0 and not draft.turns else None
+    return SessionResult(
+        session_id=draft.session_id,
+        selected=True,
+        action=action,
+        reason=reason,
+        turns=draft.turns,
+        attempt_id=draft.attempt_id,
+        import_instance_id=draft.import_instance_id,
+        attempt_state=draft.attempt_state,
+    )
 
 
 def _error_payload(code: str | None) -> dict[str, str] | None:
@@ -382,7 +445,12 @@ def _error_payload(code: str | None) -> dict[str, str] | None:
 
 
 def _warning_payload(code: str) -> dict[str, str]:
-    return {"code": code, "message": "the source record carries a normalization warning"}
+    return {
+        "code": code,
+        "message": "the effective source turn lacks this baseline observation or has only partial coverage"
+        if code.startswith("coverage_unavailable_")
+        else "the source record carries a normalization warning",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +460,20 @@ def _warning_payload(code: str) -> dict[str, str]:
 
 def render_json(result: ImportResult) -> str:
     """Render the result document as deterministic, sorted, indented JSON."""
-    return json.dumps(dict(result.report), sort_keys=True, indent=2)
+    return "".join(iter_json(result))
+
+
+def iter_json(result: ImportResult) -> Iterator[str]:
+    """Stream the lazy result without C encoder sequence materialization."""
+    yield from json.JSONEncoder(sort_keys=True, indent=2, allow_nan=False).iterencode(result.report)
 
 
 def render_human(result: ImportResult) -> str:
+    """Compatibility renderer; the CLI consumes the bounded line iterator."""
+    return "\n".join(iter_human(result))
+
+
+def iter_human(result: ImportResult) -> Iterator[str]:
     """Render the result document as concise, progress-oriented lines.
 
     Every line derives from the (already sanitized) result document, so
@@ -407,21 +485,20 @@ def render_human(result: ImportResult) -> str:
     source = _section(report, "source")
     redaction = _section(report, "redaction")
     summary = _section(report, "summary")
-    has_errors = result.error is not None or bool(_event_entries(report, "errors"))
-    lines: list[str] = []
+    has_errors = result.error is not None or next(_event_entries(report, "errors"), None) is not None
     if has_errors:
-        lines.append("mlflow-import import failed")
+        yield "mlflow-import import failed"
     elif result.dry_run:
-        lines.append("mlflow-import import dry-run complete")
+        yield "mlflow-import import dry-run complete"
     elif summary.get("turns_failed") or summary.get("failed_items"):
-        lines.append("mlflow-import import finished with item failures")
+        yield "mlflow-import import finished with item failures"
     else:
-        lines.append("mlflow-import import complete")
+        yield "mlflow-import import complete"
     experiment_id = experiment.get("id")
     experiment_suffix = f", {experiment_id}" if experiment_id else ""
-    lines.append(f"experiment: {experiment.get('name')} ({experiment.get('status')}{experiment_suffix})")
+    yield f"experiment: {experiment.get('name')} ({experiment.get('status')}{experiment_suffix})"
     generation = source.get("schema_generation") or "unknown"
-    lines.append(
+    yield (
         f"source: {generation} schema, {source.get('sessions_scanned')} session(s) scanned, "
         f"{source.get('sessions_selected')} selected"
     )
@@ -431,26 +508,42 @@ def render_human(result: ImportResult) -> str:
         redaction_line += (
             f" ({affected_fields} field(s) affected across {redaction.get('affected_record_count')} record(s))"
         )
-    lines.append(redaction_line)
-    lines.append(
+    yield redaction_line
+    yield (
         f"turns: {summary.get('turns_imported')} imported, {summary.get('turns_updated')} updated, "
-        f"{summary.get('turns_skipped')} skipped, {summary.get('turns_failed')} failed"
+        f"{summary.get('turns_skipped')} skipped, {summary.get('unchanged_turns', 0)} unchanged, "
+        f"{summary.get('turns_failed')} failed; {summary.get('failed_sessions', 0)} failed sessions"
     )
     planned = summary.get("planned")
     if isinstance(planned, Mapping):
-        lines.append(
+        yield (
             f"planned: {planned.get('imported')} import(s), {planned.get('updated')} update(s), "
             f"{planned.get('retired')} retirement(s)"
         )
-    lines.append(
+    yield (
         f"retired traces: {summary.get('retired_traces')}; "
         f"unexamined owned traces: {summary.get('unexamined_owned_traces')}"
     )
     for warning in _event_entries(summary, "warnings"):
-        lines.append(f"warning ({warning.get('code')}): {warning.get('message')}")
+        yield f"warning ({warning.get('code')}): {warning.get('message')}"
     for error in _event_entries(report, "errors"):
-        lines.append(f"error ({error.get('code')}): {error.get('message')}")
-    return "\n".join(lines)
+        yield f"error ({error.get('code')}): {error.get('message')}"
+    coverage = summary.get("coverage")
+    if isinstance(coverage, Mapping) and coverage.get("unavailable_turn_counts"):
+        counts = coverage["unavailable_turn_counts"]
+        if isinstance(counts, Mapping):
+            yield (
+                "coverage unavailable/partial: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            )
+    sessions = report.get("sessions", [])
+    if not isinstance(sessions, list):
+        sessions = []
+    for session in sessions:
+        if session.get("error") is not None:
+            yield f"session error ({session['error']['code']}): the session could not be completed"
+        for turn in session.get("turns", []):
+            if turn.get("error_code"):
+                yield f"item error ({turn['error_code']}): the item could not be completed"
 
 
 def _section(report: Mapping[str, object], name: str) -> Mapping[str, object]:
@@ -459,9 +552,8 @@ def _section(report: Mapping[str, object], name: str) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _event_entries(section: Mapping[str, object], name: str) -> list[Mapping[str, object]]:
+def _event_entries(section: Mapping[str, object], name: str) -> Iterator[Mapping[str, object]]:
     """One section's event entries as mappings (defensive on partial documents)."""
     value = section.get(name)
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, Mapping)]
-    return []
+        yield from (item for item in value if isinstance(item, Mapping))

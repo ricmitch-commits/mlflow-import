@@ -82,16 +82,19 @@ candidate for deterministic winner selection and explicit operator recovery.
 
 from __future__ import annotations
 
+import hashlib
 import random
 import re
-import shutil
-import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
+from mlflow_import import resources
+from mlflow_import.compatibility import decode_ownership, request_ownership
 from mlflow_import.content.artifacts import (
     DEFAULT_UPLOAD_CHUNK_BYTES,
     stream_turn_artifact,
@@ -99,9 +102,10 @@ from mlflow_import.content.artifacts import (
 )
 from mlflow_import.contracts import RedactionMode
 from mlflow_import.errors import ImporterError, ItemImportError, PartialTraceCreateError
-from mlflow_import.retry import RetryPolicy, is_transient_error, retry_call
+from mlflow_import.retry import RetryPolicy, check_budget, is_transient_error, retry_call
 from mlflow_import.source.discovery import DiscoveryTurnEntry, SessionScanEntry
 from mlflow_import.source.replay import ReplayTurn
+from mlflow_import.storage import DiskList, DiskMap, Store, current_store, disk_collections
 
 if TYPE_CHECKING:
     from mlflow_import.mlflow.gateway import (
@@ -267,7 +271,7 @@ class CandidateContract:
         artifact_size: int,
     ) -> CandidateContract:
         """Build the contract from a mapped request and its artifact digest."""
-        metadata = request.metadata
+        metadata = request_ownership(request)
         warnings, warning_metadata_valid = _parse_warning_metadata(metadata.get("opencode.warnings"))
         contract = cls(
             session_id=metadata.get(OWNERSHIP_SESSION_KEY, ""),
@@ -407,7 +411,9 @@ class OwnedTraceCandidate:
         without a parseable identity yields ``None`` session/turn keys, which
         the planner reports as unexamined.
         """
-        metadata = owned.metadata
+        from mlflow_import.compatibility import decode_ownership
+
+        metadata = decode_ownership(owned.tags, owned.metadata)
         tags = owned.tags
         size_text = tags.get(ARTIFACT_SIZE_TAG)
         turn_index_text = metadata.get(OWNERSHIP_TURN_INDEX_KEY)
@@ -477,10 +483,9 @@ class OwnedTraceCandidate:
 
 def _candidate_importer_marker(tags: Mapping[str, str], metadata: Mapping[str, str]) -> str | None:
     """Read one exact marker, rejecting conflicting tag/metadata copies."""
-    values = [mapping[OWNERSHIP_IMPORTER_KEY] for mapping in (tags, metadata) if OWNERSHIP_IMPORTER_KEY in mapping]
-    if not values or any(value != values[0] for value in values):
-        return None
-    return values[0]
+    from mlflow_import.compatibility import importer_marker
+
+    return importer_marker(tags, metadata)
 
 
 def _parse_warning_metadata(value: object) -> tuple[tuple[str, ...], bool]:
@@ -622,13 +627,17 @@ class ReconciliationAction:
     action: str
     turn: DiscoveryTurnEntry | None = None
     trace: OwnedTraceCandidate | None = None
-    candidates: tuple[OwnedTraceCandidate, ...] = ()
+    candidates: Sequence[OwnedTraceCandidate] = ()
     trace_id: str | None = None
     reason: str | None = None
     error_code: str | None = None
     affected_trace_ids: tuple[str, ...] = ()
     retired_trace_ids: tuple[str, ...] = ()
     conflicting_trace_ids: tuple[str, ...] = ()
+    pending_retirement_ids: tuple[str, ...] = ()
+    attempt_id: str | None = None
+    import_instance_id: str | None = None
+    attempt_state: str | None = None
 
 
 @dataclass
@@ -648,9 +657,58 @@ class ReconciliationPlan:
     imports: list[ReconciliationAction] = field(default_factory=list)
     updates: list[ReconciliationAction] = field(default_factory=list)
     retirements: list[ReconciliationAction] = field(default_factory=list)
-    unexamined_owned_traces: tuple[OwnedTraceCandidate, ...] = ()
+    unexamined_owned_traces: Sequence[OwnedTraceCandidate] = ()
     verifications: dict[str, CandidateVerification] = field(default_factory=dict)
     results: list[ReconciliationAction] = field(default_factory=list)
+    confirmed_retirements: dict[str, str] = field(default_factory=dict)
+    session_scans: list[SessionScanEntry] = field(default_factory=list)
+    session_errors: dict[str, str] = field(default_factory=dict)
+    session_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _store: Store | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._store = current_store()
+        for name in (
+            "imports",
+            "updates",
+            "retirements",
+            "results",
+            "unexamined_owned_traces",
+            "verifications",
+            "confirmed_retirements",
+            "session_scans",
+            "session_errors",
+            "session_attempts",
+        ):
+            setattr(self, name, getattr(self, name))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        store = getattr(self, "_store", None)
+        if store is not None:
+            if name in {
+                "imports",
+                "updates",
+                "retirements",
+                "results",
+                "unexamined_owned_traces",
+                "session_scans",
+            } and not isinstance(value, DiskList):
+                value = DiskList(value, store=store)
+            elif name in {
+                "verifications",
+                "confirmed_retirements",
+                "session_errors",
+                "session_attempts",
+            } and not isinstance(value, DiskMap):
+                value = DiskMap(value, store=store)
+        object.__setattr__(self, name, value)
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {key: value for key, value in self.__dict__.items() if key != "_store"}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        object.__setattr__(self, "_store", state["imports"].store)
+        self.__dict__.update(state)
 
 
 @dataclass(frozen=True)
@@ -673,6 +731,11 @@ class ReconciliationDependencies:
     artifact_snapshot: Callable[[ReplayTurn], str]
     upload_artifact: Callable[[ReplayTurn, CreatedTrace, str, RedactionMode], ArtifactVerification]
     redaction_mode: RedactionMode = RedactionMode.VERBATIM
+    defer_retirement: bool = False
+    conflict_policy: str = "overwrite"
+    replay_session: Callable[[str], ReplayTurn] | None = None
+    experiment_id: str | None = None
+    pricing_basis_for: Callable[[str], Mapping[str, dict[str, Any]]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +759,9 @@ def plan_reconciliation(
     sessions — and candidates without a parseable identity — are
     reported as ``unexamined_owned_traces``.
     """
-    scans: dict[str, SessionScanEntry] = {}
+    plan = ReconciliationPlan()
+    store = plan._store
+    scans: DiskMap[str, SessionScanEntry] = DiskMap(store=store)
     for scan in session_scans:
         if scan.session_id in scans:
             raise ItemImportError(
@@ -704,8 +769,9 @@ def plan_reconciliation(
                 "the discovery plan contains a duplicate session scan",
             )
         scans[scan.session_id] = scan
+        plan.session_scans.append(scan)
 
-    turns: dict[OwnershipKey, DiscoveryTurnEntry] = {}
+    turns: DiskMap[OwnershipKey, DiscoveryTurnEntry] = DiskMap(store=store)
     for entry in turn_entries:
         key = OwnershipKey(entry.session_id, entry.turn_key)
         if key in turns:
@@ -715,9 +781,9 @@ def plan_reconciliation(
             )
         turns[key] = entry
 
-    candidates: dict[OwnershipKey, list[OwnedTraceCandidate]] = {}
-    malformed_candidates: dict[OwnershipKey, list[OwnedTraceCandidate]] = {}
-    unexamined: list[OwnedTraceCandidate] = []
+    candidates: DiskMap[OwnershipKey, list[OwnedTraceCandidate]] = DiskMap(store=store)
+    malformed_candidates: DiskMap[OwnershipKey, list[OwnedTraceCandidate]] = DiskMap(store=store)
+    unexamined: list[OwnedTraceCandidate] = DiskList(store=store)
     for candidate in owned_traces:
         if not candidate.ownership_complete:
             # A partially populated search preview is not an owned/retirable
@@ -735,7 +801,7 @@ def plan_reconciliation(
                 and candidate_scan.selected
                 and candidate_key in turns
             ):
-                malformed_candidates.setdefault(candidate_key, []).append(candidate)
+                malformed_candidates.setdefault(candidate_key, DiskList(store=store)).append(candidate)
             continue
         if not candidate.session_id or not candidate.turn_key:
             unexamined.append(candidate)
@@ -744,9 +810,10 @@ def plan_reconciliation(
         if found is None or not found.selected:
             unexamined.append(candidate)
             continue
-        candidates.setdefault(OwnershipKey(candidate.session_id, candidate.turn_key), []).append(candidate)
+        candidates.setdefault(OwnershipKey(candidate.session_id, candidate.turn_key), DiskList(store=store)).append(
+            candidate
+        )
 
-    plan = ReconciliationPlan()
     for key, entry in turns.items():
         malformed = tuple(malformed_candidates.get(key, ()))
         if malformed:
@@ -769,7 +836,7 @@ def plan_reconciliation(
                 )
             )
             continue
-        identity_candidates = tuple(candidates.get(key, ()))
+        identity_candidates = candidates.get(key, ())
         if identity_candidates:
             plan.updates.append(ReconciliationAction(action=ACTION_UPDATED, turn=entry, candidates=identity_candidates))
         else:
@@ -790,12 +857,12 @@ def plan_reconciliation(
                 ReconciliationAction(
                     action=ACTION_RETIRED,
                     trace=candidate,
-                    candidates=tuple(key_candidates),
+                    candidates=key_candidates,
                     reason=reason,
                 )
             )
 
-    plan.unexamined_owned_traces = tuple(unexamined)
+    plan.unexamined_owned_traces = unexamined
     return plan
 
 
@@ -843,9 +910,13 @@ def upload_artifact(
     ``(replay, created, artifact_relative_path, redaction_mode)`` once
     bound through ``functools.partial``.
     """
+    if artifact_relative_path.startswith("mlflow-import/v2/") and callable(
+        getattr(gateway, "publish_experiment_file", None)
+    ):
+        return _upload_bundle(replay, created, artifact_relative_path, redaction_mode, gateway, temporary_directory)
     stage_root = temporary_directory
     if stage_root is None:
-        stage_root = Path(tempfile.mkdtemp(prefix="mlflow-import-upload-"))
+        stage_root = resources.make_temp_dir(prefix="mlflow-import-upload-")
         remove_root = True
     else:
         remove_root = False
@@ -872,8 +943,9 @@ def upload_artifact(
                     "opencode.artifact_schema_version": provenance.artifact_schema_version,
                     "opencode.redaction_mode": provenance.redaction_mode,
                 }
+                ownership = decode_ownership(created.verified_tags, created.verified_metadata)
                 for key, value in expected_metadata.items():
-                    if value is not None and created.verified_metadata.get(key) != value:
+                    if value is not None and ownership.get(key) != value:
                         raise ItemImportError(
                             "source_consistency_mismatch",
                             "the trace provenance metadata does not match the mapped request",
@@ -889,7 +961,7 @@ def upload_artifact(
             verification = gateway.upload_named_json(created.trace_id, artifact_relative_path, staged, chunk_size)
     finally:
         if remove_root:
-            shutil.rmtree(stage_root, ignore_errors=True)
+            resources.remove_tree(stage_root, ignore_errors=True)
     if (
         verification.trace_id != created.trace_id
         or verification.relative_path != artifact_relative_path
@@ -901,6 +973,103 @@ def upload_artifact(
             "the uploaded artifact did not match the streamed document at the requested path",
         )
     return replace(verification, snapshot_fingerprint=manifest.snapshot_fingerprint)
+
+
+def publish_session_object(
+    replay: ReplayTurn, mode: RedactionMode, gateway: MlflowGateway, experiment_id: str, directory: Path
+) -> tuple[str, str, int]:
+    """Publish and verify one shared session object, at most once per invocation."""
+    from mlflow_import.content.bundles import session_prefix, stream_session_object
+    from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
+
+    snapshot = artifact_snapshot_fingerprint(replay, mode)
+    prefix = session_prefix(replay, mode)
+    key = (experiment_id, prefix + "/" + snapshot)
+    if key in gateway._session_objects:
+        return gateway._session_objects[key]
+    with temporary_artifact_file(directory) as (path, handle):
+        sha256, size = stream_session_object(replay, handle, mode)
+        handle.flush()
+        relative_path = f"{prefix}/sessions/{sha256}.json"
+        gateway.publish_experiment_file(experiment_id, relative_path, path)
+    result = (relative_path, sha256, size)
+    gateway._session_objects[key] = result
+    return result
+
+
+def _upload_bundle(
+    replay: ReplayTurn,
+    created: CreatedTrace,
+    path: str,
+    mode: RedactionMode,
+    gateway: MlflowGateway,
+    directory: Path | None,
+) -> ArtifactVerification:
+    from mlflow_import.content.activity import iter_activity_specs, project_activity
+    from mlflow_import.content.canonical import StreamingArray, iter_canonical_json
+    from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
+    from mlflow_import.mlflow.mapping import SourceIdentity
+
+    with resources.temporary_directory(prefix="mlflow-import-bundle-", dir=directory) as root:
+        staging = Path(root)
+        info = gateway.trace_info(created.trace_id)
+        session_path, sha256, size = publish_session_object(replay, mode, gateway, info.experiment_id, staging)
+        activity = project_activity(replay)
+        targets: DiskMap[str, list[str]] = DiskMap()
+        for spec in iter_activity_specs(activity, replay):
+            span_id = created.span_ids_by_source.get(spec.source_key)
+            if span_id is not None:
+                for key in cast(list[str], spec.attributes.get("mlflow_import.source_keys", [spec.source_key])):
+                    targets.setdefault(key, DiskList()).append(span_id)
+        first_record = next(iter(activity.records), None)
+        if first_record is not None:
+            targets[SourceIdentity.of(first_record).key] = [created.root_span_id]
+        with temporary_artifact_file(staging) as (local, handle):
+            ownership = decode_ownership(created.verified_tags, created.verified_metadata)
+            value = {
+                "schema_version": "mlflow-import.turn-map.v1",
+                "turn_key": replay.summary.turn_key,
+                "turn_fingerprint": ownership.get("opencode.render_fingerprint"),
+                "mapping_version": ownership.get("opencode.mapping_version"),
+                "importer_version": ownership.get("opencode.importer_version"),
+                "identity_map": created_artifact_identity_map(created),
+                "privacy": mode.value,
+                "accounting": activity.provenance,
+                # No mutable session-generation pointer belongs in a reusable map.
+                "records": StreamingArray(
+                    {
+                        "source_table": record.source_table,
+                        "source_id": record.source_id,
+                        "sequence": record.sequence_value,
+                        "occurrence_id": record.occurrence_id,
+                        "entity_id": record.entity_id or record.source_id,
+                        "invocation_id": record.invocation_id,
+                        "span_ids": targets.get(SourceIdentity.of(record).key, []),
+                    }
+                    for record in replay.iter_records()
+                ),
+            }
+            from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
+
+            emitted = 0
+            for chunk in iter_canonical_json(value):
+                emitted += len(chunk)
+                if emitted > MAX_PRICING_MAP_BYTES:
+                    raise ItemImportError(
+                        "turn_map_too_large", "the canonical turn map exceeds the qualified pricing/recovery envelope"
+                    )
+                handle.write(chunk)
+            handle.flush()
+            verification = gateway.publish_experiment_file(info.experiment_id, path, local, trace_id=created.trace_id)
+        desired_tags = {
+            "mlflow_import.session_artifact": session_path,
+            "mlflow_import.session_artifact_sha256": sha256,
+            "mlflow_import.session_artifact_size": str(size),
+            "mlflow_import.turn_map": path,
+        }
+        if any(created.verified_tags.get(key) != value for key, value in desired_tags.items()):
+            gateway.reconcile_tags(created.trace_id, desired_tags, prefix="mlflow_import.session_artifact")
+        return replace(verification, snapshot_fingerprint=artifact_snapshot_fingerprint(replay, mode))
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +1114,8 @@ def apply_reconciliation(
     gateway: MlflowGateway,
     dependencies: ReconciliationDependencies,
     retry_policy: RetryPolicy,
+    *,
+    session_wide: bool = False,
 ) -> ReconciliationPlan:
     """Execute the plan: verify everything, then decide, create, and retire.
 
@@ -955,6 +1126,8 @@ def apply_reconciliation(
     unverifiable duplicates → conflict) and creates each import. Phase 3
     executes the stale retirements. The mutated plan is returned.
     """
+    if session_wide:
+        return _apply_sessions(plan, gateway, dependencies, retry_policy)
     works = _verify_all_candidates(plan, gateway, dependencies, retry_policy)
     _decide_updates(plan, gateway, dependencies, retry_policy, works)
     _decide_imports(plan, gateway, dependencies, retry_policy)
@@ -962,14 +1135,709 @@ def apply_reconciliation(
     return plan
 
 
+def _apply_sessions(
+    plan: ReconciliationPlan, gateway: MlflowGateway, dependencies: ReconciliationDependencies, policy: RetryPolicy
+) -> ReconciliationPlan:
+    from mlflow_import.content.accounting import pricing_bases
+
+    token = pricing_bases.set({})
+    try:
+        with disk_collections(plan._store):
+            return _apply_sessions_with_basis(plan, gateway, dependencies, policy)
+    finally:
+        pricing_bases.reset(token)
+
+
+def _select_pricing_basis(
+    attempts: list[dict[str, Any]], gateway: MlflowGateway, policy: str
+) -> Mapping[str, dict[str, Any]]:
+    """Select by instance and stable IDs before payload fingerprint comparison."""
+    pending = DiskList(states for states in attempts if "complete" not in states and "aborted" not in states)
+    if len(pending) > 1:
+        raise ItemImportError("attempt_state_conflict", "multiple unfinished pricing attempts require recovery")
+    if pending:
+        return cast(dict[str, dict[str, Any]], pending[0]["prepared"].get("pricing_bases", {}))
+    if policy in {"duplicate", "ignore"}:
+        return {}
+    donors: DiskList[tuple[str, Mapping[str, Any]]] = DiskList()
+    for states in attempts:
+        complete = states.get("complete")
+        if complete is None:
+            continue
+        references = complete.get("replacements", [])
+        eligible = getattr(gateway, "pricing_donor_eligible", lambda reference: True)
+        if any(not eligible(reference) for reference in references):
+            continue
+        if not references or not all(gateway.trace_exists(str(reference["trace_id"])) for reference in references):
+            continue
+        # A completed instance is eligible only after full reference verification.
+        try:
+            for reference in references:
+                gateway.verify_replacement_reference(reference)
+        except ItemImportError as error:
+            if error.code in {"replacement_verification_failed", "artifact_verification_failed"}:
+                continue
+            raise
+        donors.extend((str(complete.get("instance_id", "")), reference) for reference in references)
+    if not donors:
+        return {}
+    instance = min(instance for instance, _ in donors)  # Canonical empty ID wins.
+    selected: DiskMap[str, dict[str, Any]] = DiskMap()
+    for _, reference in DiskList(pair for pair in donors if pair[0] == instance).sorted_by(
+        lambda pair: str(pair[1]["trace_id"])
+    ):
+        turn_key = reference["metadata"].get("mlflow_import.turn_key")
+        if turn_key is not None and turn_key not in selected:
+            selected[turn_key] = gateway.read_pricing_basis(reference)
+    return selected
+
+
+def _apply_sessions_with_basis(
+    plan: ReconciliationPlan, gateway: MlflowGateway, dependencies: ReconciliationDependencies, policy: RetryPolicy
+) -> ReconciliationPlan:
+    """Stage complete sessions and durably authorize exact retirements once verified."""
+    from mlflow_import.content.bundles import session_prefix
+    from mlflow_import.identity import qualified_session
+    from mlflow_import.mlflow.attempts import AttemptJournal
+
+    sessions: DiskMap[str, ReconciliationPlan] = DiskMap(store=plan._store)
+    for scan in plan.session_scans:
+        if scan.selected and scan.retirement_scope:
+            sessions[scan.session_id] = ReconciliationPlan()
+    for collection in ("imports", "updates", "retirements"):
+        for action in getattr(plan, collection):
+            session_id = action.turn.session_id if action.turn else action.trace.session_id
+            getattr(sessions.setdefault(session_id, ReconciliationPlan()), collection).append(action)
+    for session_id, work_plan in sessions.items():
+        from mlflow_import.content.accounting import applied_bases, freeze_pricing_bases, pricing_bases
+        from mlflow_import.content.activity import project_activity
+
+        pricing_bases.set({})
+        entries = DiskList(
+            action.turn for action in chain(work_plan.imports, work_plan.updates) if action.turn is not None
+        ).sorted_by(lambda turn: turn.turn_index)
+        try:
+            check_budget()
+        except ItemImportError as error:
+            plan.results.extend(
+                ReconciliationAction(action=ACTION_FAILED, turn=entry, error_code=error.code) for entry in entries
+            )
+            continue
+        if not entries:
+            _apply_empty_session(session_id, work_plan, plan, gateway, dependencies)
+            continue
+        entry = entries[0]
+        try:
+            replay = dependencies.replay(entry)
+            request = dependencies.map_trace(replay) if dependencies.experiment_id is None else None
+        except Exception as error:
+            code = error.code if isinstance(error, ImporterError) else "turn_replay_failed"
+            plan.results.extend(
+                ReconciliationAction(action=ACTION_FAILED, turn=turn, error_code=code) for turn in entries
+            )
+            continue
+        experiment_id = dependencies.experiment_id
+        if experiment_id is None:
+            assert request is not None
+            experiment_id = request.experiment_id
+        qualified_id = qualified_session(replay.session_header)
+        foreign = gateway.foreign_conflicts(qualified_id)
+        stable_prefix = session_prefix(replay, dependencies.redaction_mode).rsplit("/", 1)[0]
+        journal = AttemptJournal(gateway, experiment_id, stable_prefix)
+        attempt: dict[str, object] | None = None
+        result_start = len(plan.results)
+        try:
+            states_list = DiskList(journal.attempts())
+            pricing_bases.set(
+                dependencies.pricing_basis_for(session_id)
+                if dependencies.pricing_basis_for is not None
+                else _select_pricing_basis(states_list, gateway, dependencies.conflict_policy)
+            )
+            if dependencies.pricing_basis_for is None:
+                pricing_bases.set(
+                    freeze_pricing_bases((dependencies.replay(turn) for turn in entries), pricing_bases.get() or {})
+                )
+            request = dependencies.map_trace(replay)
+            from mlflow_import.content.canonical import iter_canonical_json
+
+            desired_values = DiskList([turn.turn_key, turn.source_fingerprint] for turn in entries)
+            desired_values.append(
+                [
+                    dependencies.redaction_mode.value,
+                    request.artifact_snapshot_fingerprint,
+                    request_ownership(request).get(OWNERSHIP_MAPPING_VERSION_KEY),
+                    request_ownership(request).get(OWNERSHIP_ARTIFACT_SCHEMA_VERSION_KEY),
+                ]
+            )
+            desired_digest = hashlib.sha256()
+            for chunk in iter_canonical_json(desired_values):
+                desired_digest.update(chunk)
+            desired = desired_digest.hexdigest()
+            pending = DiskList(states for states in states_list if "complete" not in states and "aborted" not in states)
+            if len(pending) > 1:
+                raise ItemImportError("attempt_state_conflict", "multiple unfinished attempts require recovery")
+            if pending:
+                states = pending[0]
+                prepared = states["prepared"]
+                journal.last_attempt_id = prepared["attempt_id"]
+                if "ready_to_retire" in states:
+                    _finish_ready(journal, states["ready_to_retire"], gateway, plan.confirmed_retirements)
+                    foreign = DiskList(item for item in foreign if gateway.trace_exists(item["trace_id"]))
+                    if (
+                        dependencies.conflict_policy == "duplicate"
+                        and prepared.get("policy") == "duplicate"
+                        and prepared["desired"] == desired
+                    ):
+                        # This invocation resumes the recorded duplicate; it is
+                        # not a request for another independent completed copy.
+                        references = DiskMap(
+                            (reference["metadata"][OWNERSHIP_TURN_KEY], reference)
+                            for reference in states["ready_to_retire"]["replacements"]
+                        )
+                        plan.results.extend(
+                            ReconciliationAction(
+                                action=ACTION_SKIPPED,
+                                turn=turn,
+                                trace_id=references[turn.turn_key]["trace_id"],
+                                reason="recovered_duplicate",
+                            )
+                            for turn in entries
+                        )
+                        continue
+                    # Persisted DTOs are detached read views; re-read completion
+                    # before choosing a completed pricing donor.
+                    states_list = DiskList(journal.attempts())
+                    selected = _select_pricing_basis(states_list, gateway, dependencies.conflict_policy)
+                    pricing_bases.set(freeze_pricing_bases((dependencies.replay(turn) for turn in entries), selected))
+                elif (
+                    prepared["desired"] == desired
+                    and prepared.get("policy", "overwrite") == dependencies.conflict_policy
+                ):
+                    attempt = prepared
+                else:
+                    for candidate in gateway.iter_session_traces(experiment_id, session_id, qualified_id):
+                        if (
+                            candidate.tags.get("mlflow_import.attempt_id") == prepared["attempt_id"]
+                            and candidate.tags.get("mlflow_import.attempt_state") == "staged"
+                        ):
+                            if candidate.trace_id not in prepared["prior_ids"]:
+                                gateway.retire_trace(
+                                    experiment_id,
+                                    candidate.trace_id,
+                                    session_id=session_id,
+                                    turn_key=decode_ownership(candidate.tags, candidate.metadata).get(
+                                        OWNERSHIP_TURN_KEY
+                                    ),
+                                )
+                    journal.publish("aborted", prepared)
+                    pricing_bases.set(
+                        _select_pricing_basis(
+                            [state for state in states_list if "complete" in state],
+                            gateway,
+                            dependencies.conflict_policy,
+                        )
+                    )
+                    pricing_bases.set(
+                        freeze_pricing_bases((dependencies.replay(turn) for turn in entries), pricing_bases.get() or {})
+                    )
+                fresh = DiskList(
+                    OwnedTraceCandidate.from_owned_trace(candidate, experiment_id)
+                    for candidate in gateway.iter_session_traces(experiment_id, session_id, qualified_id)
+                    if OwnedTraceCandidate.from_owned_trace(candidate, experiment_id).ownership_complete
+                    and (
+                        attempt is None
+                        or not attempt.get("instance_id")
+                        or decode_ownership(candidate.tags, candidate.metadata).get("mlflow_import.import_instance_id")
+                        == attempt["instance_id"]
+                    )
+                )
+                scan = SessionScanEntry(
+                    session_id=session_id,
+                    adapter_generation=entry.adapter_generation,
+                    selected=True,
+                    complete_scan=True,
+                    tombstone=False,
+                    logical_turn_count=len(entries),
+                    record_count=0,
+                    creation_time_ns=None,
+                    session_context_fingerprint=entry.session_context_fingerprint,
+                    warnings=(),
+                )
+                work_plan = plan_reconciliation([scan], entries, fresh)
+            if (
+                dependencies.conflict_policy == "ignore"
+                and attempt is None
+                and (work_plan.updates or work_plan.retirements or foreign)
+            ):
+                plan.results.extend(
+                    ReconciliationAction(action=ACTION_SKIPPED, turn=turn, reason="session_conflict_ignored")
+                    for turn in entries
+                )
+                continue
+            instance_id = str(attempt.get("instance_id", "")) if attempt is not None else ""
+            if dependencies.conflict_policy == "duplicate":
+                if not instance_id:
+                    instance_id = uuid.uuid4().hex
+                if attempt is None:
+                    work_plan.imports.extend(
+                        replace(action, action=ACTION_IMPORTED, candidates=()) for action in work_plan.updates
+                    )
+                    work_plan.updates.clear()
+                    work_plan.retirements.clear()
+
+            def map_instance(turn: ReplayTurn, instance_id: str = instance_id) -> TraceCreateRequest:
+                from mlflow_import.mlflow.mapping import native_operation_id
+
+                mapped = dependencies.map_trace(turn)
+                if not instance_id:
+                    return mapped
+                operation = hashlib.sha256((mapped.expected_operation_key + instance_id).encode()).hexdigest()
+                return replace(
+                    mapped,
+                    client_request_id=(
+                        native_operation_id(operation)
+                        if mapped.client_request_id == native_operation_id(mapped.expected_operation_key)
+                        else mapped.client_request_id
+                    ),
+                    expected_operation_key=operation,
+                    root_tags={
+                        **mapped.root_tags,
+                        OWNERSHIP_OPERATION_KEY: operation,
+                        "mlflow_import.operation_key": operation,
+                        "mlflow_import.import_instance_id": instance_id,
+                    },
+                )
+
+            active = replace(dependencies, map_trace=map_instance)
+            works = _verify_all_candidates(work_plan, gateway, active, policy)
+            metadata_matches = all(
+                gateway.current_tags_match(
+                    action.candidates[0].trace_id, active.map_trace(active.replay(action.turn)).root_tags
+                )
+                for action in work_plan.updates
+                if action.turn is not None and len(action.candidates) == 1
+            )
+            all_match = (
+                not work_plan.imports
+                and not work_plan.retirements
+                and not foreign
+                and all(
+                    len(action.candidates) == 1
+                    and work_plan.verifications.get(
+                        action.candidates[0].trace_id, CandidateVerification(action.candidates[0].trace_id)
+                    ).matches
+                    for action in work_plan.updates
+                )
+            )
+            if all_match and metadata_matches and attempt is None:
+                _decide_updates(work_plan, gateway, replace(active, defer_retirement=True), policy, works)
+                plan.results.extend(work_plan.results)
+                continue
+            prior = DiskMap(
+                (candidate.trace_id, candidate)
+                for action in chain(work_plan.updates, work_plan.retirements)
+                for candidate in action.candidates
+            )
+            if attempt is None:
+                with resources.temporary_directory(prefix="mlflow-import-prepare-") as root:
+                    session_object = publish_session_object(
+                        replay, active.redaction_mode, gateway, experiment_id, Path(root)
+                    )
+                attempt = journal.publish(
+                    "prepared",
+                    {
+                        "attempt_id": uuid.uuid4().hex,
+                        "session_id": session_id,
+                        "qualified_id": qualified_id,
+                        "privacy": active.redaction_mode.value,
+                        "expected_turns": DiskList(turn.turn_key for turn in entries),
+                        "desired": desired,
+                        "prior_ids": DiskList(
+                            DiskMap(
+                                chain(((key, True) for key in prior), ((item["trace_id"], True) for item in foreign))
+                            )
+                        ).sorted_by(lambda key: key)
+                        if active.conflict_policy == "overwrite"
+                        else DiskList(prior).sorted_by(lambda key: key),
+                        "session_object": list(session_object),
+                        "policy": active.conflict_policy,
+                        "instance_id": instance_id,
+                        "pricing_bases": DiskMap(
+                            (turn.turn_key, applied_bases(project_activity(active.replay(turn)).provenance))
+                            for turn in entries
+                        ),
+                    },
+                )
+            attempt_id = str(attempt["attempt_id"])
+            session_reference = cast(list[object], attempt["session_object"])
+
+            def map_staged(
+                turn: ReplayTurn,
+                attempt_id: str = attempt_id,
+                mapper: Callable[[ReplayTurn], TraceCreateRequest] = map_instance,
+                session_reference: list[object] = session_reference,
+            ) -> TraceCreateRequest:
+                mapped = mapper(turn)
+                path = mapped.artifact_relative_path.removesuffix(".json") + f"-{attempt_id}.json"
+                return replace(
+                    mapped,
+                    artifact_relative_path=path,
+                    root_tags={
+                        **mapped.root_tags,
+                        ARTIFACT_PATH_TAG: path,
+                        "mlflow_import.attempt_id": attempt_id,
+                        "mlflow_import.attempt_state": "staged",
+                        "mlflow_import.session_artifact": str(session_reference[0]),
+                        "mlflow_import.session_artifact_sha256": str(session_reference[1]),
+                        "mlflow_import.session_artifact_size": str(session_reference[2]),
+                        "mlflow_import.turn_map": path,
+                    },
+                )
+
+            staged = replace(active, map_trace=map_staged, defer_retirement=True)
+            _decide_updates(work_plan, gateway, staged, policy, works)
+            _decide_imports(work_plan, gateway, staged, policy)
+            if any(result.action == ACTION_FAILED for result in work_plan.results):
+                work_plan.results = DiskList(
+                    replace(result, action=ACTION_FAILED, error_code=result.error_code or "session_staging_incomplete")
+                    for result in work_plan.results
+                )
+                plan.results.extend(work_plan.results)
+                continue
+            refreshed: DiskList[ReconciliationAction] = DiskList()
+            by_key = DiskMap((turn.turn_key, turn) for turn in entries)
+            for result in work_plan.results:
+                if result.action == ACTION_SKIPPED and result.trace_id is not None and result.turn is not None:
+                    current_replay = active.replay(by_key[result.turn.turn_key])
+                    current = active.map_trace(current_replay)
+                    with resources.temporary_directory(prefix="mlflow-import-refresh-") as root:
+                        path, checksum, size = publish_session_object(
+                            current_replay, active.redaction_mode, gateway, experiment_id, Path(root)
+                        )
+                    changed = gateway.reconcile_current_tags(result.trace_id, current.root_tags)
+                    changed |= gateway.reconcile_tags(
+                        result.trace_id,
+                        {
+                            "mlflow_import.session_artifact": path,
+                            "mlflow_import.session_artifact_sha256": checksum,
+                            "mlflow_import.session_artifact_size": str(size),
+                        },
+                        prefix="mlflow_import.session_artifact",
+                    )
+                    if changed and result.action == ACTION_SKIPPED:
+                        result = replace(result, action=ACTION_UPDATED, reason="metadata_refreshed")
+                refreshed.append(result)
+            work_plan.results = refreshed.sorted_by(lambda result: result.turn.turn_index if result.turn else 0)
+            retire_ids = DiskMap(
+                (trace_id, True) for result in work_plan.results for trace_id in result.pending_retirement_ids
+            )
+            retire_ids.update(
+                (action.trace.trace_id, True) for action in work_plan.retirements if action.trace is not None
+            )
+            replacements: DiskList[dict[str, Any]] = DiskList()
+            for result in work_plan.results:
+                if result.trace_id is not None:
+                    replacements.append(gateway.replacement_reference(result.trace_id))
+            current_prior_ids = DiskMap(
+                (candidate.trace_id, True)
+                for candidate in gateway.iter_session_traces(experiment_id, session_id, qualified_id)
+                if candidate.tags.get("mlflow_import.attempt_id") != attempt_id
+                and (
+                    not instance_id
+                    or decode_ownership(candidate.tags, candidate.metadata).get("mlflow_import.import_instance_id")
+                    == instance_id
+                )
+            )
+            prior_ids = cast(list[str], attempt["prior_ids"])
+            if len(current_prior_ids) != len(prior_ids) or any(key not in current_prior_ids for key in prior_ids):
+                raise ItemImportError("session_conflict_changed", "the pre-existing session conflict set changed")
+            manifest_payload = {
+                "schema_version": "mlflow-import.session-manifest.v1",
+                "session_id": qualified_id,
+                "session": session_reference,
+                "privacy": active.redaction_mode.value,
+                "instance_id": instance_id,
+                "turns": DiskList(
+                    {"turn_key": result.turn.turn_key, "trace_id": result.trace_id, "map": reference["map"]}
+                    for result, reference in zip(work_plan.results, replacements, strict=True)
+                    if result.turn is not None
+                ),
+            }
+            with resources.temporary_directory(prefix="mlflow-import-manifest-") as root:
+                from mlflow_import.mlflow.attempts import write_state_json
+
+                manifest_file = Path(root) / "manifest.json"
+                manifest_checksum, manifest_size = write_state_json(manifest_file, manifest_payload)
+                manifest_path = f"{session_prefix(replay, active.redaction_mode)}/manifests/{manifest_checksum}.json"
+                gateway.publish_experiment_file(experiment_id, manifest_path, manifest_file)
+            ready = journal.publish(
+                "ready_to_retire",
+                {
+                    **attempt,
+                    "replacements": replacements,
+                    "manifest": [manifest_path, manifest_checksum, manifest_size],
+                    "retirements": DiskList(
+                        {
+                            "trace_id": trace_id,
+                            "session_id": prior[trace_id].session_id,
+                            "turn_key": prior[trace_id].turn_key,
+                            "identity": gateway.conflict_identity(trace_id),
+                        }
+                        for trace_id in DiskList(retire_ids).sorted_by(lambda key: key)
+                    )
+                    + DiskList(foreign if active.conflict_policy == "overwrite" else ()),
+                },
+            )
+            _finish_ready(journal, ready, gateway, plan.confirmed_retirements)
+            plan.results.extend(
+                replace(
+                    result,
+                    retired_trace_ids=result.pending_retirement_ids
+                    + (
+                        tuple(item["trace_id"] for item in foreign)
+                        if index == 0 and active.conflict_policy == "overwrite"
+                        else ()
+                    ),
+                )
+                for index, result in enumerate(work_plan.results)
+            )
+            plan.results.extend(
+                replace(action, trace_id=action.trace.trace_id, retired_trace_ids=(action.trace.trace_id,))
+                for action in work_plan.retirements
+                if action.trace is not None
+            )
+        except Exception as error:
+            code = error.code if isinstance(error, ImporterError) else "session_recovery_failed"
+            if work_plan.results:
+                plan.results.extend(
+                    replace(result, action=ACTION_FAILED, error_code=code) for result in work_plan.results
+                )
+            else:
+                for turn in entries:
+                    plan.results.append(ReconciliationAction(action=ACTION_FAILED, turn=turn, error_code=code))
+        finally:
+            _annotate_attempt(plan, session_id, journal, result_start)
+    return plan
+
+
+def _apply_empty_session(
+    session_id: str,
+    work: ReconciliationPlan,
+    plan: ReconciliationPlan,
+    gateway: MlflowGateway,
+    dependencies: ReconciliationDependencies,
+) -> None:
+    """The same durable gate with an empty replacement set; never create a trace."""
+    from mlflow_import.content.bundles import session_prefix
+    from mlflow_import.content.canonical import canonical_json
+    from mlflow_import.identity import qualified_session
+    from mlflow_import.mlflow.attempts import AttemptJournal
+
+    journal = None
+    result_start = len(plan.results)
+    try:
+        if dependencies.replay_session is None:
+            raise ItemImportError("empty_session_unavailable", "the frozen empty session is unavailable")
+        replay = dependencies.replay_session(session_id)
+        foreign = DiskList(
+            item
+            for item in gateway.foreign_conflicts(qualified_session(replay.session_header))
+            if gateway.trace_exists(item["trace_id"])
+        )
+        candidates = DiskList(action.trace for action in work.retirements if action.trace is not None)
+        experiment_id = dependencies.experiment_id or (candidates[0].experiment_id if candidates else None)
+        if experiment_id is None:
+            raise ItemImportError("experiment_unavailable", "the selected target experiment is unavailable")
+        prefix = session_prefix(replay, dependencies.redaction_mode)
+        journal = AttemptJournal(gateway, experiment_id, prefix.rsplit("/", 1)[0])
+        pending = DiskList(
+            states for states in journal.attempts() if "complete" not in states and "aborted" not in states
+        )
+        if len(pending) > 1:
+            raise ItemImportError("attempt_state_conflict", "multiple unfinished attempts require recovery")
+        for states in pending:
+            journal.last_attempt_id = states["prepared"]["attempt_id"]
+            if "ready_to_retire" in states:
+                _finish_ready(journal, states["ready_to_retire"], gateway, plan.confirmed_retirements)
+            else:
+                prepared = states["prepared"]
+                for candidate in candidates:
+                    tags = gateway.trace_info(candidate.trace_id).tags
+                    if (
+                        tags.get("mlflow_import.attempt_id") == prepared["attempt_id"]
+                        and tags.get("mlflow_import.attempt_state") == "staged"
+                    ):
+                        if candidate.trace_id not in prepared["prior_ids"]:
+                            gateway.retire_trace(
+                                experiment_id, candidate.trace_id, session_id=session_id, turn_key=candidate.turn_key
+                            )
+                journal.publish("aborted", prepared)
+        if dependencies.conflict_policy != "overwrite":
+            plan.results.extend(
+                replace(action, action=ACTION_SKIPPED, trace_id=action.trace.trace_id, reason="no_importable_turns")
+                for action in work.retirements
+                if action.trace is not None
+            )
+            return
+        # Re-read only the exact originally planned IDs after recovery. Already
+        # absent IDs are idempotent retirements, never a reason to widen scope.
+        prior = DiskList(candidate for candidate in candidates if gateway.trace_exists(candidate.trace_id))
+        foreign = DiskList(item for item in foreign if gateway.trace_exists(item["trace_id"]))
+        if not prior and not foreign:
+            return
+        with resources.temporary_directory(prefix="mlflow-import-empty-") as root:
+            session_object = publish_session_object(
+                replay, dependencies.redaction_mode, gateway, experiment_id, Path(root)
+            )
+            prepared = journal.publish(
+                "prepared",
+                {
+                    "attempt_id": uuid.uuid4().hex,
+                    "session_id": session_id,
+                    "qualified_id": qualified_session(replay.session_header),
+                    "privacy": dependencies.redaction_mode.value,
+                    "expected_turns": [],
+                    "desired": dependencies.artifact_snapshot(replay),
+                    "policy": "overwrite",
+                    "instance_id": "",
+                    "prior_ids": DiskList(
+                        chain((candidate.trace_id for candidate in prior), (item["trace_id"] for item in foreign))
+                    ),
+                    "session_object": list(session_object),
+                },
+            )
+            payload = canonical_json(
+                {
+                    "schema_version": "mlflow-import.session-manifest.v1",
+                    "session_id": qualified_session(replay.session_header),
+                    "session": list(session_object),
+                    "turns": [],
+                    "privacy": dependencies.redaction_mode.value,
+                }
+            )
+            checksum = hashlib.sha256(payload).hexdigest()
+            path = f"{prefix}/manifests/{checksum}.json"
+            source = Path(root) / "manifest.json"
+            with resources.open_file(source, "wb") as handle:
+                handle.write(payload)
+            gateway.publish_experiment_file(experiment_id, path, source)
+        ready = journal.publish(
+            "ready_to_retire",
+            {
+                **prepared,
+                "manifest": [path, checksum, len(payload)],
+                "replacements": [],
+                "retirements": DiskList(
+                    {
+                        "trace_id": candidate.trace_id,
+                        "session_id": session_id,
+                        "turn_key": candidate.turn_key,
+                        "identity": gateway.conflict_identity(candidate.trace_id),
+                    }
+                    for candidate in prior
+                )
+                + foreign,
+            },
+        )
+        _finish_ready(journal, ready, gateway, plan.confirmed_retirements)
+        plan.results.extend(
+            replace(action, trace_id=action.trace.trace_id, retired_trace_ids=(action.trace.trace_id,))
+            for action in work.retirements
+            if action.trace is not None
+        )
+    except Exception as error:
+        code = error.code if isinstance(error, ImporterError) else "session_recovery_failed"
+        if not work.retirements:
+            plan.session_errors[session_id] = code
+        plan.results.extend(
+            replace(action, action=ACTION_FAILED, trace_id=action.trace.trace_id, error_code=code)
+            for action in work.retirements
+            if action.trace is not None
+        )
+    finally:
+        if journal is not None:
+            _annotate_attempt(plan, session_id, journal, result_start)
+
+
+def _annotate_attempt(plan: ReconciliationPlan, session_id: str, journal: Any, start: int) -> None:
+    """Report only states actually read back from the durable journal."""
+    import sys
+
+    active = sys.exception()
+    if active is not None and not isinstance(active, Exception):
+        return  # Cancellation performs cleanup, never more diagnostic downloads.
+    attempt_id = getattr(journal, "last_attempt_id", None)
+    if attempt_id is None:
+        return
+    try:
+        states = next(states for states in journal.attempts() if states["prepared"]["attempt_id"] == attempt_id)
+    except Exception:
+        return  # Preserve the original error if the diagnostic read itself fails.
+    state = next(name for name in ("complete", "aborted", "ready_to_retire", "prepared") if name in states)
+    values = dict(attempt_id=attempt_id, import_instance_id=states["prepared"]["instance_id"], attempt_state=state)
+    plan.session_attempts[session_id] = values
+    cast(DiskList[ReconciliationAction], plan.results).update_from(start, lambda result: replace(result, **values))
+
+
+def _finish_ready(
+    journal: object,
+    ready: Mapping[str, object],
+    gateway: MlflowGateway,
+    confirmed: MutableMapping[str, str] | None = None,
+) -> None:
+    """Reverify the recorded remote replacement set before any exact-ID delete."""
+    from typing import Any, cast
+
+    state = cast(Any, journal)
+    gateway._artifact_checks.clear()
+    state.verify_ready(ready)
+    if "manifest" in ready:
+        path, checksum, size = cast(list[Any], ready["manifest"])
+        gateway.verify_experiment_file(state.experiment_id, path, checksum, size)
+    if "session_object" in ready:
+        path, checksum, size = cast(list[Any], ready["session_object"])
+        gateway.verify_experiment_file(state.experiment_id, path, checksum, size)
+    replacements = cast(list[dict[str, object]], ready["replacements"])
+    for reference in replacements:
+        gateway.verify_replacement_reference(reference)
+    for retirement in cast(list[dict[str, Any]], ready["retirements"]):
+        gateway.authorize_retirement(state.experiment_id, retirement, ready)
+    for retirement in cast(list[dict[str, Any]], ready["retirements"]):
+        if gateway.trace_exists(retirement["trace_id"]):
+            gateway.authorize_retirement(state.experiment_id, retirement, ready)
+            if retirement.get("foreign"):
+                gateway.retire_conflict(state.experiment_id, retirement)
+            else:
+                gateway.retire_trace(
+                    state.experiment_id,
+                    retirement["trace_id"],
+                    session_id=retirement["session_id"],
+                    turn_key=retirement["turn_key"],
+                    expected_metadata={
+                        key: value for key, value in retirement["identity"].items() if value is not None
+                    },
+                )
+        if gateway.trace_exists(retirement["trace_id"]):
+            raise ItemImportError("trace_retirement_failed", "an exact planned retirement remains visible")
+        if confirmed is not None:
+            confirmed[retirement["trace_id"]] = retirement["session_id"]
+    for reference in replacements:
+        gateway.reconcile_tags(
+            str(reference["trace_id"]),
+            {"mlflow_import.attempt_state": "complete"},
+            prefix="mlflow_import.attempt_state",
+        )
+    state.publish("complete", ready)
+
+
 def _verify_all_candidates(
     plan: ReconciliationPlan,
     gateway: MlflowGateway,
     dependencies: ReconciliationDependencies,
     retry_policy: RetryPolicy,
-) -> dict[OwnershipKey, _IdentityWork]:
+) -> MutableMapping[OwnershipKey, _IdentityWork]:
     """Phase 1: map every update identity and verify every one of its candidates."""
-    works: dict[OwnershipKey, _IdentityWork] = {}
+    works: MutableMapping[OwnershipKey, _IdentityWork] = DiskMap(store=plan._store)
     for action in plan.updates:
         entry = action.turn
         if entry is None:  # pragma: no cover - the planner always attaches the turn
@@ -1036,10 +1904,18 @@ def _verify_one_candidate(
     except Exception:
         return CandidateVerification(trace_id=candidate.trace_id, matches=False, error_code="candidate_contract_failed")
     try:
-        return retry_call(
+        result = retry_call(
             lambda: gateway.verify_owned_candidate(candidate, contract),
             retry_policy,
         )
+        if result.matches and callable(getattr(gateway, "verify_candidate_payload", None)):
+            try:
+                gateway.verify_candidate_payload(candidate, work.request)
+            except ItemImportError as error:
+                if error.code in {"trace_verification_failed", "legacy_payload_requires_replacement"}:
+                    return CandidateVerification(candidate.trace_id, matches=False, reason="payload_mismatch")
+                raise
+        return result
     except ImporterError as error:
         return CandidateVerification(trace_id=candidate.trace_id, matches=False, error_code=error.code)
     except Exception:
@@ -1120,7 +1996,13 @@ def _decide_updates(
             work = replace(work, replay=dependencies.replay(entry))
             assert work.replay is not None
             work.request = dependencies.map_trace(work.replay)
-            if CandidateContract.from_create_request(work.request, "", 0) != work.expected_contract:
+            actual_contract = CandidateContract.from_create_request(work.request, "", 0)
+            expected_contract = work.expected_contract
+            if expected_contract is not None:
+                actual_contract = replace(
+                    actual_contract, artifact_relative_path=expected_contract.artifact_relative_path
+                )
+            if actual_contract != expected_contract:
                 raise ItemImportError("source_consistency_mismatch", "the remapped contract differs from verification")
         except Exception as error:
             plan.results.append(
@@ -1210,6 +2092,19 @@ def _decide_updates(
             others = [candidate for candidate in action.candidates if candidate.trace_id != winner_candidate.trace_id]
             assert work.request is not None
             experiment_id = winner_candidate.experiment_id or work.request.experiment_id
+            if dependencies.defer_retirement:
+                plan.results.append(
+                    ReconciliationAction(
+                        action=ACTION_SKIPPED,
+                        turn=entry,
+                        trace=winner_candidate,
+                        candidates=action.candidates,
+                        trace_id=winner_candidate.trace_id,
+                        reason=REASON_UNCHANGED,
+                        pending_retirement_ids=tuple(candidate.trace_id for candidate in others),
+                    )
+                )
+                continue
             cleanup_failures, cleanup_conflicts = _retire_candidates(gateway, others, experiment_id, retry_policy)
             cleanup_error = (
                 "ownership_conflict"
@@ -1525,6 +2420,15 @@ def _replace_identity(
         # against the current contract: it is the winner; retire the others.
         others = [candidate for candidate in action.candidates if candidate.trace_id != survivor_winner.trace_id]
         others.extend(survivors)
+        if dependencies.defer_retirement:
+            return ReconciliationAction(
+                action=ACTION_UPDATED,
+                turn=work.entry,
+                trace=survivor_winner,
+                trace_id=survivor_winner.trace_id,
+                candidates=action.candidates,
+                pending_retirement_ids=tuple(candidate.trace_id for candidate in others),
+            )
         assert work.request is not None
         experiment_id = survivor_winner.experiment_id or work.request.experiment_id
         cleanup_failures, cleanup_conflicts = _retire_candidates(gateway, others, experiment_id, retry_policy)
@@ -1550,6 +2454,10 @@ def _replace_identity(
     result = _write_identity(gateway, dependencies, retry_policy, work, action, created)
     if result.action != ACTION_UPDATED:
         return result
+    if dependencies.defer_retirement:
+        return replace(
+            result, pending_retirement_ids=tuple(candidate.trace_id for candidate in (*action.candidates, *survivors))
+        )
     # A verified replacement exists: retire the old primary, then every other
     # redundant owned candidate for this identity (including any survivor an
     # ambiguous create left behind).
@@ -1576,8 +2484,8 @@ def _replace_identity(
                 experiment_id,
                 created.trace_id,
                 retry_policy,
-                session_id=work.request.metadata.get(OWNERSHIP_SESSION_KEY),
-                turn_key=work.request.metadata.get(OWNERSHIP_TURN_KEY),
+                session_id=request_ownership(work.request).get(OWNERSHIP_SESSION_KEY),
+                turn_key=request_ownership(work.request).get(OWNERSHIP_TURN_KEY),
                 expected_metadata=_request_creation_metadata(work.request),
             )
             if created_retirement.retired:
@@ -1731,8 +2639,8 @@ def _rollback_after_replacement(
         work.request.experiment_id,
         created.trace_id,
         retry_policy,
-        session_id=work.request.metadata.get(OWNERSHIP_SESSION_KEY),
-        turn_key=work.request.metadata.get(OWNERSHIP_TURN_KEY),
+        session_id=request_ownership(work.request).get(OWNERSHIP_SESSION_KEY),
+        turn_key=request_ownership(work.request).get(OWNERSHIP_TURN_KEY),
         expected_metadata=_request_creation_metadata(work.request),
     )
     if rollback.retired:
@@ -1816,8 +2724,8 @@ def _create_with_ambiguous_recovery(
                 work.request.experiment_id,
                 error.created.trace_id,
                 retry_policy,
-                session_id=work.request.metadata.get(OWNERSHIP_SESSION_KEY),
-                turn_key=work.request.metadata.get(OWNERSHIP_TURN_KEY),
+                session_id=request_ownership(work.request).get(OWNERSHIP_SESSION_KEY),
+                turn_key=request_ownership(work.request).get(OWNERSHIP_TURN_KEY),
                 expected_metadata=_request_creation_metadata(work.request),
             )
             if not cleanup.retired:
@@ -1840,7 +2748,7 @@ def _create_with_ambiguous_recovery(
             verification_failed = False
             nonmatching_survivor = False
             for survivor in surviving_candidates:
-                expected_metadata = work.request.metadata
+                expected_metadata = request_ownership(work.request)
                 if (
                     survivor.session_id != expected_metadata.get(OWNERSHIP_SESSION_KEY)
                     or survivor.turn_key != expected_metadata.get(OWNERSHIP_TURN_KEY)
@@ -1897,13 +2805,13 @@ def _search_surviving_candidates(
     """Search operation-key survivors, reporting whether the search was unverifiable."""
     assert work.request is not None
     request = work.request
-    expected_operation = request.metadata[OWNERSHIP_OPERATION_KEY]
+    expected_operation = request.expected_operation_key
     observed: dict[str, OwnedTraceCandidate] = {}
 
     def collect_page_results() -> None:
         """Collect pages while retaining ids if a later page fails."""
         for trace in gateway.iter_owned_traces(request.experiment_id):
-            metadata = trace.metadata
+            metadata = decode_ownership(trace.tags, trace.metadata)
             if metadata.get(OWNERSHIP_OPERATION_KEY) == expected_operation:
                 candidate = OwnedTraceCandidate.from_owned_trace(trace, request.experiment_id)
                 observed.setdefault(candidate.trace_id, candidate)
@@ -1966,7 +2874,17 @@ def _bounded_retire(
 
 def _request_creation_metadata(request: TraceCreateRequest) -> dict[str, str]:
     """Return only exact ownership metadata for a final delete check."""
-    return CandidateContract.from_create_request(request, "", 0).creation_metadata
+    ownership = request_ownership(request)
+    return {
+        **CandidateContract.from_create_request(request, "", 0).creation_metadata,
+        **{
+            key: ownership.get(key, "") for key in (
+                "parent_session_id", "mlflow_import.qualified_session_id", "mlflow_import.harness",
+                "mlflow_import.source_namespace", "mlflow_import.import_instance_id",
+            )
+        },
+        "mlflow.trace.session": request.native_session_id,
+    }
 
 
 def candidate_creation_metadata(candidate: OwnedTraceCandidate) -> dict[str, str]:

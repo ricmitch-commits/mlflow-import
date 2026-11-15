@@ -140,7 +140,7 @@ from typing import cast
 
 from mlflow_import.content.canonical import DuplicateKeyObject, canonical_json
 from mlflow_import.contracts import RedactionMode, Redactor
-from mlflow_import.json_values import json_text_from_decoded
+from mlflow_import.json_values import decode_lossless_json, json_text_from_decoded
 from mlflow_import.source.model import SourceRecord
 
 __all__ = [
@@ -181,6 +181,7 @@ DETECTOR_CATEGORIES: tuple[str, ...] = (
     "connection_secret",
     "known_token_prefix",
     "opaque_binary",
+    "user_identity",
 )
 """Detector-category names that may appear in a report's counts."""
 
@@ -241,7 +242,7 @@ TEXT_ASSIGNMENT_PATTERN = re.compile(
     r"""(?P<name>""" + _escaped_key_alternation() + r""")"""
     r"""(?P<close_quote>["']?)"""
     r"""(?P<sep>\s*[:=]\s*)"""
-    r"""(?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,\s;}\]]+)""",
+    r"""(?P<value>"(?:[^"\\]|\\.)*(?:"|\Z)|'(?:[^'\\]|\\.)*(?:'|\Z)|\[REDACTED\]|[^,\s;}\]]+)""",
     re.IGNORECASE,
 )
 """Delimiter-aware textual assignment scanner for malformed/unknown text."""
@@ -480,6 +481,9 @@ def _redact_node(
     state: _RedactionState,
     depth: int = 0,
 ) -> object:
+    if depth > 32:
+        state.record("opaque_binary")
+        return REDACTED_MARKER
     # DuplicateKeyObject is also a Mapping for typed extraction; its lossless
     # ordered-pair form must take precedence over generic mapping traversal.
     if isinstance(value, DuplicateKeyObject):
@@ -499,7 +503,7 @@ def _redact_node(
     if isinstance(value, tuple):
         return tuple(_redact_node(item, path, protected, state, depth + 1) for item in value)
     if isinstance(value, str):
-        return _scan_text(value, state)
+        return _scan_text(value, state, depth)
     if isinstance(value, (bytes, bytearray, memoryview)):
         state.record("opaque_binary")
         return REDACTED_BINARY_MARKER
@@ -510,6 +514,24 @@ def _redact_node(
     # string, bytes-like, nor a JSON scalar is masked as opaque.
     state.record("opaque_binary")
     return REDACTED_BINARY_MARKER
+
+
+def _is_user_identity(name: str) -> bool:
+    return re.sub(r"[._\-\s]", "", name).lower() in {
+        "user",
+        "userid",
+        "username",
+        "useridentity",
+        "userinfo",
+        "useremail",
+        "email",
+        "emailaddress",
+        "mlflowtraceuser",
+        "mlflowuser",
+        "mlflowimportuser",
+        "mlflowimportuserid",
+        "mlflowimportusername",
+    }
 
 
 def _redact_field(
@@ -524,21 +546,201 @@ def _redact_field(
     child_path = (*path, name)
     if _is_protected(name, child_path, protected):
         return item
+    normalized_name = re.sub(r"[._\-\s]", "", name).lower()
+    if _is_user_identity(name):
+        state.record("user_identity")
+        return REDACTED_MARKER
     if _is_structured_auth_key(name) and isinstance(item, str):
         auth = STRUCTURED_AUTH_VALUE_PATTERN.fullmatch(item)
         if auth is not None:
             state.record("structured_auth_field")
             return auth.group("scheme") + auth.group("space") + REDACTED_MARKER
-    if SECRET_KEY_NAME_PATTERN.fullmatch(name) is not None:
+    if SECRET_KEY_NAME_PATTERN.fullmatch(normalized_name) is not None:
         state.record("secret_key_value")
         return _masked_value_marker(item)
     return _redact_node(item, child_path, protected, state, depth)
 
 
-def _scan_text(text: str, state: _RedactionState) -> str:
+_FRAGMENT_BYTES = 8 * 1024 * 1024
+_ASSIGNMENT_TOKEN = re.compile(r"(?:\\u[0-9a-fA-F]{4}|[A-Za-z0-9_.-])+")
+_JSON_OPENER = re.compile(r"\{|\[|\\u(?:007b|005b)", re.IGNORECASE)
+
+
+def _quoted_end(text: str, start: int) -> tuple[int, bool]:
+    quote, index = text[start], start + 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+        elif text[index] == quote:
+            return index + 1, True
+        else:
+            index += 1
+    return len(text), False
+
+
+def _container_end(text: str, start: int) -> int:
+    """Consume a whole assigned container; malformed nesting is secret to EOF."""
+    stack = ["}" if text[start] == "{" else "]"]
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char in "\"'":
+            index, complete = _quoted_end(text, index)
+            if not complete:
+                return len(text)
+            continue
+        if char in "{[":
+            if len(stack) >= 64:
+                return len(text)
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if char != stack.pop():
+                return len(text)
+            if not stack:
+                return index + 1
+        index += 1
+    return len(text)
+
+
+def _mask_container_assignments(text: str, state: _RedactionState) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for token in _ASSIGNMENT_TOKEN.finditer(text):
+        if token.start() < cursor:
+            continue
+        name = _decode_escaped_key(token.group())
+        identity = _is_user_identity(name)
+        secret = SECRET_KEY_NAME_PATTERN.fullmatch(re.sub(r"[._\-\s]", "", name).lower()) is not None
+        secret = (
+            secret or re.search(r"(?:^|[-.])(?:" + _SECRET_KEY_ALTERNATION + r")$", name, re.IGNORECASE) is not None
+        )
+        if not identity and not secret:
+            continue
+        index = token.end()
+        if index < len(text) and text[index] in "\"'":
+            index += 1
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text) or text[index] not in ":=":
+            continue
+        index += 1
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text) or text[index] not in "{[" or text.startswith(REDACTED_MARKER, index):
+            continue
+        parts.extend((text[cursor:index], REDACTED_MARKER))
+        cursor = _container_end(text, index)
+        state.counts["user_identity" if identity else "secret_key_value"] += 1
+    if not parts:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _scan_json_string_fragments(text: str, state: _RedactionState, depth: int) -> str:
+    """Visit non-overlapping quoted fragments even when surrounded by plain text."""
+    parts: list[str] = []
+    cursor = index = 0
+    while index < len(text):
+        if text[index] != '"':
+            index += 1
+            continue
+        end, complete = _quoted_end(text, index)
+        fragment = text[index:end]
+        if len(fragment) > _FRAGMENT_BYTES or len(fragment.encode("utf-8")) > _FRAGMENT_BYTES:
+            sanitized = json_text_from_decoded(REDACTED_MARKER)
+            state.record("opaque_binary")
+        elif not complete:
+            # An outer JSON string can be cut at any escape/decode layer. Its
+            # remaining bytes have no trustworthy quote boundary: mask through
+            # EOF when a literal or unicode-escaped JSON opener is recoverable.
+            # Do not invent a repaired JSON value or expose its ambiguous tail.
+            if _JSON_OPENER.search(fragment) is None:
+                break  # Plain unfinished prose still goes to assignment scanning.
+            sanitized = json_text_from_decoded(REDACTED_MARKER)
+            state.record("opaque_binary")
+        else:
+            try:
+                value = decode_lossless_json(fragment).value
+            except (ValueError, RecursionError):
+                if _JSON_OPENER.search(fragment) is None:
+                    index = end
+                    continue
+                # A later fragment's quote may look like this truncated
+                # string's terminator. Failed decoding makes that boundary
+                # untrustworthy too, so consume the ambiguous remainder.
+                end = len(text)
+                sanitized = json_text_from_decoded(REDACTED_MARKER)
+                state.record("opaque_binary")
+            else:
+                # Prose may precede JSON at every encoding layer. Plain scalar
+                # leaves stay with the assignment-first scanners below so detector
+                # precedence is unchanged; JSON-bearing strings recurse regardless
+                # of where their first opener occurs.
+                if isinstance(value, str) and _JSON_OPENER.search(value) is None and '"' not in value:
+                    index = end
+                    continue
+                redacted = _redact_node(value, (), frozenset(), state, depth + 1)
+                sanitized = json_text_from_decoded(redacted) if redacted != value else fragment
+        if sanitized != fragment:
+            parts.extend((text[cursor:index], sanitized))
+            cursor = end
+        index = end
+    if not parts:
+        return text
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _scan_text(text: str, state: _RedactionState, depth: int = 0) -> str:
     """Apply the textual detector pipeline in fixed order."""
+    if (
+        len(text) <= _FRAGMENT_BYTES
+        and len(text.encode("utf-8")) <= _FRAGMENT_BYTES
+        and text.lstrip().startswith(("{", "[", '"'))
+    ):
+        try:
+            parsed = decode_lossless_json(text).value
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if isinstance(parsed, (Mapping, list, str)) and parsed != text:
+                sanitized = _redact_node(parsed, (), frozenset(), state, depth + 1)
+                if sanitized != parsed:
+                    return json_text_from_decoded(sanitized)
     matches_before = sum(state.counts.values())
-    result = _substitute(TEXT_ASSIGNMENT_PATTERN, text, _assignment_replacement, "secret_key_value", state)
+    result = _scan_json_string_fragments(text, state, depth)
+    result = _mask_container_assignments(result, state)
+    result = _substitute(PEM_PRIVATE_KEY_PATTERN, result, _marker_replacement, "pem_private_key", state)
+    # A truncated quoted value is secret through end-of-text, not just its
+    # first whitespace-delimited word. Never let the well-formed fast path
+    # expose the remainder of that value.
+    assignments = re.compile(
+        r"""(?P<open_quote>["']?)(?<![A-Za-z0-9_])(?P<name>(?:\\u[0-9a-f]{4}|[A-Za-z0-9_.-])+)"""
+        r"""(?P<close_quote>["']?)(?P<sep>\s*[:=]\s*)"""
+        r"""(?P<value>"(?:[^"\\]|\\.)*(?:"|\Z)|'(?:[^'\\]|\\.)*(?:'|\Z)|\[REDACTED\]|[^,\s;{}\[\]]+)""",
+        re.IGNORECASE,
+    )
+    # In malformed identity assignments an unquoted display name may contain
+    # spaces. No typed identity exemption applies to arbitrary raw text.
+    parts: list[str] = []
+    cursor = 0
+    for match in assignments.finditer(result):
+        if match.start("value") < cursor or not _is_user_identity(_decode_escaped_key(match.group("name"))):
+            continue
+        value = match.group("value")
+        if value.startswith(('"', "'", REDACTED_MARKER)):
+            continue
+        delimiter = re.search(r"[,;}\]\r\n]", result[match.start("value") :])
+        end = match.start("value") + delimiter.start() if delimiter else len(result)
+        parts.extend((result[cursor : match.start("value")], REDACTED_MARKER))
+        state.counts["user_identity"] += 1
+        cursor = end
+    if parts:
+        parts.append(result[cursor:])
+        result = "".join(parts)
+    result = _substitute(assignments, result, _assignment_replacement, "secret_key_value", state)
+    result = _substitute(TEXT_ASSIGNMENT_PATTERN, result, _assignment_replacement, "secret_key_value", state)
     result = _substitute(AUTH_HEADER_PATTERN, result, _auth_header_replacement, "auth_header", state)
     result = _substitute(PEM_PRIVATE_KEY_PATTERN, result, _marker_replacement, "pem_private_key", state)
     result = _substitute(UNTERMINATED_PEM_PRIVATE_KEY_PATTERN, result, _marker_replacement, "pem_private_key", state)
@@ -575,7 +777,7 @@ def _marker_replacement(match: re.Match[str]) -> str:
 
 def _assignment_replacement(match: re.Match[str]) -> str:
     name = _decode_escaped_key(match.group("name"))
-    if SECRET_KEY_NAME_PATTERN.fullmatch(name) is None:
+    if SECRET_KEY_NAME_PATTERN.fullmatch(name) is None and not _is_user_identity(name):
         return match.group(0)
     value = match.group("value")
     if value.startswith('"'):

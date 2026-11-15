@@ -102,7 +102,9 @@ def _direct_export(script: str) -> tuple[LegacyAdapter, object, object]:
     writer_connection = sqlite3.connect(":memory:")
     try:
         connection.executescript(script)
-        writer_connection.executescript(_SNAPSHOT_DDL)
+        from mlflow_import.source.snapshot import _SNAPSHOT_SCHEMA
+
+        writer_connection.executescript(_SNAPSHOT_SCHEMA)
         adapter = LegacyAdapter(connection, LEGACY_CATALOG_V1)
         writer = SnapshotWriter(writer_connection, "legacy", identity_redaction)
         returned = adapter.export_to_snapshot(writer, identity_redaction)
@@ -114,17 +116,26 @@ def _direct_export(script: str) -> tuple[LegacyAdapter, object, object]:
 
 
 def _child_select_counts(script: str) -> dict[str, int]:
-    """Count executed SELECT statements per source table during an export."""
+    """Count source passes, excluding proven primary-key point payload reads."""
     connection = sqlite3.connect(":memory:")
     writer_connection = sqlite3.connect(":memory:")
     statements: list[str] = []
     try:
         connection.executescript(script)
         connection.set_trace_callback(statements.append)
-        writer_connection.executescript(_SNAPSHOT_DDL)
+        from mlflow_import.source.snapshot import _SNAPSHOT_SCHEMA
+
+        writer_connection.executescript(_SNAPSHOT_SCHEMA)
         adapter = LegacyAdapter(connection, LEGACY_CATALOG_V1)
         writer = SnapshotWriter(writer_connection, "legacy", identity_redaction)
         adapter.export_to_snapshot(writer, identity_redaction)
+        connection.set_trace_callback(None)
+        point_reads = set()
+        for statement in statements:
+            if statement.lstrip().upper().startswith("SELECT"):
+                plan = connection.execute("EXPLAIN QUERY PLAN " + statement).fetchall()
+                if len(plan) == 1 and "SEARCH" in plan[0][3] and "PRIMARY KEY" in plan[0][3]:
+                    point_reads.add(statement)
     finally:
         connection.close()
         writer_connection.close()
@@ -134,6 +145,8 @@ def _child_select_counts(script: str) -> dict[str, int]:
         # sqlite's trace callback emits parameterized pragma calls as
         # separate `-- PRAGMA ...` comment entries; they are not SQL.
         if not text or text.startswith("--"):
+            continue
+        if statement in point_reads:
             continue
         # Identifier quoting ("session") is normalized away so the
         # per-table FROM clauses can be matched.
@@ -299,23 +312,18 @@ class TestLegacySessionExport:
         assert all("unknown_source_field" not in header.warnings for header in headers)
         assert snapshot.schema_description.warnings == ("session_share_omitted",)
 
-    def test_blank_and_whitespace_session_ids_are_missing_and_not_exported(self, tmp_path: Path) -> None:
+    def test_blank_and_whitespace_session_ids_fail_required_identity_validation(self, tmp_path: Path) -> None:
         script = _fixture_script(
             "INSERT INTO session (id, time_created) VALUES ('', 1771001000000);"
             "INSERT INTO session (id, time_created) VALUES ('   ', 1771001000001);"
         )
 
-        with _exported(tmp_path, script) as (snapshot, adapter):
-            headers = list(adapter.iter_session_headers())
+        from mlflow_import.errors import SourceCompatibilityError
 
-        assert [header.session_id for header in headers] == [
-            "ses-legacy-001",
-            "ses-legacy-002",
-            "ses-legacy-003",
-        ]
-        assert snapshot.stats.session_count == 3
-        assert snapshot.stats.warning_count >= 2
-        assert snapshot.export_warnings.count("session_missing_id") == 2
+        with pytest.raises(SourceCompatibilityError) as caught:
+            with _exported(tmp_path, script):
+                pass
+        assert caught.value.code == "invalid_session_identity"
 
     def test_sessions_export_in_session_sort_key_order(self, tmp_path: Path) -> None:
         with _exported(tmp_path, _fixture_script()) as (_snapshot, adapter):
@@ -841,7 +849,7 @@ class TestLegacyIdentityAndDeduplication:
         assert len({record.source_identity for record in duplicates}) == 2
         assert len({record.join_projection_key for record in duplicates}) == 2
 
-    def test_duplicate_explicit_ids_collapse_to_first_projection(self, tmp_path: Path) -> None:
+    def test_distinct_physical_rows_with_duplicate_required_ids_fail(self, tmp_path: Path) -> None:
         script = _fixture_script().replace(" PRIMARY KEY", "")
         script += (
             "INSERT INTO part VALUES ('part-dup', 'msg-legacy-001', 'ses-legacy-001',"
@@ -849,27 +857,25 @@ class TestLegacyIdentityAndDeduplication:
             "INSERT INTO part VALUES ('part-dup', 'msg-legacy-001', 'ses-legacy-001',"
             ' 1771000014000, 1771000014000, \'{"type": "text", "text": "second"}\');'
         )
-        with _exported(tmp_path, script) as (_snapshot, adapter):
-            records = [r for r in adapter.iter_records("ses-legacy-001") if r.source_id == "part-dup"]
+        from mlflow_import.errors import SourceCompatibilityError
 
-        assert len(records) == 1
-        assert records[0].decoded_value == {"type": "text", "text": "first"}
+        with pytest.raises(SourceCompatibilityError) as caught:
+            with _exported(tmp_path, script):
+                pass
+        assert caught.value.code == "duplicate_record_identity"
 
-    def test_session_without_id_is_skipped_and_reported(self, tmp_path: Path) -> None:
+    def test_session_without_id_fails_required_identity_validation(self, tmp_path: Path) -> None:
         extra = (
             "INSERT INTO session VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,"
             " NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,"
             " NULL, NULL, NULL, NULL, NULL, NULL);"
         )
-        with _exported(tmp_path, _fixture_script(extra)) as (snapshot, adapter):
-            headers = list(adapter.iter_session_headers())
+        from mlflow_import.errors import SourceCompatibilityError
 
-        assert [header.session_id for header in headers] == [
-            "ses-legacy-001",
-            "ses-legacy-002",
-            "ses-legacy-003",
-        ]
-        assert snapshot.stats.session_count == 3
+        with pytest.raises(SourceCompatibilityError) as caught:
+            with _exported(tmp_path, _fixture_script(extra)):
+                pass
+        assert caught.value.code == "invalid_session_identity"
 
 
 class TestLegacySafety:
@@ -1068,8 +1074,10 @@ class TestLegacyEnvelope:
                 "SELECT canonical_record FROM snapshot_records WHERE source_id IS NULL AND source_table = 'message'"
             ).fetchone()
 
-        assert row is not None
-        stored = json.loads(row[0])
+            from mlflow_import.source.spool import read_payload
+
+            assert row is not None
+            stored = json.loads(read_payload(snapshot.snapshot_path.with_suffix(".payloads"), row[0]))
         record_section = stored["record"]
         assert record_section["source_identity"] is not None
         assert record_section["source_table"] == "message"
@@ -1115,11 +1123,11 @@ class TestLegacyEnvelope:
 
 
 class TestBoundedChildQueries:
-    """Finding 3: child-table access is a constant number of queries.
+    """Finding 3: child-table access is a constant number of scans.
 
     Messages, parts, and todos stream through ONE merge-joined cursor per
-    table for the whole database, so the number of executed SELECT
-    statements per table does not grow with the number of messages.
+    table for the whole database, with indexed point payload reads. The number
+    of source scans per table does not grow with the number of messages.
     """
 
     @staticmethod

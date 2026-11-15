@@ -12,15 +12,13 @@ NAME = "claude"
 
 def default_sources(session_id: str | None = None) -> tuple[Path, ...]:
     root = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
-    if session_id is not None:
-        return tuple(sorted(root.glob(f"projects/*/{session_id}.jsonl")))
-    return tuple(sorted(root.glob("projects/*/*.jsonl")))
+    return (root / "projects",)
 
 
 def detect(path: Path) -> bool:
-    return (path.is_dir() and ("claude" in path.parts or "projects" in path.parts)) or (
-        path.suffix == ".jsonl" and ("claude" in path.parts or "projects" in path.parts)
-    )
+    from .jsonl_common import detect as detect_schema
+
+    return detect_schema(path, NAME)
 
 
 def exporter(path: Path) -> JsonlExporter:

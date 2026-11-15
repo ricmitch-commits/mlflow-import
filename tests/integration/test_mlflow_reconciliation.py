@@ -112,13 +112,13 @@ class RecordingGateway(MlflowGateway):
     def create_trace(self, spec: TraceCreateRequest):
         created = super().create_trace(spec)
         self._recorded_events.append(
-            GatewayEvent("create_trace", created.trace_id, spec.metadata.get("opencode.turn_key"))
+            GatewayEvent("create_trace", created.trace_id, spec.root_tags.get("opencode.turn_key"))
         )
         return created
 
     def verify_trace(self, created, expected: TraceCreateRequest) -> None:
         self._recorded_events.append(
-            GatewayEvent("verify_trace", created.trace_id, expected.metadata.get("opencode.turn_key"))
+            GatewayEvent("verify_trace", created.trace_id, expected.root_tags.get("opencode.turn_key"))
         )
         super().verify_trace(created, expected)
 
@@ -257,7 +257,7 @@ class Baseline:
             locations=[self.experiment_id], max_results=100, include_spans=False, flush=True
         )
         return {
-            trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "mlflow-import"
+            trace.trace_id for trace in page if trace.info.tags.get("opencode.importer") == "mlflow-import"
         }
 
 
@@ -337,7 +337,7 @@ def baseline(live_server: LiveServer, tmp_path_factory: pytest.TempPathFactory) 
         experiment_name=name,
         tmp_root=tmp_root,
     )
-    assert run.exit_status == 0, run.report["errors"]
+    assert run.exit_status == 0, run.report
     experiment = live_server.client.get_experiment_by_name(name)
     assert experiment is not None
     ids = trace_ids_by_key(run.report)
@@ -412,7 +412,8 @@ def test_unchanged_rerun_creates_no_duplicates_and_tampered_digest_replaces(base
 
     summary = rerun.report["summary"]
     assert isinstance(summary, Mapping)
-    assert summary["turns_skipped"] == _TURNS
+    assert summary["turns_skipped"] == 0
+    assert summary["unchanged_turns"] == _TURNS
     assert summary["turns_imported"] == 0
     assert summary["turns_updated"] == 0
     assert summary["turns_failed"] == 0
@@ -438,7 +439,8 @@ def test_unchanged_rerun_creates_no_duplicates_and_tampered_digest_replaces(base
     summary = replaced.report["summary"]
     assert isinstance(summary, Mapping)
     assert summary["turns_updated"] == 1
-    assert summary["turns_skipped"] == _TURNS - 1
+    assert summary["turns_skipped"] == 0
+    assert summary["unchanged_turns"] == _TURNS - 1
     assert summary["turns_failed"] == 0
     turns = {str(turn["turn_key"]): turn for turn in turn_entries(replaced.report)}
     tampered_turn = turns[tampered_key]
@@ -463,7 +465,8 @@ def test_unchanged_rerun_creates_no_duplicates_and_tampered_digest_replaces(base
     assert len(recorded_sha) == 64 and recorded_sha != "0" * 64
     with TemporaryDirectory(prefix="mlflow-import-recon-") as dst:
         repo = get_artifact_repository(
-            replacement.info.tags[MLFLOW_ARTIFACT_LOCATION], tracking_uri=baseline.client.tracking_uri
+            baseline.client.get_experiment(replacement.info.experiment_id).artifact_location,
+            tracking_uri=baseline.client.tracking_uri,
         )
         downloaded = Path(repo.download_artifacts(recorded_path, dst))
         stored = downloaded.read_bytes()
@@ -505,7 +508,8 @@ def test_changed_turn_replacement_follows_create_verify_upload_verify_retire_ord
     for key, turn in turns.items():
         if key == changed_key:
             continue
-        assert turn["action"] == "skipped", (key, turn)
+        assert turn["action"] == "updated", (key, turn)
+        assert turn["reason"] == "metadata_refreshed"
         assert turn["trace_id"] == baseline.trace_ids_by_key[key]
 
     # The write protocol's observable order at the gateway boundary, scoped
@@ -513,10 +517,9 @@ def test_changed_turn_replacement_follows_create_verify_upload_verify_retire_ord
     # → record the digest, and only THEN retire the old trace.
     new_trace_events = [event for event in events if event.trace_id == new_id]
     methods = [event.method for event in new_trace_events]
-    assert methods[:5] == [
+    assert methods[:4] == [
         "create_trace",
         "verify_trace",
-        "upload_named_json",
         "verify_named_json",
         "record_artifact_verification",
     ]
@@ -536,7 +539,7 @@ def test_changed_turn_replacement_follows_create_verify_upload_verify_retire_ord
     assert "synthetic changed part one" in str(root.outputs)
     new_path = replacement.info.tags[ARTIFACT_PATH_TAG]
     assert new_path != old_path
-    assert new_path.startswith("mlflow-import/v1/sessions/ses-synthetic-1/turns/")
+    assert new_path.startswith("mlflow-import/v2/opencode/")
 
     baseline.trace_ids_by_key[changed_key] = new_id
 
@@ -549,6 +552,7 @@ def test_changed_turn_replacement_follows_create_verify_upload_verify_retire_ord
 def test_retirement_failure_after_verified_replacement_preserves_the_old_trace(
     baseline: Baseline,
 ) -> None:
+    before_ids = baseline.owned_trace_ids()
     changed_key = baseline.turn_keys_by_index[4]
     old_id = baseline.trace_ids_by_key[changed_key]
     old_trace = baseline.client.get_trace(old_id, display=False, flush=True)
@@ -570,7 +574,7 @@ def test_retirement_failure_after_verified_replacement_preserves_the_old_trace(
     turns = {str(turn["turn_key"]): turn for turn in turn_entries(run.report)}
     failed_turn = turns[changed_key]
     assert failed_turn["action"] == "failed"
-    assert failed_turn["error_code"] == "retirement_failed"
+    assert failed_turn["error_code"] == "session_recovery_failed"
     new_id = failed_turn["trace_id"]
     assert isinstance(new_id, str) and new_id != old_id
     assert run.exit_status == 1
@@ -585,9 +589,11 @@ def test_retirement_failure_after_verified_replacement_preserves_the_old_trace(
     preserved_root = [span for span in preserved.data.spans if span.parent_id is None][0]
     assert preserved_root.outputs == old_root.outputs
     assert preserved.info.tags[ARTIFACT_PATH_TAG] == old_trace.info.tags[ARTIFACT_PATH_TAG]
-    assert not _trace_exists(baseline.client, new_id)
-    # ... and the run left the owned population at exactly six traces.
-    assert len(baseline.owned_trace_ids()) == _TURNS
+    assert _trace_exists(baseline.client, new_id)
+    # The durable ready batch retains its verified replacement for recovery.
+    created_ids = {event.trace_id for event in events if event.method == "create_trace"}
+    retired_ids = {event.trace_id for event in events if event.method == "retire_trace"}
+    assert baseline.owned_trace_ids() == (before_ids | created_ids) - retired_ids
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +652,8 @@ def test_stale_retirement_is_scoped_and_foreign_traces_remain_untouched(
     assert [turn["trace_id"] for turn in retirements] == [dropped_id]
     assert [turn["reason"] for turn in retirements] == ["stale_turn"]
     for key, turn in turns.items():
-        assert turn["action"] == "skipped", (key, turn)
-        assert turn["reason"] == "unchanged"
+        assert turn["action"] == "updated", (key, turn)
+        assert turn["reason"] == "metadata_refreshed"
         assert turn["trace_id"] == surviving_before[key]
 
     # Observable server state: exactly the dropped trace is gone; the
@@ -657,7 +663,7 @@ def test_stale_retirement_is_scoped_and_foreign_traces_remain_untouched(
     assert foreign_after.info.tags == foreign_before.info.tags
     assert foreign_after.info.trace_metadata == foreign_before.info.trace_metadata
     page = client.search_traces(locations=[experiment.experiment_id], max_results=100, include_spans=False, flush=True)
-    owned = {trace.trace_id for trace in page if trace.info.trace_metadata.get("opencode.importer") == "mlflow-import"}
+    owned = {trace.trace_id for trace in page if trace.info.tags.get("opencode.importer") == "mlflow-import"}
     assert dropped_id not in owned
     assert foreign_id not in owned
     assert len(owned) == _TURNS - 1

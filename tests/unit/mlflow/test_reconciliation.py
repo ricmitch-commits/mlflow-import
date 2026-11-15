@@ -247,7 +247,7 @@ def test_plan_marks_turns_with_candidates_as_pending_updates(discovery_entries: 
     assert len(plan.updates) == 1
     action = plan.updates[0]
     assert action.action == ACTION_UPDATED
-    assert action.turn is discovery_entries.turns[0]
+    assert action.turn == discovery_entries.turns[0]
     assert action.candidates == (candidate,)
     # A pure planner never selects a winner from unverified candidates.
     assert plan.verifications == {}
@@ -277,7 +277,7 @@ def test_plan_retires_stale_turns_of_selected_complete_sessions(discovery_entrie
     assert len(plan.retirements) == 1
     action = plan.retirements[0]
     assert action.action == ACTION_RETIRED
-    assert action.trace is stale
+    assert action.trace == stale
     assert action.trace.session_id == "session-a"
     assert action.reason == "stale_turn"
 
@@ -1631,7 +1631,7 @@ def test_stale_retirement_is_executed_and_reported(fake_gateway: FakeMlflowGatew
 
     assert [action.action for action in plan.results] == [ACTION_IMPORTED, ACTION_RETIRED]
     retired = plan.results[1]
-    assert retired.trace is stale
+    assert retired.trace == stale
     assert retired.trace_id == "tr-stale"
     assert retired.retired_trace_ids == ("tr-stale",)
     assert not fake_gateway.has_trace("tr-stale")

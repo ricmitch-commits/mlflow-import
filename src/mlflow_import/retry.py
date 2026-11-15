@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TypeVar
 
-from mlflow_import.errors import ImporterError
+from mlflow_import.errors import ImporterError, ItemImportError
 
 __all__ = [
     "TRANSIENT_ERROR_CODES",
@@ -46,6 +48,50 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+
+
+@dataclass
+class RetryBudget:
+    retries_left: int
+    deadline: float
+    operations_left: int = 1_000_000
+
+    def check(self, *, retry: bool = False, operation: bool = False) -> None:
+        if time.monotonic() >= self.deadline or (retry and self.retries_left <= 0):
+            raise ItemImportError("retry_budget_exhausted", "the shared retry or operation deadline was exhausted")
+        if retry:
+            self.retries_left -= 1
+        if operation:
+            if self.operations_left <= 0:
+                raise ItemImportError("operation_budget_exhausted", "the shared work-operation allowance was exhausted")
+            self.operations_left -= 1
+
+
+_BUDGET: ContextVar[RetryBudget | None] = ContextVar("mlflow_import_retry_budget", default=None)
+
+
+def check_budget() -> None:
+    """Check the shared deadline before work outside retry_call itself."""
+    if budget := _BUDGET.get():
+        budget.check(operation=True)
+
+
+@contextmanager
+def retry_budget(
+    max_retries: int = 64, deadline_seconds: float = 600.0, max_operations: int = 1_000_000
+) -> Iterator[RetryBudget]:
+    """Share finite retries/deadline across nested operations without resetting them."""
+    existing = _BUDGET.get()
+    if existing is not None:
+        yield existing
+        return
+    budget = RetryBudget(max_retries, time.monotonic() + deadline_seconds, max_operations)
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
+
 
 #: MLflow protocol ``error_code`` values that are worth retrying: server
 #: 5xx responses and rate limiting, from the pinned 3.17.2
@@ -155,10 +201,17 @@ def retry_call(
     """
     attempt = 0
     while True:
+        budget = _BUDGET.get()
+        if budget is not None:
+            budget.check(operation=True)
         attempt += 1
         try:
             return operation()
         except Exception as exc:
             if not is_transient_error(exc) or attempt >= policy.max_attempts:
                 raise
-            sleep(policy.delay_seconds(attempt, random_source))
+            delay = policy.delay_seconds(attempt, random_source)
+            if budget is not None:
+                budget.check(retry=True)
+                delay = min(delay, max(0.0, budget.deadline - time.monotonic()))
+            sleep(delay)

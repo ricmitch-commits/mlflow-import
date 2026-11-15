@@ -40,8 +40,10 @@ memory.
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 from collections.abc import Generator, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from mlflow_import.content.canonical import canonical_json
 from mlflow_import.content.fingerprint import FramedDigest, canonical_record_value
@@ -218,6 +220,134 @@ def build_replay_turn(snapshot: SourceSnapshot, header: SessionHeader, summary: 
     if header.session_id != summary.session_id:
         raise ValueError("the turn summary does not belong to the supplied session header")
     return _SnapshotReplayTurn(snapshot, header, summary)
+
+
+def _index_connection(snapshot: SourceSnapshot) -> sqlite3.Connection:
+    if snapshot.turn_index is None:
+        path = snapshot.snapshot_path.parent / "turn-index.db"
+        from mlflow_import.resources import current_storage
+
+        if budget := current_storage():
+            budget.resize(path, 0)
+        from mlflow_import.resources import open_file
+
+        with open_file(path, "xb"):
+            pass
+        from mlflow_import.resources import sqlite_connect
+
+        connection = sqlite_connect(path, uri=True)
+        connection.executescript("""
+            PRAGMA cache_size=-2048;
+            PRAGMA temp_store=FILE;
+            PRAGMA max_page_count=262144;
+            CREATE TABLE sessions(session_id TEXT PRIMARY KEY);
+            CREATE TABLE turns(session_id TEXT, turn_key TEXT, ordinal INTEGER,
+                first_row INTEGER, last_row INTEGER, summary TEXT,
+                PRIMARY KEY(session_id, turn_key), UNIQUE(session_id, ordinal));
+            CREATE TABLE keys(turn_key TEXT PRIMARY KEY);
+            CREATE TABLE hashes(session_id TEXT, mode TEXT, digest TEXT, PRIMARY KEY(session_id, mode));
+            CREATE TABLE turn_records(session_id TEXT, turn_key TEXT, ordinal INTEGER, occurrence INTEGER,
+                payload_offset INTEGER,payload_length INTEGER,
+                PRIMARY KEY(session_id,turn_key,ordinal));
+            CREATE INDEX turn_occurrences ON turn_records(session_id,turn_key,occurrence);
+        """)
+        connection.execute("ATTACH DATABASE ? AS frozen_source", (snapshot.snapshot_path.as_uri() + "?mode=ro",))
+        snapshot.turn_index = connection
+    return snapshot.turn_index
+
+
+def indexed_turn_summaries(
+    snapshot: SourceSnapshot, session_id: str, records: Iterable[SourceRecord] | None = None
+) -> Iterator[TurnSummary]:
+    """Index turn ranges once, then stream small persisted summaries.
+
+    The secondary catalog contains only locators and summaries; payloads stay
+    in the frozen snapshot. Building a session is transactional, so a failed
+    scan cannot expose a partially indexed session to a later caller.
+    """
+    from mlflow_import.source.discovery import _turn_summary_from_payload
+
+    connection = _index_connection(snapshot)
+    if connection.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone() is None:
+        adapter = NormalizedSnapshotAdapter(snapshot)
+        scoped = adapter._scoped_tables
+        rows = snapshot.connection.execute(
+            "SELECT rowid,payload_offset,payload_length FROM snapshot_records"
+            " WHERE session_id=? AND active=1 AND source_table NOT IN ("
+            + ",".join("?" for _ in scoped)
+            + ") ORDER BY COALESCE(anchor_ordinal,path_ordinal,rowid),anchor_ordinal IS NOT NULL,path_ordinal,rowid",
+            (session_id, *sorted(scoped)),
+        )
+        with connection:
+            connection.execute("DELETE FROM keys")
+            state: _TurnState | None = None
+            first_row = last_row = 0
+
+            def save() -> None:
+                if state is not None:
+                    summary = state.summary()
+                    connection.execute(
+                        "INSERT INTO turns VALUES(?,?,?,?,?,?)",
+                        (
+                            session_id,
+                            summary.turn_key,
+                            summary.turn_index,
+                            first_row,
+                            last_row,
+                            json.dumps(asdict(summary), separators=(",", ":")),
+                        ),
+                    )
+
+            for (rowid, offset, length), record in zip(
+                rows, adapter.iter_records(session_id) if records is None else records, strict=True
+            ):
+                if _starts_turn(record):
+                    save()
+                    ordinal = state.header.ordinal + 1 if state is not None else 1
+                    material = _turn_key_material(session_id, record, ordinal)
+                    key = _TURN_KEY_PREFIX + hashlib.sha256(material).hexdigest()
+                    occurrence = 1
+                    while connection.execute("SELECT 1 FROM keys WHERE turn_key=?", (key,)).fetchone():
+                        occurrence += 1
+                        key = (
+                            _TURN_KEY_PREFIX + hashlib.sha256(material + b"\0" + canonical_json(occurrence)).hexdigest()
+                        )
+                    connection.execute("INSERT INTO keys VALUES(?)", (key,))
+                    warnings: tuple[str, ...] = (TURN_KEY_FALLBACK_WARNING,) if record.source_id is None else ()
+                    if occurrence > 1:
+                        warnings += (TURN_KEY_COLLISION_WARNING,)
+                    state = _TurnState(_TurnHeader(ordinal, session_id, key, record, warnings))
+                    first_row = rowid
+                if state is not None:
+                    state.add(record)
+                    last_row = rowid
+                    connection.execute(
+                        "INSERT INTO turn_records VALUES(?,?,?,?,?,?)",
+                        (session_id, state.header.key, state._record_count, rowid, offset, length),
+                    )
+            save()
+            connection.execute("INSERT INTO sessions VALUES(?)", (session_id,))
+    elif records is not None:
+        for _ in records:
+            pass
+    for (payload,) in connection.execute(
+        "SELECT summary FROM turns WHERE session_id=? ORDER BY ordinal", (session_id,)
+    ):
+        yield _turn_summary_from_payload(json.loads(payload))
+
+
+def indexed_turn_summary(snapshot: SourceSnapshot, session_id: str, key: str) -> TurnSummary | None:
+    """Resolve a stable turn key without scanning the session or its summaries."""
+    from mlflow_import.source.discovery import _turn_summary_from_payload
+
+    connection = _index_connection(snapshot)
+    if connection.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone() is None:
+        for _ in indexed_turn_summaries(snapshot, session_id):
+            pass
+    row = connection.execute(
+        "SELECT summary FROM turns WHERE session_id=? AND turn_key=?", (session_id, key)
+    ).fetchone()
+    return _turn_summary_from_payload(json.loads(row[0])) if row is not None else None
 
 
 @dataclass(frozen=True)
@@ -537,6 +667,7 @@ class _SnapshotReplayTurn:
     """Concrete ``ReplayTurn``: fresh snapshot cursors and bounded root loaders."""
 
     def __init__(self, snapshot: SourceSnapshot, header: SessionHeader, summary: TurnSummary) -> None:
+        self._snapshot = snapshot
         self._header = header
         self._summary = summary
         self._adapter = NormalizedSnapshotAdapter(snapshot)
@@ -549,9 +680,76 @@ class _SnapshotReplayTurn:
     def summary(self) -> TurnSummary:
         return self._summary
 
+    def iter_summaries(self) -> Iterator[TurnSummary]:
+        return indexed_turn_summaries(self._snapshot, self._summary.session_id)
+
+    def iter_all_records(self) -> Iterator[SourceRecord]:
+        """Read the frozen occurrence/derived projection inventory once in spool order."""
+        return self._adapter._iter_stored_records(
+            "SELECT session_id,source_table,source_id,canonical_record,raw_permitted_fields"
+            " FROM snapshot_records WHERE session_id=? ORDER BY rowid",
+            (self._summary.session_id,),
+        )
+
+    def iter_original_records(self) -> Iterator[SourceRecord]:
+        """Expose physical occurrences separately from generated effective entities."""
+        return self._adapter._iter_stored_records(
+            "SELECT session_id,source_table,source_id,canonical_record,raw_permitted_fields"
+            " FROM snapshot_records WHERE session_id=? AND occurrence_kind='original' ORDER BY rowid",
+            (self._summary.session_id,),
+        )
+
+    def session_snapshot_fingerprint(self, mode: str) -> str:
+        """Compute the session digest once per privacy mode, irrespective of turns."""
+        from mlflow_import.content.fingerprint import _complete_session_value
+
+        connection = _index_connection(self._snapshot)
+        row = connection.execute(
+            "SELECT digest FROM hashes WHERE session_id=? AND mode=?", (self._summary.session_id, mode)
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        digest = FramedDigest("shared-session-v1")
+        digest.update(canonical_json({"privacy": mode, "session": _complete_session_value(self._header)}))
+        for record in self.iter_all_records():
+            digest.update(canonical_json(canonical_record_value(record)))
+        value = digest.hexdigest()
+        with connection:
+            connection.execute("INSERT INTO hashes VALUES(?,?,?)", (self._summary.session_id, mode, value))
+        return value
+
+    def scoped_records_fingerprint(self) -> str:
+        """Digest session-scoped observations once, independent of turn count."""
+        connection = _index_connection(self._snapshot)
+        key = (self._summary.session_id, "scoped-records-v1")
+        row = connection.execute("SELECT digest FROM hashes WHERE session_id=? AND mode=?", key).fetchone()
+        if row is not None:
+            return str(row[0])
+        digest = FramedDigest("session-scoped-records-v1")
+        for record in self.iter_session_records():
+            digest.update(canonical_json(canonical_record_value(record)))
+        value = digest.hexdigest()
+        with connection:
+            connection.execute("INSERT INTO hashes VALUES(?,?,?)", (*key, value))
+        return value
+
     def iter_records(self) -> Generator[SourceRecord, None, None]:
         """Fresh cursor over this turn's selected ordered records."""
-        return iter_turn_records(self._adapter.iter_records(self._summary.session_id), self._summary)
+        indexed_turn_summary(self._snapshot, self._summary.session_id, self._summary.turn_key)
+        connection = _index_connection(self._snapshot)
+        bounds = connection.execute(
+            "SELECT first_row,last_row FROM turns WHERE session_id=? AND turn_key=?",
+            (self._summary.session_id, self._summary.turn_key),
+        ).fetchone()
+        if bounds is None:
+            raise ValueError("the summary's turn key matches no turn in the supplied records")
+        yield from self._adapter._iter_stored_records(
+            "SELECT r.session_id,r.source_table,r.source_id,r.canonical_record,r.raw_permitted_fields"
+            " FROM turn_records t JOIN frozen_source.snapshot_records r ON r.rowid=t.occurrence"
+            " WHERE t.session_id=? AND t.turn_key=? ORDER BY t.ordinal",
+            (self._summary.session_id, self._summary.turn_key),
+            connection,
+        )
 
     def iter_session_records(self) -> Iterator[SourceRecord]:
         """Fresh cursor over the session-scoped records."""
@@ -564,22 +762,18 @@ class _SnapshotReplayTurn:
         with :meth:`iter_records` and :meth:`iter_session_records` is
         the complete permitted session payload.
         """
-        used_keys: set[str] = set()
-        target_ordinal: int | None = None
-        for header, record in _scan_turns(self._adapter.iter_records(self._summary.session_id), used_keys):
-            if header is None:
-                yield record
-                continue
-            if target_ordinal is None:
-                if header.key != self._summary.turn_key:
-                    yield record
-                    continue
-                target_ordinal = header.ordinal
-                continue
-            if header.ordinal != target_ordinal:
-                yield record
-        if target_ordinal is None:
+        if indexed_turn_summary(self._snapshot, self._summary.session_id, self._summary.turn_key) is None:
             raise ValueError("the summary's turn key matches no turn in the supplied records")
+        scoped = self._adapter._scoped_tables
+        yield from self._adapter._iter_stored_records(
+            "SELECT r.session_id,r.source_table,r.source_id,r.canonical_record,r.raw_permitted_fields"
+            " FROM frozen_source.snapshot_records r WHERE r.session_id=? AND r.source_table NOT IN ("
+            + ",".join("?" for _ in scoped)
+            + ") AND NOT EXISTS (SELECT 1 FROM turn_records t"
+            " WHERE t.session_id=r.session_id AND t.turn_key=? AND t.occurrence=r.rowid) ORDER BY r.rowid",
+            (self._summary.session_id, *sorted(scoped), self._summary.turn_key),
+            _index_connection(self._snapshot),
+        )
 
     def load_root_input(self, max_bytes: int) -> BoundedRootValue | None:
         """Stream the turn's first-user record's decoded value, bounded.

@@ -15,6 +15,25 @@ from tests.integration.server import LiveServer, live_mlflow_server
 from tests.support.fake_clock import FakeClock
 from tests.support.fake_gateway import FakeMlflowClient
 
+_INITIAL_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "")
+
+
+@pytest.fixture(autouse=True)
+def isolated_source_defaults(tmp_path: Path) -> Iterator[None]:
+    """Default-discovery tests must never inspect the developer's real sessions."""
+    root = tmp_path / "empty-adapter-defaults"
+    with pytest.MonkeyPatch.context() as patch:
+        for name in (
+            "XDG_DATA_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "GEMINI_CLI_HOME",
+        ):
+            patch.setenv(name, str(root / name.lower()))
+        yield
+
 
 @pytest.fixture
 def restrictive_tmp_path() -> Iterator[Path]:
@@ -41,7 +60,7 @@ def live_server() -> Iterator[LiveServer]:
     launching its own. See ``tests/integration/server.py`` for the launch,
     health-check, OTEL-scrub, and always-reap lifecycle.
     """
-    with live_mlflow_server() as server:
+    with live_mlflow_server(requested_uri=_INITIAL_TRACKING_URI) as server:
         yield server
 
 

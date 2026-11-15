@@ -99,17 +99,26 @@ _CHILD_TABLES = (
 
 
 def _child_select_counts(script: str) -> dict[str, int]:
-    """Count executed SELECT statements per source table during an export."""
+    """Count source passes, excluding proven primary-key point payload reads."""
     connection = sqlite3.connect(":memory:")
     writer_connection = sqlite3.connect(":memory:")
     statements: list[str] = []
     try:
         connection.executescript(script)
         connection.set_trace_callback(statements.append)
-        writer_connection.executescript(_SNAPSHOT_DDL)
+        from mlflow_import.source.snapshot import _SNAPSHOT_SCHEMA
+
+        writer_connection.executescript(_SNAPSHOT_SCHEMA)
         adapter = CurrentAdapter(connection, CURRENT_CATALOG_V1)
         writer = SnapshotWriter(writer_connection, "current", identity_redaction)
         adapter.export_to_snapshot(writer, identity_redaction)
+        connection.set_trace_callback(None)
+        point_reads = set()
+        for statement in statements:
+            if statement.lstrip().upper().startswith("SELECT"):
+                plan = connection.execute("EXPLAIN QUERY PLAN " + statement).fetchall()
+                if len(plan) == 1 and "SEARCH" in plan[0][3] and "PRIMARY KEY" in plan[0][3]:
+                    point_reads.add(statement)
     finally:
         connection.close()
         writer_connection.close()
@@ -119,6 +128,8 @@ def _child_select_counts(script: str) -> dict[str, int]:
         # sqlite's trace callback emits parameterized pragma calls as
         # separate `-- PRAGMA ...` comment entries; they are not SQL.
         if not text or text.startswith("--"):
+            continue
+        if statement in point_reads:
             continue
         # Identifier quoting ("session_v2") is normalized away so the
         # per-table FROM clauses can be matched.
@@ -263,19 +274,18 @@ class TestCurrentSessionExport:
         assert all("unknown_source_field" not in header.warnings for header in headers)
         assert snapshot.schema_description.warnings == ("session_share_omitted",)
 
-    def test_blank_and_whitespace_session_ids_are_missing_and_not_exported(self, tmp_path: Path) -> None:
+    def test_blank_and_whitespace_session_ids_fail_required_identity_validation(self, tmp_path: Path) -> None:
         script = _fixture_script(
             "INSERT INTO session_v2 (id, time_created) VALUES ('', 1772001000000);"
             "INSERT INTO session_v2 (id, time_created) VALUES ('   ', 1772001000001);"
         )
 
-        with _exported(tmp_path, script) as (snapshot, adapter):
-            headers = list(adapter.iter_session_headers())
+        from mlflow_import.errors import SourceCompatibilityError
 
-        assert [header.session_id for header in headers] == ["ses-current-001", "ses-current-002"]
-        assert snapshot.stats.session_count == 2
-        assert snapshot.stats.warning_count >= 2
-        assert snapshot.export_warnings.count("session_missing_id") == 2
+        with pytest.raises(SourceCompatibilityError) as caught:
+            with _exported(tmp_path, script):
+                pass
+        assert caught.value.code == "invalid_session_identity"
 
     def test_sessions_export_in_creation_order(self, tmp_path: Path) -> None:
         with _exported(tmp_path, _fixture_script()) as (_snapshot, adapter):
@@ -818,12 +828,12 @@ class TestCurrentOptionalScopedTables:
 
 
 class TestBoundedChildQueries:
-    """Finding 3: child-table access is a constant number of queries.
+    """Finding 3: child-table scans remain constant as message count grows.
 
     ``session_message``, every session-scoped table, and the transitive
     instruction blobs each stream through ONE merge-joined cursor for the
-    whole database, so the number of executed SELECT statements per table
-    does not grow with the number of messages.
+    whole database. Payloads use primary-key point reads after locator ordering;
+    those linear indexed reads are not repeated transcript scans.
     """
 
     @staticmethod
@@ -838,7 +848,7 @@ class TestBoundedChildQueries:
         ]
         return _fixture_script("".join(rows))
 
-    def test_child_query_count_is_constant_in_message_count(self) -> None:
+    def test_child_scan_count_is_constant_in_message_count(self) -> None:
         counts = [_child_select_counts(self._scaled_script(size)) for size in (0, 5, 25)]
 
         assert counts[0] == counts[1] == counts[2]

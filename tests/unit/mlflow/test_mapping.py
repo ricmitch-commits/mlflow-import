@@ -180,8 +180,9 @@ def test_mapping_preserves_six_turn_session_shape(six_turn_session) -> None:
 
     assert len(specs) == 6
     assert {spec.native_session_id for spec in specs} == {"ses-synthetic-1"}
-    assert len({spec.client_request_id for spec in specs}) == 6
-    assert all(spec.metadata["opencode.session_id"] == "ses-synthetic-1" for spec in specs)
+    assert len({spec.native_session_id for spec in specs}) == 1
+    assert all(spec.client_request_id is None for spec in specs)
+    assert all(spec.root_tags["opencode.session_id"] == "ses-synthetic-1" for spec in specs)
 
 
 # ---------------------------------------------------------------------------
@@ -1665,14 +1666,14 @@ def test_legacy_mapping_matches_native_conversation_trace_shape() -> None:
 def test_six_turn_statuses_follow_source_outcomes(six_turn_session) -> None:
     specs = [map_turn_to_trace(turn, six_turn_session.context) for turn in six_turn_session.turns]
 
-    assert [spec.root_status for spec in specs] == ["OK", "OK", "UNSET", "ERROR", "OK", "OK"]
-    assert [spec.metadata["opencode.outcome"] for spec in specs] == [
-        ASSISTANT_RESULT_OUTCOME,
-        ASSISTANT_RESULT_OUTCOME,
+    assert [spec.root_status for spec in specs] == ["OK", "OK", "ERROR", "ERROR", "OK", "OK"]
+    assert [spec.root_tags["opencode.outcome"] for spec in specs] == [
+        "stop",
+        "stop",
         "lifecycle_observed",
         OUTCOME_EXPLICIT_FAILURE,
-        ASSISTANT_RESULT_OUTCOME,
-        ASSISTANT_RESULT_OUTCOME,
+        "stop",
+        "stop",
     ]
 
 
@@ -1690,7 +1691,7 @@ def test_six_turn_children_cover_the_typed_record_shapes(six_turn_session) -> No
         "session_pending:pending-synthetic-2",
     }
     assert children["session_message:msg-synthetic-a1"].span_type == "LLM"
-    assert children["session_message:msg-synthetic-a1"].name == "model synthetic-provider/synthetic-model"
+    assert children["session_message:msg-synthetic-a1"].name == "llm_call"
     assert children["session_message:msg-synthetic-a1#content-1"].span_type == "TOOL"
     assert children["session_message:msg-synthetic-a1#content-2"].span_type != EVENT_SPAN_TYPE
     assert isinstance(children["session_message:msg-synthetic-a1#content-0"], EventSpec)
@@ -1709,25 +1710,68 @@ def test_six_turn_children_cover_the_typed_record_shapes(six_turn_session) -> No
 def test_six_turn_metadata_carries_session_and_database_identity(six_turn_session) -> None:
     spec = map_turn_to_trace(six_turn_session.turns[0], six_turn_session.context)
 
-    assert spec.metadata["opencode.title"] == "Synthetic six turn session"
-    assert spec.metadata["opencode.slug"] == "synthetic-six-turn-slug"
-    assert spec.metadata["opencode.directory"] == "/repo/synthetic-project"
-    assert spec.metadata["opencode.agent"] == "synthetic-agent"
-    assert spec.metadata["opencode.version"] == "synthetic-opencode-version"
-    assert spec.metadata["opencode.model"] == "synthetic-provider/synthetic-model"
-    assert spec.metadata["mlflow_import.source_database_fingerprint"] == six_turn_session.snapshot.fingerprint
-    assert spec.metadata["opencode.logical_turn_count"] == "6"
-    assert spec.metadata["mlflow_import.source_message_count"] == str(len(six_turn_session.message_records()))
-    assert spec.metadata["mlflow_import.source_part_count"] == str(len(six_turn_session.part_records()))
+    assert spec.root_tags["mlflow_import.current.title"] == "Synthetic six turn session"
+    assert spec.root_tags["mlflow_import.current.slug"] == "synthetic-six-turn-slug"
+    assert spec.root_tags["mlflow_import.current.directory"] == "/repo/synthetic-project"
+    assert spec.root_tags["mlflow_import.current.agent"] == "synthetic-agent"
+    assert spec.root_tags["mlflow_import.current.version"] == "synthetic-opencode-version"
+    assert spec.root_tags["mlflow_import.current.model"] == "synthetic-provider/synthetic-model"
+    assert spec.root_tags["mlflow_import.source_namespace"] == six_turn_session.snapshot.source_namespace
+    assert spec.root_tags["mlflow_import.current.logical_turn_count"] == "6"
+    assert spec.root_tags["mlflow_import.current.mlflow_import.source_message_count"] == str(
+        len(six_turn_session.message_records())
+    )
+    assert spec.root_tags["mlflow_import.current.mlflow_import.source_part_count"] == str(
+        len(six_turn_session.part_records())
+    )
 
 
 def test_six_turn_timing_comes_from_source_timestamps(six_turn_session) -> None:
     specs = [map_turn_to_trace(turn, six_turn_session.context) for turn in six_turn_session.turns]
 
     assert specs[0].start_time_ns == 1_772_000_010_000_000_000
-    # The final timed session event is source-derived and extends the root;
-    # no local wall-clock timestamp is invented.
-    assert specs[0].end_time_ns == 1_772_000_065_000_000_000
+    # Native duration ends at the assistant message, not later lifecycle rows.
+    assert specs[0].end_time_ns == 1_772_000_020_000_000_000
     assert specs[2].start_time_ns == 1_772_000_050_000_000_000
-    assert all("opencode.timing_estimated" in specs[index].metadata for index in (0, 1, 2))
+    assert all("opencode.timing_estimated" in specs[index].root_tags for index in (0, 1, 2))
     assert all("opencode.timing_estimated" not in specs[index].metadata for index in (3, 4, 5))
+def test_plugin_previews_include_synthetic_text_and_truncate_utf16():
+    from types import SimpleNamespace
+
+    from mlflow_import.mlflow.mapping import _opencode_projection
+
+    def record(identity, role, decoded, parent=None):
+        return SimpleNamespace(
+            source_id=identity, parent_source_id=parent, source_type=role,
+            source_table="message" if parent is None else "part",
+            derived_child_ordinal=None, decoded_value=decoded, timestamp=None, completion_timestamp=None,
+        )
+
+    records = [
+        record("u", "user", {"time": {"created": 1000}}),
+        record("p1", "text", {"type": "text", "text": "prompt"}, "u"),
+        record("p2", "text", {"type": "text", "text": "context", "synthetic": True}, "u"),
+        record("a", "assistant", {"time": {"created": 1002, "completed": 1010}}),
+        record("p3", "text", {"type": "text", "text": " "}, "a"),
+        record("p4", "text", {"type": "text", "text": "😀" * 600}, "a"),
+    ]
+    prompt, response, start, end = _opencode_projection(SimpleNamespace(iter_records=lambda: iter(records)))
+    assert prompt == "prompt\ncontext"
+    assert response == "😀" * 500
+    assert (start, end) == (1_000_000_000, 1_010_000_000)
+
+
+@pytest.mark.parametrize("invalid", [True, False, 1e100, float("inf"), "malformed", {"value": 1000}])
+def test_invalid_semantic_timestamps_preserve_normalized_fallbacks(invalid):
+    from types import SimpleNamespace
+
+    records = [
+        SourceRecord("message", "user", "u", decoded_value={"time": {"created": invalid}},
+                     timestamp=normalize_timestamp(1000, "ms")),
+        SourceRecord("message", "assistant", "a",
+                     decoded_value={"time": {"created": invalid, "completed": invalid}},
+                     timestamp=normalize_timestamp(2000, "ms"),
+                     completion_timestamp=normalize_timestamp(2020, "ms")),
+    ]
+    _, _, start, end = mapping._opencode_projection(SimpleNamespace(iter_records=lambda: iter(records)))
+    assert (start, end) == (1_000_000_000, 2_020_000_000)

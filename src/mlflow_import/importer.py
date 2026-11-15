@@ -66,18 +66,18 @@ and the gateway-bound artifact uploader.
 from __future__ import annotations
 
 import inspect
-import shutil
 import sqlite3
 import sys
-import tempfile
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, MutableMapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
+from itertools import chain as iter_chain
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from mlflow_import import __version__ as IMPORTER_VERSION
+from mlflow_import import resources
 from mlflow_import.config import ImportConfig
 from mlflow_import.content.fingerprint import (
     artifact_snapshot_fingerprint,
@@ -113,8 +113,9 @@ from mlflow_import.mlflow.reconciliation import (
     plan_reconciliation,
     upload_artifact,
 )
+from mlflow_import.privacy import safe_client_diagnostics
 from mlflow_import.reporting import REASON_DRY_RUN, ReportBuilder, TurnResult
-from mlflow_import.retry import RetryPolicy
+from mlflow_import.retry import RetryPolicy, retry_budget
 from mlflow_import.source.candidates import candidate_session_ids
 from mlflow_import.source.connection import open_live_connection
 from mlflow_import.source.discovery import (
@@ -137,7 +138,8 @@ from mlflow_import.source.snapshot import (
     SourceSnapshot,
     create_normalized_snapshot,
 )
-from mlflow_import.source.turns import build_replay_turn, iter_turn_summaries
+from mlflow_import.source.turns import build_replay_turn, indexed_turn_summary
+from mlflow_import.storage import DiskList, DiskMap, Store, disk_collections
 
 __all__ = [
     "BROAD_SELECTION_MESSAGE",
@@ -348,6 +350,12 @@ class ImportResult:
     report: dict[str, object]
     error: ImporterError | None = None
     failed_items: int = 0
+    _store: Store | None = field(default=None, repr=False, compare=False)
+
+    def close(self) -> None:
+        """Release lazy report storage after the caller finishes reading/rendering."""
+        if self._store is not None:
+            self._store.close()
 
 
 def exit_status(result: ImportResult) -> int:
@@ -424,14 +432,7 @@ class _SessionReplayIndex:
         return header
 
     def _summary(self, session_id: str, turn_key: str) -> TurnSummary:
-        summary = next(
-            (
-                summary
-                for summary in iter_turn_summaries(self._adapter.iter_records(session_id))
-                if summary.turn_key == turn_key
-            ),
-            None,
-        )
+        summary = indexed_turn_summary(self._snapshot, session_id, turn_key)
         if summary is None:
             raise ImporterError(
                 "replay_turn_unavailable",
@@ -489,7 +490,7 @@ class _MappingContexts:
         redaction_mode: RedactionMode,
     ) -> None:
         self._adapter = adapter
-        self._turn_counts = {scan.session_id: scan.logical_turn_count for scan in scans}
+        self._turn_counts = DiskMap((scan.session_id, scan.logical_turn_count) for scan in scans)
         self._snapshot = snapshot
         self._experiment_id = experiment_id
         self._inline_limit_bytes = inline_limit_bytes
@@ -502,6 +503,7 @@ class _MappingContexts:
         context = self._cache.get(session_id)
         if context is None:
             context = self._build(session_id)
+            self._cache.clear()
             self._cache[session_id] = context
         return context
 
@@ -529,10 +531,17 @@ class _MappingContexts:
         )
 
     def _generation(self, session_id: str) -> str:
-        if not self._generations:
-            for header in self._adapter.iter_session_headers():
-                self._generations.setdefault(header.session_id, header.adapter_generation)
-        return self._generations.get(session_id, "")
+        if isinstance(self._adapter, NormalizedSnapshotAdapter):
+            header = self._adapter.session_header(session_id)
+            return header.adapter_generation if header is not None else ""
+        return next(
+            (
+                header.adapter_generation
+                for header in self._adapter.iter_session_headers()
+                if header.session_id == session_id
+            ),
+            "",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +603,354 @@ class _CountingRedaction:
 
 
 def run_import(config: ImportConfig, dependencies: ImportDependencies) -> ImportResult:
+    """Execute within one finite invocation retry/deadline budget."""
+    from mlflow_import.compatibility import IdentityIndex, identity_index
+
+    budget = None
+    result = None
+    try:
+        with resources.temporary_storage(retain_result=True) as budget:
+            with (
+                retry_budget(),
+                safe_client_diagnostics(),
+                disk_collections() as store,
+                identity_index(IdentityIndex()),
+            ):
+                if config.__dict__.get("_discover_defaults", False):
+                    result = _run_defaults(config, dependencies)
+                else:
+                    result = _run_import(config, dependencies)
+                result.report["resources"] = {
+                    "temporary_limit_bytes": budget.max_bytes,
+                    "temporary_peak_bytes": budget.peak_bytes,
+                    "sqlite_heap_limit_bytes": budget.sqlite_heap_bytes,
+                    "temporary_sql_statements": budget.sql_statements,
+                    "temporary_peak_entries": budget.peak_entries,
+                }
+                budget.retained = store.root
+                return replace(result, _store=store)
+    except resources.TemporaryStorageError as error:
+        # A full result store cannot be used to report its own exhaustion. This
+        # fixed-size emergency envelope allocates no more temporary storage.
+        return _storage_failure_result(config, error, budget)
+    except ConfigurationError as error:
+        if error.code != "temporary_storage_cleanup_failed" or result is None:
+            raise
+        summary = cast(dict[str, Any], result.report["summary"])
+        warnings = cast(list[dict[str, str]], summary["warnings"])
+        failed = result.failed_items
+        if not any(item["code"] in {_RUN_CLEANUP_WARNING, "temporary_storage_cleanup_failed"} for item in warnings):
+            warnings.append({"code": error.code, "message": error.safe_message})
+            summary["failed_items"] += 1
+            failed += 1
+        return replace(result, _store=store, failed_items=failed)
+
+
+def _storage_failure_result(config: ImportConfig, error: ImporterError, budget: Any) -> ImportResult:
+    phase2 = bool(budget and budget.phase2)
+    # Do not retain failed statement/source frames (and their decoded records)
+    # through an exception traceback on the returned lazy API result.
+    error = ImporterError(error.code, error.safe_message, exit_status=1 if phase2 else 2)
+    summary: dict[str, Any] = {
+        key: 0
+        for key in (
+            "selected_sessions",
+            "selected_turns",
+            "imported_turns",
+            "updated_turns",
+            "skipped_turns",
+            "unchanged_turns",
+            "failed_turns",
+            "turns_imported",
+            "turns_updated",
+            "turns_skipped",
+            "turns_failed",
+            "failed_sessions",
+            "failed_retirements",
+            "retired_traces",
+            "unexamined_owned_traces",
+        )
+    }
+    summary.update(
+        failed_items=int(phase2), resource_failures=int(phase2), incomplete=True, recovery_pending=phase2, warnings=[]
+    )
+    if config.dry_run:
+        summary["planned"] = {"imported": 0, "updated": 0, "retired": 0}
+    return ImportResult(
+        config.dry_run,
+        {
+            "schema_version": "mlflow-import.result.v1",
+            "dry_run": config.dry_run,
+            "experiment": {"name": config.experiment_name, "id": None, "status": "unresolved"},
+            "source": {
+                "schema_generation": None,
+                "fingerprint": None,
+                "sessions_scanned": 0,
+                "sessions_selected": 0,
+                "logical_turn_count": 0,
+                "record_count": 0,
+            },
+            "redaction": {
+                "mode": "redacted" if config.redact else "verbatim",
+                "detector_counts": {},
+                "affected_field_count": 0,
+                "affected_record_count": 0,
+            },
+            "summary": summary,
+            "sessions": [],
+            "errors": [{"code": error.code, "message": error.safe_message}],
+            "resources": {
+                "temporary_limit_bytes": budget.max_bytes if budget else 0,
+                "temporary_peak_bytes": budget.peak_bytes if budget else 0,
+            },
+        },
+        error=error,
+        failed_items=int(phase2),
+    )
+
+
+def _register_identities(snapshot: SourceSnapshot, harness: str) -> None:
+    from mlflow_import.compatibility import _IDENTITIES
+
+    index = _IDENTITIES.get()
+    if index is not None:
+        for (native,) in snapshot.connection.execute("SELECT id FROM source_identity_headers"):
+            index.add(harness, snapshot.source_namespace or snapshot.fingerprint, native)
+
+
+def _run_defaults(config: ImportConfig, dependencies: ImportDependencies) -> ImportResult:
+    """Freeze every available adapter-owned root before the first target write.
+
+    Snapshots remain owned by the outer stack throughout sequential consumption.
+    Executable ordering, identity resolution and result aggregation use private
+    disk catalogs; source-root handles are bounded by the adapter registry.
+    """
+    from mlflow_import.sources import ADAPTERS
+
+    reports: DiskList[dict[str, object]] = DiskList()
+    first_error: ImporterError | None = None
+    failed_items = 0
+    cleanup_failed = False
+    mode = RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM
+    try:
+        with ExitStack() as stack:
+            root = dependencies.temp_directory_factory("mlflow-import-defaults-").resolve()
+            if budget := resources.current_storage():
+                budget.adopt(root)
+
+            def cleanup_sources() -> None:
+                nonlocal cleanup_failed
+                cleanup_failed = _cleanup_run_root(root)
+
+            stack.callback(cleanup_sources)
+            frozen_sources: list[tuple[ImportConfig, SourceSnapshot, _CountingRedaction]] = []
+            filters = SelectionFilters(
+                config.from_time,
+                config.to_time,
+                config.directory,
+                config.model,
+                config.min_user_turns,
+                from_time_ns=config.from_time_ns,
+                to_time_ns=config.to_time_ns,
+            )
+            for name, adapter in ADAPTERS.items():
+                if config.harness is not None and config.harness != name:
+                    continue
+                for candidate in adapter.default_sources():
+                    path = candidate.path
+                    selected = replace(config, db_path=path)
+                    for key in ("_session", "_on_conflict", "_from_time_ns", "_to_time_ns"):
+                        object.__setattr__(selected, key, config.__dict__.get(key))
+                    object.__setattr__(selected, "_harness", name)
+                    object.__setattr__(selected, "_source", None)
+                    counting = _CountingRedaction(DeterministicRedactor(mode))
+                    if name == "opencode":
+                        with open_live_connection(path) as live:
+                            description = probe_schema(live.connection)
+                            exporter = dependencies.exporter_factory(live.connection, description)
+                    else:
+                        exporter = adapter.exporter(path)
+                    frozen = stack.enter_context(
+                        _default_snapshot_factory(
+                            path,
+                            root,
+                            exporter,
+                            counting,
+                            SelectionEvidenceEvaluator(filters),
+                            session_id=config.session,
+                        )
+                    )
+                    frozen_sources.append((selected, frozen, counting))
+            if not frozen_sources:
+                raise ConfigurationError("source_unavailable", "no supported default source roots are available")
+            # Complete the identity inventory before resolving any bare alias.
+            # One root's unique native ID may collide with a later root.
+            for selected, frozen, _ in frozen_sources:
+                _register_identities(frozen, selected.harness or "opencode")
+            store = reports.store
+            schedule = "schedule_" + store.table()
+            store.db.execute(
+                f"CREATE TABLE {schedule}(root INTEGER,session TEXT,created INTEGER,harness TEXT,namespace TEXT)"
+            )
+            readers: list[DiscoveryPlanReader] = []
+            for root_index, (selected, frozen, _) in enumerate(frozen_sources):
+                plan_path = root / f"discovery-{root_index}.jsonl"
+                discover_sessions(dependencies.replay_adapter_factory(frozen), filters, plan_path, config.session)
+                reader = DiscoveryPlanReader(plan_path).freeze()
+                readers.append(reader)
+                store.db.executemany(
+                    f"INSERT INTO {schedule} VALUES(?,?,?,?,?)",
+                    (
+                        (root_index, scan.session_id, scan.creation_time_ns, selected.harness, frozen.source_namespace)
+                        for scan in reader.iter_session_scans()
+                    ),
+                )
+
+            def append_report(result: ImportResult, root_index: int) -> None:
+                nonlocal first_error, failed_items
+                selected, frozen, _ = frozen_sources[root_index]
+                sessions = cast(list[dict[str, Any]], result.report["sessions"])
+                for index, session in enumerate(sessions):
+                    session["harness"] = selected.harness
+                    session["source_namespace"] = frozen.source_namespace
+                    sessions[index] = session
+                reports.append(result.report)
+                first_error = first_error or result.error
+                failed_items += result.failed_items
+
+            # All roots pass the read-only conflict/recovery/projection phase
+            # before the first target mutation. Hold one writer lock across it
+            # and the globally ordered write phase.
+            gateway = dependencies.gateway_factory(config.dry_run)
+            with (
+                nullcontext()
+                if config.dry_run
+                else dependencies.lock_factory(gateway.tracking_uri, config.experiment_name)
+            ) as held_lock:
+                for root_index, (selected, frozen, counting) in enumerate(frozen_sources):
+                    preview = replace(selected, dry_run=True)
+                    for key, value in selected.__dict__.items():
+                        if key.startswith("_"):
+                            object.__setattr__(preview, key, value)
+                    append_report(_run_import(preview, dependencies, frozen, counting, readers[root_index]), root_index)
+                if not config.dry_run and first_error is None and failed_items == 0:
+                    reports.clear()
+                    active_dependencies = replace(
+                        dependencies,
+                        gateway_factory=lambda dry_run: gateway,
+                        lock_factory=lambda tracking_uri, experiment_name: nullcontext(cast(ImportLock, held_lock)),
+                    )
+                    reported_roots: set[int] = set()
+                    for root_index, session_id in store.db.execute(
+                        f"SELECT root,session FROM {schedule} "
+                        "ORDER BY created IS NULL,created,session,harness,namespace"
+                    ):
+                        selected, frozen, counting = frozen_sources[root_index]
+                        result = _run_import(
+                            selected, active_dependencies, frozen, counting, readers[root_index].for_session(session_id)
+                        )
+                        if root_index in reported_roots:
+                            redaction = cast(dict[str, Any], result.report["redaction"])
+                            for key, value in redaction.items():
+                                if isinstance(value, int):
+                                    redaction[key] = 0
+                                elif isinstance(value, dict):
+                                    redaction[key] = {name: 0 for name in value}
+                        reported_roots.add(root_index)
+                        append_report(result, root_index)
+                        if result.error is not None:
+                            break
+                elif config.dry_run:
+                    # The same schedule determines result order in preview mode.
+                    sessions_by_key: DiskMap[tuple[str, str, str], dict[str, Any]] = DiskMap()
+                    for report in reports:
+                        for session in cast(list[dict[str, Any]], report["sessions"]):
+                            sessions_by_key[
+                                (session["harness"], session["source_namespace"], session["session_id"])
+                            ] = session
+                    ordered: DiskList[dict[str, Any]] = DiskList()
+                    for harness, namespace, session_id in store.db.execute(
+                        f"SELECT harness,namespace,session FROM {schedule} "
+                        "ORDER BY created IS NULL,created,session,harness,namespace"
+                    ):
+                        ordered.append(sessions_by_key[(harness, namespace, session_id)])
+                    # Attach after numeric aggregation below; keep root reports
+                    # for their source/redaction and selection summaries.
+                    ordered_sessions = ordered
+    except Exception as failure:
+        error = (
+            failure
+            if isinstance(failure, ImporterError)
+            else ConfigurationError("source_discovery_failed", "default source discovery could not be completed")
+        )
+        builder = ReportBuilder(dry_run=config.dry_run, experiment_name=config.experiment_name, redaction_mode=mode)
+        builder.add_error(error.code, error.safe_message)
+        if cleanup_failed:
+            _record_run_cleanup_failure(builder)
+        return ImportResult(
+            dry_run=config.dry_run, report=builder.build(), error=error, failed_items=int(cleanup_failed)
+        )
+    if not reports:
+        builder = ReportBuilder(dry_run=config.dry_run, experiment_name=config.experiment_name, redaction_mode=mode)
+        reports.append(builder.build())
+    report = dict(reports[0])
+    report["dry_run"] = config.dry_run
+    for section in ("summary", "source", "redaction"):
+        merged = dict(cast(dict[str, Any], report[section]))
+        for following in reports[1:]:
+            _merge_report_counts(merged, cast(dict[str, Any], following[section]))
+        report[section] = merged
+    sources: DiskMap[tuple[str, str], dict[str, Any]] = DiskMap()
+    for following in reports:
+        source = cast(dict[str, Any], following["source"])
+        source_key = (str(source.get("schema_generation")), str(source.get("fingerprint")))
+        if source_key not in sources:
+            sources[source_key] = source
+        else:
+            merged_source = sources[source_key]
+            _merge_report_counts(merged_source, source)
+            sources[source_key] = merged_source
+    report["sources"] = DiskList(sources.values())
+    report["sessions"] = (
+        ordered_sessions
+        if config.dry_run
+        else DiskList(session for following in reports for session in cast(list[Any], following["sessions"]))
+    )
+    report["errors"] = DiskList(error for following in reports for error in cast(list[Any], following["errors"]))
+    if cleanup_failed:
+        summary = cast(dict[str, Any], report["summary"])
+        summary["failed_items"] += 1
+        summary["warnings"].append({"code": _RUN_CLEANUP_WARNING, "message": _RUN_CLEANUP_MESSAGE})
+    return ImportResult(
+        dry_run=config.dry_run,
+        report=report,
+        error=first_error,
+        failed_items=failed_items + int(cleanup_failed),
+    )
+
+
+def _merge_report_counts(target: dict[str, Any], incoming: Mapping[str, Any]) -> None:
+    """Merge nested counters without dropping earlier roots' detector/coverage keys."""
+    for key, value in incoming.items():
+        if isinstance(value, int) and not isinstance(value, bool) and key != "generated_ns":
+            target[key] = target.get(key, 0) + value
+        elif isinstance(value, list):
+            target[key] = DiskList(iter_chain(target.get(key, []), value))
+        elif isinstance(value, dict):
+            nested = dict(target.get(key, {}))
+            _merge_report_counts(nested, value)
+            target[key] = nested
+        else:
+            target.setdefault(key, value)
+
+
+def _run_import(
+    config: ImportConfig,
+    dependencies: ImportDependencies,
+    frozen: SourceSnapshot | None = None,
+    counting_override: _CountingRedaction | None = None,
+    reader_override: DiscoveryPlanReader | None = None,
+) -> ImportResult:
     """Run the two-pass import pipeline and return its versioned result.
 
     Pre-write failures (configuration, schema, snapshot, capability,
@@ -604,7 +961,7 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
     items (exit ``1``) while later items continue.
     """
     redaction_mode = RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM
-    counting = _CountingRedaction(DeterministicRedactor(redaction_mode))
+    counting = counting_override or _CountingRedaction(DeterministicRedactor(redaction_mode))
     builder = ReportBuilder(
         dry_run=config.dry_run,
         experiment_name=config.experiment_name,
@@ -617,6 +974,8 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
         directory=config.directory,
         model=config.model,
         min_user_turns=config.min_user_turns,
+        from_time_ns=config.from_time_ns,
+        to_time_ns=config.to_time_ns,
     )
     if not _any_optional_filter(filters, config.session):
         builder.add_warning(BROAD_SELECTION_WARNING, BROAD_SELECTION_MESSAGE)
@@ -624,7 +983,11 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
     result: ImportResult | None = None
     try:
         try:
-            run_root = dependencies.temp_directory_factory("mlflow-import-run-")
+            run_root = dependencies.temp_directory_factory("mlflow-import-run-").resolve()
+            if budget := resources.current_storage():
+                budget.adopt(run_root)
+        except resources.TemporaryStorageError:
+            raise
         except Exception:
             temp_failure = ConfigurationError(_TEMP_DIRECTORY_FAILED, _TEMP_DIRECTORY_FAILED_MESSAGE)
             builder.add_error(temp_failure.code, temp_failure.safe_message)
@@ -636,7 +999,7 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
             )
         else:
             assert run_root is not None
-            result = _run_pipeline(config, dependencies, builder, counting, filters, run_root)
+            result = _run_pipeline(config, dependencies, builder, counting, filters, run_root, frozen, reader_override)
     except ImporterError as error:
         _record_snapshot_cleanup_failure(builder, error)
         builder.add_error(error.code, error.safe_message)
@@ -671,6 +1034,8 @@ def _run_pipeline(
     counting: _CountingRedaction,
     filters: SelectionFilters,
     run_root: Path,
+    frozen: SourceSnapshot | None = None,
+    reader_override: DiscoveryPlanReader | None = None,
 ) -> ImportResult:
     """Phases 1-7: source, snapshot, discovery, and the global preflight."""
     redaction_mode = RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM
@@ -679,11 +1044,14 @@ def _run_pipeline(
     # registered exporter bound to it, then the connection closes before
     # extraction (the snapshot driver opens and closes its own).
     exporter: SourceExporter
-    if config.harness in {"claude", "codex"}:
-        from mlflow_import.sources.claude import exporter as claude_exporter
-        from mlflow_import.sources.codex import exporter as codex_exporter
+    if frozen is not None:
+        description = frozen.schema_description
+        exporter = cast(SourceExporter, None)
+        candidate_ids = None
+    elif config.harness in {"claude", "codex", "pi", "gemini"}:
+        from mlflow_import.sources import get_adapter
 
-        exporter = (claude_exporter if config.harness == "claude" else codex_exporter)(config.db_path)
+        exporter = get_adapter(config.harness).exporter(config.db_path)
         description = exporter.inspect()
         candidate_ids = None
     else:
@@ -693,19 +1061,25 @@ def _run_pipeline(
             candidate_ids = candidate_session_ids(live.connection, description, filters, config.session)
 
     snapshot_started = _debug_phase_started(config, "snapshot")
-    with _snapshot_reporting_context(
-        dependencies.snapshot_factory,
-        config.db_path,
-        run_root,
-        exporter,
-        counting,
-        SelectionEvidenceEvaluator(filters),
-        session_id=config.session,
-        session_ids=candidate_ids,
-        progress_callback=_snapshot_progress_callback(config),
-        require_selection_evidence=filters.directory is not None or filters.model is not None,
-        builder=builder,
+    with (
+        nullcontext(frozen)
+        if frozen is not None
+        else _snapshot_reporting_context(
+            dependencies.snapshot_factory,
+            config.db_path,
+            run_root,
+            exporter,
+            counting,
+            SelectionEvidenceEvaluator(filters),
+            session_id=config.session,
+            session_ids=candidate_ids,
+            progress_callback=_snapshot_progress_callback(config),
+            require_selection_evidence=filters.directory is not None or filters.model is not None,
+            builder=builder,
+        )
     ) as snapshot:
+        if reader_override is None:
+            _register_identities(snapshot, config.harness or "opencode")
         _debug_phase_completed(
             config,
             "snapshot",
@@ -724,7 +1098,23 @@ def _run_pipeline(
         adapter = dependencies.replay_adapter_factory(snapshot)
         plan_path = run_root / DISCOVERY_PLAN_FILENAME
         discovery_started = _debug_phase_started(config, "discovery")
-        stats = discover_sessions(adapter, filters, plan_path, config.session)
+        if reader_override is None:
+            stats = discover_sessions(adapter, filters, plan_path, config.session)
+            reader = DiscoveryPlanReader(plan_path).freeze()
+        else:
+            from mlflow_import.source.discovery import DiscoveryStats
+
+            reader = reader_override
+            scans = list(reader.iter_session_scans())  # exactly one session in an ordered view
+            stats = DiscoveryStats(
+                len(scans),
+                sum(scan.selected for scan in scans),
+                sum(1 for _ in reader.iter_turns()),
+                sum(scan.tombstone for scan in scans),
+                0,
+                0,
+                plan_path,
+            )
         _debug_phase_completed(
             config,
             "discovery",
@@ -736,7 +1126,6 @@ def _run_pipeline(
         builder.set_source_counts(
             sessions_scanned=stats.session_scan_count, sessions_selected=stats.selected_session_count
         )
-        reader = DiscoveryPlanReader(plan_path)
         for scan in reader.iter_session_scans():
             builder.add_session_scan(
                 scan.session_id,
@@ -758,6 +1147,28 @@ def _run_pipeline(
         require_capabilities(capability)
         _debug_phase_completed(config, "capability preflight", capability_started)
 
+        pending_excluded = 0
+        if isinstance(gateway, MlflowGateway) and (reader_override is None or reader_override._session_id is None):
+            existing = _resolve_existing_experiment(gateway, config.experiment_name)
+            if existing is not None and existing.experiment_id is not None:
+                namespace = snapshot.source_namespace or snapshot.fingerprint
+                harness = config.harness or "opencode"
+                selected_ids = DiskMap((scan.session_id, True) for scan in reader.iter_session_scans() if scan.selected)
+                for session_id in gateway.pending_sessions(
+                    existing.experiment_id, f"mlflow-import/v2/{harness}/{namespace}"
+                ):
+                    if config.session is not None and config.session != session_id:
+                        continue
+                    if session_id not in selected_ids:
+                        pending_excluded += 1
+                        builder.add_session_error(session_id, "recovery_pending")
+                if pending_excluded:
+                    builder.add_error(
+                        "recovery_pending",
+                        "unfinished attempts require relaxing time, directory, "
+                        "model or minimum-turn filters for the reported sessions",
+                    )
+
         if config.dry_run:
             result = _run_dry(config, dependencies, builder, gateway, snapshot, reader)
         else:
@@ -776,6 +1187,8 @@ def _run_pipeline(
                     run_root=run_root,
                 )
 
+    if pending_excluded:
+        result = replace(result, failed_items=result.failed_items + pending_excluded, report=builder.build())
     return result
 
 
@@ -848,7 +1261,11 @@ def _run_dry(
     planning_started = _debug_phase_started(config, "planning and owned-trace lookup")
     experiment = gateway.resolve_experiment(config.experiment_name, create=True)
     _record_experiment(builder, experiment)
-    plan = plan_reconciliation(reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment))
+    plan = plan_reconciliation(
+        reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment, snapshot, reader)
+    )
+    if isinstance(gateway, MlflowGateway):
+        _prepare_pricing_bases(config, gateway, experiment, snapshot, reader, snapshot.snapshot_path.parent)
     builder.set_unexamined_owned_traces(len(plan.unexamined_owned_traces))
     _debug_phase_completed(config, "planning and owned-trace lookup", planning_started, turns=len(plan.results))
 
@@ -950,12 +1367,19 @@ def _run_normal(
     # happen before every pre-write check has passed.
     planning_started = _debug_phase_started(config, "planning and owned-trace lookup")
     experiment = _resolve_existing_experiment(gateway, config.experiment_name)
-    plan = plan_reconciliation(reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment))
+    plan = plan_reconciliation(
+        reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment, snapshot, reader)
+    )
     builder.set_unexamined_owned_traces(len(plan.unexamined_owned_traces))
     _debug_phase_completed(config, "planning and owned-trace lookup", planning_started, turns=len(plan.results))
 
     # Phase 11: every replay fingerprint check passes before any mutation.
     replay = dependencies.replay_builder(snapshot)
+    pricing_basis_for = (
+        _prepare_pricing_bases(config, gateway, experiment, snapshot, reader, run_root)
+        if isinstance(gateway, MlflowGateway)
+        else None
+    )
     replay_started = _debug_phase_started(config, "replay fingerprint validation")
     _verify_replayed_fingerprints(reader.iter_turns(), replay)
     _debug_phase_completed(config, "replay fingerprint validation", replay_started, turns=len(plan.results))
@@ -989,7 +1413,23 @@ def _run_normal(
         staging_directory=staging,
     )
     reconciliation_started = _debug_phase_started(config, "reconciliation")
-    apply_reconciliation(plan, gateway, reconciliation, dependencies.retry_policy)
+
+    def replay_session(session_id: str) -> ReplayTurn:
+        header = NormalizedSnapshotAdapter(snapshot).session_header(session_id)
+        if header is None:
+            raise ImporterError("replay_session_unavailable", "a selected frozen session is unavailable")
+        return build_replay_turn(snapshot, header, TurnSummary(session_id, 0, ""))
+
+    reconciliation = replace(
+        reconciliation,
+        conflict_policy=config.on_conflict,
+        replay_session=replay_session,
+        experiment_id=experiment.experiment_id,
+        pricing_basis_for=pricing_basis_for,
+    )
+    apply_reconciliation(
+        plan, gateway, reconciliation, dependencies.retry_policy, session_wide=isinstance(gateway, MlflowGateway)
+    )
     _debug_phase_completed(
         config,
         "reconciliation",
@@ -998,8 +1438,62 @@ def _run_normal(
     )
 
     failed_items = _record_normal_results(builder, plan, reader.iter_turns())
-    builder.set_retired_traces(sum(len(result.retired_trace_ids) for result in plan.results))
+    retired_ids: DiskMap[str, bool] = DiskMap()
+    for result in plan.results:
+        for trace_id in result.retired_trace_ids:
+            retired_ids[trace_id] = True
+    for trace_id in plan.confirmed_retirements:
+        retired_ids[trace_id] = True
+    builder.set_retired_traces(len(retired_ids))
     return ImportResult(dry_run=False, report=builder.build(), failed_items=failed_items)
+
+
+def _prepare_pricing_bases(
+    config: ImportConfig,
+    gateway: MlflowGateway,
+    experiment: ExperimentRef | None,
+    snapshot: SourceSnapshot,
+    reader: DiscoveryPlanReader,
+    directory: Path,
+) -> Callable[[str], Mapping[str, dict[str, Any]]]:
+    """Freeze instance-scoped verified pricing donors during read-only planning."""
+    from mlflow_import.content.accounting import freeze_pricing_bases
+    from mlflow_import.content.bundles import source_prefix
+    from mlflow_import.mlflow.attempts import AttemptJournal
+    from mlflow_import.mlflow.reconciliation import _select_pricing_basis
+    from mlflow_import.retry import check_budget
+    from mlflow_import.source.turns import build_replay_turn, indexed_turn_summaries
+
+    mode = RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM
+    adapter = NormalizedSnapshotAdapter(snapshot)
+    bases: DiskMap[str, Mapping[str, dict[str, Any]]] = DiskMap()
+    for scan in reader.iter_session_scans():
+        check_budget()
+        if not scan.selected:
+            continue
+        selected: Mapping[str, dict[str, Any]] = {}
+        header = adapter.session_header(scan.session_id)
+        if header is None:
+            raise ConfigurationError("replay_session_unavailable", "a selected source header is missing")
+        if experiment is not None and experiment.experiment_id is not None:
+            prefix = source_prefix(header, mode).rsplit("/", 1)[0]
+            states = DiskList(AttemptJournal(gateway, experiment.experiment_id, prefix).attempts())
+            if sum("complete" not in state and "aborted" not in state for state in states) > 1:
+                raise ConfigurationError("attempt_state_conflict", "multiple unfinished attempts require recovery")
+            selected = _select_pricing_basis(states, gateway, config.on_conflict)
+        selected = freeze_pricing_bases(
+            (
+                build_replay_turn(snapshot, header, summary)
+                for summary in indexed_turn_summaries(snapshot, scan.session_id)
+            ),
+            selected,
+        )
+        bases[scan.session_id] = selected
+
+    def load(session_id: str) -> Mapping[str, dict[str, Any]]:
+        return bases.get(session_id, {})
+
+    return load
 
 
 def _prepare_staging_directory(run_root: Path) -> Path:
@@ -1008,6 +1502,8 @@ def _prepare_staging_directory(run_root: Path) -> Path:
     try:
         if not run_root.is_dir():
             raise OSError("run root is not a directory")
+        if budget := resources.current_storage():
+            budget.resize(staging, 0)
         staging.mkdir(mode=0o700, exist_ok=True)
         if not staging.is_dir():
             raise OSError("staging path is not a directory")
@@ -1047,7 +1543,12 @@ def _record_experiment(builder: ReportBuilder, experiment: ExperimentRef) -> Non
     builder.set_experiment(experiment.experiment_id, status)
 
 
-def _owned_candidates(gateway: MlflowGateway, experiment: ExperimentRef | None) -> list[OwnedTraceCandidate]:
+def _owned_candidates(
+    gateway: MlflowGateway,
+    experiment: ExperimentRef | None,
+    snapshot: SourceSnapshot | None = None,
+    reader: DiscoveryPlanReader | None = None,
+) -> list[OwnedTraceCandidate]:
     """Index the experiment's importer-owned traces (read-only search).
 
     A missing (or dry-run planned) experiment has no owned traces to look
@@ -1055,10 +1556,35 @@ def _owned_candidates(gateway: MlflowGateway, experiment: ExperimentRef | None) 
     """
     if experiment is None or experiment.experiment_id is None:
         return []
-    return [
+    if isinstance(gateway, MlflowGateway) and snapshot is not None and reader is not None:
+        from mlflow_import.identity import qualified_session
+
+        adapter = NormalizedSnapshotAdapter(snapshot)
+        candidates: list[OwnedTraceCandidate] = DiskList()
+        for scan in reader.iter_session_scans():
+            if not scan.selected:
+                continue
+            header = adapter.session_header(scan.session_id)
+            if header is None:
+                raise ConfigurationError("replay_session_unavailable", "a selected session header is missing")
+            for trace in gateway.iter_session_traces(
+                experiment.experiment_id, scan.session_id, qualified_session(header)
+            ):
+                from mlflow_import.compatibility import decode_ownership
+
+                namespace = decode_ownership(trace.tags, trace.metadata).get("mlflow_import.source_namespace")
+                if namespace is not None and namespace != header.source_fingerprint:
+                    continue
+                candidate = OwnedTraceCandidate.from_owned_trace(trace, experiment.experiment_id)
+                if not candidate.ownership_complete:
+                    gateway.remember_foreign(qualified_session(header), scan.session_id, trace)
+                    continue
+                candidates.append(candidate)
+        return candidates
+    return DiskList(
         OwnedTraceCandidate.from_owned_trace(trace, experiment.experiment_id)
         for trace in gateway.iter_owned_traces(experiment.experiment_id)
-    ]
+    )
 
 
 def _record_normal_results(
@@ -1067,16 +1593,27 @@ def _record_normal_results(
     turns: Iterable[DiscoveryTurnEntry],
 ) -> int:
     """Record the applied reconciliation outcomes in plan order."""
-    failed_items = sum(1 for result in plan.results if result.action == ACTION_FAILED)
-    results_by_key: dict[tuple[str, str], ReconciliationAction] = {}
-    retirements_by_trace: dict[str, ReconciliationAction] = {}
+    failed_items = sum(1 for result in plan.results if result.action == ACTION_FAILED) + len(plan.session_errors)
+    for session_id, code in plan.session_errors.items():
+        builder.add_session_error(session_id, code)
+    for session_id, values in plan.session_attempts.items():
+        builder.set_session_attempt(session_id, values)
+    results_by_key: MutableMapping[tuple[str, str], ReconciliationAction] = DiskMap()
+    retirements_by_trace: MutableMapping[str, ReconciliationAction] = DiskMap()
+    reported_retirements: DiskMap[str, bool] = DiskMap()
     for applied in plan.results:
+        for trace_id in applied.retired_trace_ids:
+            reported_retirements[trace_id] = True
         if applied.turn is None and applied.trace_id is not None:
             retirements_by_trace[applied.trace_id] = applied
             continue
         key = _result_key(applied)
         if key is not None:
             results_by_key[key] = applied
+    unreported_by_session: DiskMap[str, list[str]] = DiskMap()
+    for trace_id, session_id in plan.confirmed_retirements.items():
+        if trace_id not in reported_retirements:
+            unreported_by_session.setdefault(session_id, DiskList()).append(trace_id)
     for entry in turns:
         outcome = results_by_key.get((entry.session_id, entry.turn_key))
         if outcome is None:
@@ -1093,6 +1630,10 @@ def _record_normal_results(
                 )
             )
             continue
+        recovered = tuple(unreported_by_session.pop(entry.session_id, ()))
+        for trace_id in recovered:
+            reported_retirements[trace_id] = True
+        outcome = replace(outcome, retired_trace_ids=outcome.retired_trace_ids + recovered)
         builder.add_turn(
             TurnResult(
                 session_id=entry.session_id,
@@ -1106,6 +1647,9 @@ def _record_normal_results(
                 retired_trace_ids=outcome.retired_trace_ids,
                 conflicting_trace_ids=outcome.conflicting_trace_ids,
                 warnings=entry.warnings,
+                attempt_id=outcome.attempt_id,
+                import_instance_id=outcome.import_instance_id,
+                attempt_state=outcome.attempt_state,
             )
         )
     for action in plan.retirements:
@@ -1129,8 +1673,23 @@ def _record_normal_results(
                 retired_trace_ids=outcome.retired_trace_ids if outcome is not None else (),
                 conflicting_trace_ids=outcome.conflicting_trace_ids if outcome is not None else (),
                 warnings=candidate.warnings,
+                attempt_id=outcome.attempt_id if outcome else None,
+                import_instance_id=outcome.import_instance_id if outcome else None,
+                attempt_state=outcome.attempt_state if outcome else None,
             )
         )
+    for session_id, trace_ids in unreported_by_session.items():
+        for trace_id in trace_ids:
+            builder.add_turn(
+                TurnResult(
+                    session_id=session_id,
+                    turn_key="",
+                    action=ACTION_RETIRED,
+                    trace_id=trace_id,
+                    source_present=False,
+                    retired_trace_ids=(trace_id,),
+                )
+            )
     return failed_items
 
 
@@ -1169,7 +1728,7 @@ def _default_snapshot_factory(
     redaction: RedactionCallback,
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
-    session_ids: frozenset[str] | None = None,
+    session_ids: Collection[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> AbstractContextManager[SourceSnapshot]:
     """The production normalized-snapshot factory."""
@@ -1195,7 +1754,7 @@ def _snapshot_reporting_context(
     redaction: RedactionCallback,
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
-    session_ids: frozenset[str] | None = None,
+    session_ids: Collection[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     *,
     require_selection_evidence: bool,
@@ -1234,7 +1793,7 @@ def _open_snapshot(
     redaction: RedactionCallback,
     selection_evaluator: SelectionEvidenceEvaluator,
     session_id: str | None = None,
-    session_ids: frozenset[str] | None = None,
+    session_ids: Collection[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     *,
     require_selection_evidence: bool,
@@ -1349,7 +1908,7 @@ def _finalize_result(result: ImportResult, builder: ReportBuilder) -> ImportResu
 def _cleanup_run_root(run_root: Path) -> bool:
     """Remove the run root and return whether safe cleanup reporting is needed."""
     try:
-        shutil.rmtree(run_root)
+        resources.remove_tree(run_root)
     except Exception:
         # The report must never expose the path or exception details. The
         # caller records one generic invocation-level cleanup warning.
@@ -1398,7 +1957,7 @@ def build_dependencies(config: ImportConfig) -> ImportDependencies:
         return acquire_import_lock(tracking_endpoint, experiment_name, resolve_lock_root())
 
     def temp_directory_factory(prefix: str) -> Path:
-        return Path(tempfile.mkdtemp(prefix=prefix))
+        return resources.make_temp_dir(prefix=prefix)
 
     return ImportDependencies(
         snapshot_factory=_default_snapshot_factory,

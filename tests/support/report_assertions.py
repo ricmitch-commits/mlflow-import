@@ -56,7 +56,7 @@ def assert_counts_are_disjoint(report: Mapping[str, object]) -> None:
     """Assert the summary's count units partition the report's entries exactly.
 
     Every current turn (``source_present`` true) is counted in exactly one
-    of the imported/updated/skipped/failed buckets; every failed entry —
+    of the imported/updated/unchanged/skipped/failed buckets; every failed entry —
     including a failed trace retirement, which is a stale entry — counts
     in ``turns_failed``; retired traces are reported separately as
     ``retired_traces`` and never count as current turns.
@@ -66,6 +66,8 @@ def assert_counts_are_disjoint(report: Mapping[str, object]) -> None:
     entries = [turn for session in report["sessions"] for turn in session["turns"]]
     current = [turn for turn in entries if turn["source_present"]]
     failed = [turn for turn in entries if turn["action"] == "failed"]
+    unchanged = [turn for turn in current if turn["action"] == "skipped" and turn["reason"] == "unchanged"]
+    assert summary["unchanged_turns"] == len(unchanged)
 
     assert summary["turns_failed"] == len(failed)
     for bucket, action in (
@@ -73,11 +75,11 @@ def assert_counts_are_disjoint(report: Mapping[str, object]) -> None:
         ("turns_updated", "updated"),
         ("turns_skipped", "skipped"),
     ):
-        assert summary[bucket] == len([turn for turn in current if turn["action"] == action])
+        assert summary[bucket] == len([turn for turn in current if turn["action"] == action and turn not in unchanged])
     # Every current turn is counted exactly once: the non-failed ones across
     # the imported/updated/skipped buckets, the failed ones (current failed
     # writes and stale failed retirements alike) in turns_failed.
-    assert summary["turns_imported"] + summary["turns_updated"] + summary["turns_skipped"] == len(
+    assert summary["turns_imported"] + summary["turns_updated"] + summary["turns_skipped"] + len(unchanged) == len(
         [turn for turn in current if turn["action"] != "failed"]
     )
     retired_entries = [turn for turn in entries if turn["action"] == "retired"]

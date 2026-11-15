@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import heapq
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import replace
 from operator import itemgetter
 
 from mlflow_import.errors import SourceCompatibilityError
 from mlflow_import.source.catalog import CURRENT_CATALOG_V1, LEGACY_CATALOG_V1
 from mlflow_import.source.current import CurrentAdapter
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.legacy import LegacyAdapter
 from mlflow_import.source.model import (
     SchemaDescription,
@@ -114,20 +115,22 @@ class MixedAdapter:
         writer: SnapshotWriter,
         redaction: RedactionCallback,
         session_id: str | None = None,
-        session_ids: frozenset[str] | None = None,
+        session_ids: Collection[str] | None = None,
     ) -> ExportStats:
-        overlaps = self._current.session_ids() & self._legacy.session_ids()
-        if session_ids is not None:
-            overlaps &= set(session_ids)
-        elif session_id is not None:
-            overlaps &= {session_id}
+        overlaps = DiskIds(
+            str(row[0])
+            for row in self._current.connection.execute(
+                "SELECT DISTINCT c.id FROM session_v2 c JOIN session l ON c.id=l.id WHERE c.id IS NOT NULL"
+            )
+            if (session_ids is None or str(row[0]) in session_ids) and (session_id is None or str(row[0]) == session_id)
+        )
         self._current.begin_export(
-            overlap_session_ids=frozenset(overlaps),
+            overlap_session_ids=overlaps,
             selected_session_id=session_id,
             selected_session_ids=session_ids,
         )
         self._legacy.begin_export(
-            suppressed_session_ids=frozenset(overlaps),
+            suppressed_session_ids=overlaps,
             selected_session_id=session_id,
             selected_session_ids=session_ids,
         )

@@ -34,14 +34,14 @@ from __future__ import annotations
 import os
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from mlflow_import.config import normalize_model_identity
 from mlflow_import.source.model import SessionHeader, SourceRecord
 from mlflow_import.source.model_identity import extract_model_identity
 
-_MODEL_EVIDENCE_TABLES = frozenset({"message", "part", "session_message"})
+_MODEL_EVIDENCE_TABLES = frozenset({"message", "part", "session_message", "jsonl_message", "jsonl"})
 
 __all__ = [
     "SelectionEvidence",
@@ -69,8 +69,9 @@ class SelectionEvidenceEvaluator:
     filters: SelectionFilters
 
     def session_evidence(self, header: SessionHeader) -> SelectionEvidence:
+        directory = header.directory or header.path
         directory_match = self.filters.directory is None or (
-            header.directory is not None and matches_directory(Path(header.directory), self.filters.directory)
+            directory is not None and matches_directory(Path(directory), self.filters.directory)
         )
         identity = extract_model_identity(header.model)
         model_match = self.filters.model is None or (
@@ -107,6 +108,8 @@ class SelectionFilters:
     directory: Path | None = None
     model: str | None = None
     min_user_turns: int | None = None
+    from_time_ns: int | None = None
+    to_time_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ class SessionDiscoverySummary:
     logical_turn_count: int
     warnings: tuple[str, ...] = ()
     complete_scan: bool = True
+    creation_time_ns: int | None = None
 
 
 def matches_directory(candidate: Path, requested: Path) -> bool:
@@ -185,7 +189,7 @@ def select_session(
     eligible session imports every logical turn, never only the turns
     beyond the threshold.
     """
-    if not _matches_creation_time(summary.creation_time, filters):
+    if not _matches_creation_time(summary.creation_time, filters, summary.creation_time_ns):
         return False
     if filters.directory is not None:
         directory_match = (
@@ -205,14 +209,42 @@ def select_session(
     return True
 
 
-def _matches_creation_time(creation_time: datetime | None, filters: SelectionFilters) -> bool:
+def instant_ns(value: datetime) -> int:
+    """Convert a timezone-qualified CLI bound without floating-point rounding."""
+    delta = value - datetime(1970, 1, 1, tzinfo=UTC)
+    return ((delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds) * 1000
+
+
+def time_bounds(filters: SelectionFilters) -> tuple[int | None, int | None]:
+    lower = (
+        filters.from_time_ns
+        if filters.from_time_ns is not None
+        else instant_ns(filters.from_time)
+        if filters.from_time
+        else None
+    )
+    upper = (
+        filters.to_time_ns
+        if filters.to_time_ns is not None
+        else instant_ns(filters.to_time)
+        if filters.to_time
+        else None
+    )
+    return lower, upper
+
+
+def _matches_creation_time(
+    creation_time: datetime | None, filters: SelectionFilters, creation_ns: int | None = None
+) -> bool:
     """Apply inclusive creation-time bounds; missing times stay eligible without them."""
-    if filters.from_time is None and filters.to_time is None:
+    lower, upper = time_bounds(filters)
+    if lower is None and upper is None:
         return True
-    if creation_time is None:
+    if creation_time is None and creation_ns is None:
         return False
-    if filters.from_time is not None and creation_time < filters.from_time:
+    observed = creation_ns if creation_ns is not None else instant_ns(creation_time)  # type: ignore[arg-type]
+    if lower is not None and observed < lower:
         return False
-    if filters.to_time is not None and creation_time > filters.to_time:
+    if upper is not None and observed > upper:
         return False
     return True

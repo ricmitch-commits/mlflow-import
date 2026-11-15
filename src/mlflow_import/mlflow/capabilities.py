@@ -36,10 +36,8 @@ Capability failure aborts the entire invocation before mutation through
 
 from __future__ import annotations
 
-import base64
 import inspect
 import json
-import os
 import re
 import ssl
 import urllib.error
@@ -88,7 +86,7 @@ MAX_VERSION_RESPONSE_BYTES = 64 * 1024
 #: byte-exact through span inputs/outputs (larger payloads must become named
 #: trace artifacts). Reported as the target's payload limit when the
 #: recorded profile applies.
-PINNED_MAX_INLINE_PAYLOAD_BYTES = 1_048_576
+PINNED_MAX_INLINE_PAYLOAD_BYTES = 4_194_304
 
 #: The pinned public operations the writer depends on — identical to the
 #: profile's ``REQUIRED_METHODS`` (pinned by the gateway contract test).
@@ -253,6 +251,21 @@ def probe_capabilities(
         errors.append("tracking server version attestation failed")
 
     profile_backed = profile_applies and server_version_attested
+
+    # Historical native fields require the pinned public object-ingestion API;
+    # detached-span availability alone does not establish native parity.
+    try:
+        from mlflow.entities import Span, TraceInfo
+        from mlflow.tracing.client import TracingClient
+
+        if not callable(getattr(Span, "from_dict", None)) or not callable(TraceInfo):
+            errors.append("the public historical trace objects are unavailable")
+        for method, keywords in (("start_trace", {"trace_info"}), ("log_spans", {"location", "spans"})):
+            operation = getattr(TracingClient, method, None)
+            if not callable(operation) or not keywords <= inspect.signature(operation).parameters.keys():
+                errors.append("the public historical trace ingestion API is unavailable")
+    except (ImportError, TypeError, ValueError):
+        errors.append("the public historical trace ingestion API is unavailable")
 
     # 2. Module-level public trace API: availability plus signature shape.
     start_span: Any = getattr(mlflow, "start_span_no_context", None)
@@ -426,48 +439,14 @@ def _enforce_version_response_size(response: object) -> None:
         raise _VersionAttestationFailure("tracking server version attestation returned a malformed response")
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Fail closed instead of forwarding authorization to a redirected host."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
-        return None
-
-
 def _http_version_transport(tracking_uri: str | None) -> Mapping[str, object]:
     """Read the server version through stdlib HTTP and standard env config."""
     endpoint = version_endpoint(tracking_uri or "")
-    headers = {"Accept": "application/json", "User-Agent": "mlflow-import-capability-probe"}
-    token = os.environ.get("MLFLOW_TRACKING_TOKEN")
-    username = os.environ.get("MLFLOW_TRACKING_USERNAME")
-    password = os.environ.get("MLFLOW_TRACKING_PASSWORD")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif username is not None or password is not None:
-        raw = f"{username or ''}:{password or ''}".encode()
-        headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+    from mlflow_import.resources import artifact_http_configuration
 
+    opener, headers = artifact_http_configuration()
+    headers["Accept"] = "application/json"
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
-    context = ssl.create_default_context()
-    insecure = os.environ.get("MLFLOW_TRACKING_INSECURE_TLS", "").strip().lower() in {"1", "true", "yes", "on"}
-    if insecure:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    else:
-        ca_path = (
-            os.environ.get("MLFLOW_TRACKING_SERVER_CERT_PATH")
-            or os.environ.get("REQUESTS_CA_BUNDLE")
-            or os.environ.get("CURL_CA_BUNDLE")
-        )
-        if ca_path:
-            if os.path.isdir(ca_path):
-                context.load_verify_locations(capath=ca_path)
-            else:
-                context.load_verify_locations(cafile=ca_path)
-    client_cert_path = os.environ.get("MLFLOW_TRACKING_CLIENT_CERT_PATH")
-    if client_cert_path:
-        context.load_cert_chain(certfile=client_cert_path)
-
-    opener = urllib.request.build_opener(_NoRedirectHandler(), urllib.request.HTTPSHandler(context=context))
     try:
         with opener.open(request, timeout=VERSION_ATTESTATION_TIMEOUT_SECONDS) as response:
             status_value = getattr(response, "status", None)

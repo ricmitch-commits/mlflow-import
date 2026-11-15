@@ -72,7 +72,7 @@ PINNED_MLFLOW_VERSION = "3.17.2"
 #: Largest inline payload (bytes) the profile verifies to round-trip byte-exact
 #: through span inputs/outputs. Larger session payloads must be written as
 #: named trace artifacts instead of inline span data.
-MAX_INLINE_PAYLOAD_BYTES = 1_048_576
+MAX_INLINE_PAYLOAD_BYTES = 4_194_304
 
 #: Fixed read block (bytes) used when hashing, staging, and re-reading artifact
 #: payloads so no whole file is ever held in memory.

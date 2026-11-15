@@ -2,17 +2,17 @@
 
 One-shot CLI that imports coding-agent sessions into MLflow as traces.
 
-`mlflow-import` reads supported session records from OpenCode, Claude Code,
-Codex, PI, and Gemini CLI, reconstructs their logical turns, and writes one
+`mlflow-import` targets session import from OpenCode, Claude Code,
+Codex, PI, and Gemini CLI. The fixture-qualified adapters reconstruct logical turns and write one
 MLflow trace per turn — with child spans for messages, tool calls, and
-content, a streamed canonical JSON artifact per turn, and deterministic
+content, shared session JSON plus reusable turn maps and a manifest, and deterministic
 re-run behavior: an unchanged session imports once, a changed turn replaces
 only that turn's trace, and traces the source no longer carries are retired.
 
 Each harness is handled by a source adapter. Adapters discover and normalize
 the harness's supported local session format while preserving source identity,
 ordering, timing, metadata, and raw records where MLflow has no native field.
-The trace/session `source` value (`mlflow.source.name` in MLflow metadata) is
+The trace/session `source` value (`mlflow.source.name` in creation tags) is
 the canonical harness name: `opencode`, `claude`, `codex`, `pi`, or `gemini`.
 The `--source PATH` option selects local input; its path is not the exported
 `source` value.
@@ -31,18 +31,39 @@ Version 0.1.0. The fixture-qualified target pair is the
 `mlflow==3.17.2` client against a server launched from that same
 installation, with an explicit SQLite backend and a same-host `file://`
 experiment artifact root (see [docs/compatibility.md](docs/compatibility.md)).
-All five source adapters have synthetic fixture coverage in this
-checkout; see the compatibility document for the exact schema signatures
-and explicit non-support. Known limitations are recorded in
+The qualified implementation has synthetic end-to-end, resource and independent
+review evidence; final post-audit verification/sign-off is tracked in
+[docs/errors.md](docs/errors.md). OpenCode has verified reference-scale evidence. All five have
+fixture-backed [source processing](docs/source-adapters.md) and independent
+[native/structured readback](docs/projection-parity.md), with explicit supported
+schema, pricing and unavailable-data boundaries. This is not a claim that local
+storage retained every live-plugin observation. See
+[docs/compatibility.md](docs/compatibility.md) for tested boundaries,
+[docs/errors.md](docs/errors.md) for resolved failures and final verification status, and
 [CHANGELOG.md](CHANGELOG.md).
+
+The qualified projection is `mapping-v8` / `accounting-v2`: invocation-aware
+usage, persisted-first costs, reproducible frozen API-price bases and actual
+versioned coverage. Unknown USD costs remain absent native values, not zeros or
+server-generated prices. Source-schema, model/rate and payload limits remain
+explicit in the profile documentation.
+
+OpenCode native trace info follows the `@mlflow/opencode` 0.4.0 reference:
+bare session/parent IDs, semantic assistant completion time, plain-text previews,
+input/output/reasoning totals, and NULL native cache/cost fields. Richer source
+accounting remains in spans and canonical artifacts. Native client request IDs
+are source-only; operation keys and qualified identity live in initial ownership
+tags. See [projection parity](docs/projection-parity.md) for the exact contract.
 
 ### Wire-contract compatibility
 
 New traces and results use the neutral `mlflow_import.*` identifiers and
 `mlflow-import.result.v1`. Legacy `opencode.*` ownership metadata and
-`opencode-mlflow.result.v1` documents are decoded through
-`mlflow_import.legacy`; unknown versions are never guessed into the new
-contract. See
+legacy trace fields are recognized by reconciliation. The typed `compatibility-v1`
+decoder reads both `mlflow-import.result.v1` and `opencode-mlflow.result.v1`, retaining
+the original schema. Historical producer compatibility is fixture/live-qualified
+for revision `36ed44f`; other historical variants are not blanket-qualified, and
+old unbound in-flight journals are not automatically upgraded. See
 [docs/operations.md](docs/operations.md),
 [docs/compatibility.md](docs/compatibility.md), and
 [docs/result-schema.md](docs/result-schema.md).
@@ -144,8 +165,8 @@ mlflow-import --experiment-name NAME [options]
 | `--session SESSION-ID` | Restrict selection to the source session with this ID. The whole session is selected, including all of its logical turns. |
 | `--on-conflict duplicate\|overwrite\|ignore` | How to handle a session that already exists in MLflow, including sessions not previously imported by this tool. Default: `overwrite`. `duplicate` imports another copy, `overwrite` replaces the conflicting session, and `ignore` skips the incoming session. |
 | `--tracking-uri URI` | MLflow tracking URI; otherwise standard MLflow client/environment configuration. |
-| `--from-time ISO` | Inclusive lower bound on session **creation** time. Requires an explicit timezone offset or `Z`. |
-| `--to-time ISO` | Inclusive upper bound on session creation time. Requires an explicit timezone offset or `Z`. |
+| `--from-time DATE\|ISO` | Inclusive creation-time lower bound; date-only means `00:00:00Z`. Timestamps require an offset or `Z`. |
+| `--to-time DATE\|ISO` | Inclusive creation-time upper bound; date-only means `23:59:59Z` (excludes later fractional seconds). |
 | `--directory PATH` | Restrict to sessions in this directory and all component-descendants. |
 | `--model PROVIDER/MODEL` | Exact normalized model identity match. |
 | `--min-user-turns N` | Select sessions with strictly more than `N` logical user turns. Omitted = no restriction. |
@@ -178,8 +199,8 @@ Selection semantics worth knowing before your first run:
   previously imported by this tool; `duplicate` creates another copy without
   retiring the existing one; and `ignore` leaves the existing session
   unchanged and skips the incoming session.
-- Timestamps require an explicit timezone offset or `Z`. Bounds are
-  inclusive and apply only to the session's creation time.
+- Date-only bounds use UTC day boundaries. Timestamps require an explicit
+  timezone offset or `Z`. Bounds are inclusive and use source creation time.
 - Every supplied filter combines with logical AND; an omitted filter
   imposes no restriction.
 - A run with **no** optional selection filter carries a
@@ -197,3 +218,15 @@ server/API, or keep a background process running. It does not use an ORM, does
 not write to MLflow's backend store directly, and uses only public MLflow
 client APIs. See [CHANGELOG.md](CHANGELOG.md) for the full excluded-scope
 list.
+
+## Synthetic benchmark
+
+The strengthened disposable local gate verified **307 sessions** and
+**494 / 494 / 495 / 495 turns** across fresh, unchanged, append and edit phases,
+including exact paged target trace-ID cardinality. The generated workload contains
+319,987,518 JSON bytes, 8,134 messages and 47,976 parts; all content is synthetic.
+The four invocations took **378.763 / 308.581 / 311.298 / 311.747 seconds**,
+each below 600 seconds; unchanged performed **zero** gateway mutations.
+These results supersede the earlier 511.8-second fresh timing.
+Hardware, complete phase timings, exact command and limits are in
+[docs/compatibility.md](docs/compatibility.md#synthetic-performance-evidence).

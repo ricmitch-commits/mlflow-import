@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import cast
 
 from mlflow_import.errors import ConfigurationError
+from mlflow_import.source.model import iso_fractional_ns
 from mlflow_import.sources import detect_harness, get_adapter
 
 PROG = "mlflow-import"
@@ -79,6 +80,14 @@ class ImportConfig:
     @property
     def on_conflict(self) -> str:
         return cast(str, self.__dict__.get("_on_conflict", "overwrite"))
+
+    @property
+    def from_time_ns(self) -> int | None:
+        return cast(int | None, self.__dict__.get("_from_time_ns"))
+
+    @property
+    def to_time_ns(self) -> int | None:
+        return cast(int | None, self.__dict__.get("_to_time_ns"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,6 +173,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_argv(argv: Sequence[str]) -> list[str]:
+    """Normalize the flat public command and explicit historical import spelling."""
+    effective = list(argv)
+    if effective and effective[0] != "import" and effective[0].startswith("-"):
+        effective.insert(0, "import")
+    return effective
+
+
+def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
+    """One shared syntax/normalization boundary, without source discovery."""
+    return build_parser().parse_args(normalize_argv(argv))
+
+
 def parse_config(argv: Sequence[str]) -> ImportConfig:
     """Parse ``argv`` into a validated, frozen :class:`ImportConfig`.
 
@@ -173,12 +195,11 @@ def parse_config(argv: Sequence[str]) -> ImportConfig:
     :class:`~mlflow_import.errors.ConfigurationError` with a safe message
     that never echoes the offending value.
     """
-    effective_argv = list(argv)
-    # The utility has one command, but accepting the historical ``import``
-    # spelling keeps old automation usable while the public shape stays flat.
-    if effective_argv and effective_argv[0] != "import" and effective_argv[0].startswith("-"):
-        effective_argv.insert(0, "import")
-    args = build_parser().parse_args(effective_argv)
+    return config_from_arguments(parse_arguments(argv))
+
+
+def config_from_arguments(args: argparse.Namespace) -> ImportConfig:
+    """Validate already-parsed arguments under the caller's resource scope."""
 
     experiment_name = args.experiment_name
     if not experiment_name.strip():
@@ -209,12 +230,8 @@ def parse_config(argv: Sequence[str]) -> ImportConfig:
             raise ConfigurationError("harness_source_mismatch", "the source does not match the selected harness")
 
     default_db = DEFAULT_DB_PATH
-    if source is None and args.db is None and harness in {"claude", "codex"}:
+    if source is None and args.db is None and harness is not None:
         locations = adapter.default_locations(args.session)
-        if len(locations) > 1:
-            raise ConfigurationError(
-                "ambiguous_source", "the selected harness has multiple default sources; specify --source"
-            )
         if locations:
             default_db = str(locations[0])
         elif harness == "claude":
@@ -238,11 +255,32 @@ def parse_config(argv: Sequence[str]) -> ImportConfig:
         output=args.output,
         log_level=args.log_level,
     )
+    object.__setattr__(config, "_from_time_ns", _bound_nanoseconds(config.from_time, args.from_time))
+    object.__setattr__(config, "_to_time_ns", _bound_nanoseconds(config.to_time, args.to_time))
+    if config.from_time_ns is not None and config.to_time_ns is not None and config.from_time_ns > config.to_time_ns:
+        raise ConfigurationError("invalid_time_range", "the normalized lower time bound exceeds the upper bound")
     object.__setattr__(config, "_harness", harness)
     object.__setattr__(config, "_source", source)
     object.__setattr__(config, "_session", args.session)
     object.__setattr__(config, "_on_conflict", args.on_conflict)
+    object.__setattr__(
+        config,
+        "_discover_defaults",
+        source is None and args.db is None and (harness is None or len(adapter.default_locations()) > 1),
+    )
     return config
+
+
+def _bound_nanoseconds(parsed: datetime | None, raw: str | None) -> int | None:
+    if parsed is None or raw is None:
+        return None
+    delta = parsed - datetime(1970, 1, 1, tzinfo=UTC)
+    try:
+        return ((delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds) * 1000 + iso_fractional_ns(raw)
+    except ValueError:
+        raise ConfigurationError(
+            "invalid_timestamp", "time bound precision exceeds the supported nanosecond envelope"
+        ) from None
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -290,7 +328,14 @@ def _parse_time_bound(flag: str, value: str | None) -> datetime | None:
     if value is None:
         return None
     try:
+        if len(value) == 10:
+            parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+            return parsed.replace(hour=23, minute=59, second=59) if flag == "--to-time" else parsed
         return parse_timestamp(value)
+    except ValueError:
+        raise ConfigurationError(
+            "invalid_timestamp", f"{flag} must be a valid date or timezone-qualified timestamp"
+        ) from None
     except ConfigurationError as error:
         raise ConfigurationError(error.code, f"{flag} {error.safe_message}") from error
 

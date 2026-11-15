@@ -892,17 +892,18 @@ def every_spec_carries_native_session_id(scenario_context: dict[str, object], se
     assert all(spec.native_session_id == session_id for spec in _mapped_specs(scenario_context))
 
 
-@then(parsers.parse("the specs carry {count:d} distinct client request ids"))
-def specs_carry_distinct_client_request_ids(scenario_context: dict[str, object], count: int) -> None:
+@then(parsers.parse("the specs carry {count:d} distinct operation keys and absent client request ids"))
+def specs_carry_distinct_operation_keys(scenario_context: dict[str, object], count: int) -> None:
     """Every turn maps under its own deterministic idempotency key."""
     specs = _mapped_specs(scenario_context)
-    assert len({spec.client_request_id for spec in specs}) == count
+    assert len({spec.expected_operation_key for spec in specs}) == count
+    assert all(spec.client_request_id is None for spec in specs)
 
 
 @then(parsers.parse('every spec metadata records "{key}" as "{value}"'))
 def every_spec_metadata_records(scenario_context: dict[str, object], key: str, value: str) -> None:
     """The namespaced ownership metadata round-trips on every spec."""
-    assert all(spec.metadata[key] == value for spec in _mapped_specs(scenario_context))
+    assert all(spec.root_tags[key] == value for spec in _mapped_specs(scenario_context))
 
 
 @then(parsers.parse("the root input of turn {index:d} is the first user prompt"))
@@ -944,7 +945,7 @@ def turn_maps_to_root_status_with_outcome(
     """The source terminal outcome drives the authoritative root status."""
     spec = _mapped_specs(scenario_context)[index - 1]
     assert spec.root_status == status
-    assert spec.metadata["opencode.outcome"] == outcome
+    assert spec.root_tags["opencode.outcome"] == outcome
 
 
 @then(parsers.parse("turn {index:d} has {count:d} children"))
@@ -1311,7 +1312,7 @@ def old_trace_remains_active(scenario_context: dict[str, object], bdd_gateway: F
     assert old_trace_id is not None, "the previous run recorded no trace id"
     stored = gateway.stored_trace(old_trace_id)
     assert stored is not None, "the old trace must remain"
-    assert stored.state == "OK"
+    assert stored.state in {"OK", "ERROR"}  # Active terminal traces may have unknown source outcomes.
 
 
 @then("the new trace is rolled back or reported as a recovery conflict")
@@ -1961,7 +1962,7 @@ def old_trace_is_retired_and_replacement_is_active(
     assert not bdd_gateway.has_trace(old_id)
     stored = bdd_gateway.stored_trace(new_id)
     assert stored is not None
-    assert stored.state == "OK"
+    assert stored.state in {"OK", "ERROR"}
 
 
 @then("the failed replacement was rolled back")
@@ -2109,7 +2110,7 @@ def stored_root_statuses_follow_the_source_outcomes(
 ) -> None:
     """The six-turn outcomes round-tripped as authoritative root statuses."""
     entries = dict(_latest_turn_entries(scenario_context))
-    expected = {1: "OK", 3: "UNSET", 4: "ERROR"}
+    expected = {1: "OK", 3: "ERROR", 4: "ERROR"}
     for turn_index, status in expected.items():
         stored = bdd_gateway.stored_trace(entries[turn_index])
         assert stored is not None
@@ -2256,8 +2257,8 @@ def report_shows_redaction_counts_without_the_bearer_token(scenario_context: dic
 def the_redacted_identifiers_survive(scenario_context: dict[str, object], bdd_gateway: FakeMlflowGateway) -> None:
     """Redaction masked content but preserved reconciliation identifiers."""
     stored = _latest_stored_trace(scenario_context, bdd_gateway)
-    assert stored.metadata["opencode.session_id"] == BDD_SESSION_ID
-    assert stored.metadata["opencode.importer"] == "mlflow-import"
+    assert stored.tags["opencode.session_id"] == BDD_SESSION_ID
+    assert stored.tags["opencode.importer"] == "mlflow-import"
     relative_path = stored.tags["opencode.artifact_path"]
     artifact = bdd_gateway.stored_artifact(stored.trace_id, relative_path).decode("utf-8")
     assert "ses-bdd-cli-user-1" in artifact, "the artifact must preserve the record source ids"

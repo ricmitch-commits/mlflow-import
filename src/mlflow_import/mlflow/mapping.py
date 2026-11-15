@@ -63,8 +63,8 @@ Boundaries fixed here:
   ``UNSET`` with ``opencode.outcome`` recording the source terminal
   outcome. The explicit ``root_status`` rides the request so the
   gateway never re-derives what the source knows.
-- **Ownership.** The initial trace-create request carries the complete
-  namespaced ownership/operation metadata
+- **Ownership.** The initial historical trace-create request carries complete
+  namespaced ownership/operation creation tags
   (``opencode.importer`` … ``opencode.operation_key``) plus available
   session/source metadata, so everything survives a crash before trace
   completion. It also records the artifact's exact relative path as the
@@ -72,8 +72,8 @@ Boundaries fixed here:
   candidate's stored artifact at the candidate's own recorded location
   (the path is not an equivalence field). ``operation_key`` is the
   SHA-256 of the exact experiment/session/turn/render tuple with
-  versioned separators; the deterministic ``client_request_id`` equals
-  it.
+  versioned separators. Native ``client_request_id`` is source-only and nullable;
+  it is not the operation key.
 - **Identity binding.** :class:`ArtifactIdentityEnvelope` records the
   pre-identity-map artifact identity (render/snapshot fingerprints and
   the deterministic artifact path). :func:`bind_mlflow_identity_map`
@@ -84,6 +84,7 @@ Boundaries fixed here:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -128,6 +129,7 @@ from mlflow_import.source.turns import (
 )
 
 if TYPE_CHECKING:
+    from mlflow_import.content.activity import Activity
     from mlflow_import.mlflow.gateway import TraceChildRequest, TraceCreateRequest
 
 __all__ = [
@@ -333,12 +335,16 @@ def operation_key(experiment_id: str, session_id: str, turn_key: str, render_fin
 
     The versioned header and single-NUL separators frame the tuple
     unambiguously, so two different tuples can never concatenate to the
-    same hash input. The result is both the trace's operation key
-    (``opencode.operation_key``) and its deterministic
-    ``client_request_id`` idempotency key.
+    same hash input. The result is the trace's operation creation tag
+    (``opencode.operation_key``), independent of native client request identity.
     """
     material = "\0".join((OPERATION_KEY_VERSION, experiment_id, session_id, turn_key, render_fingerprint))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def native_operation_id(operation: str) -> str:
+    """Lossless versioned SHA-256 encoding within the native 50-character limit."""
+    return "mi1:" + base64.urlsafe_b64encode(bytes.fromhex(operation)).decode("ascii").rstrip("=")
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +455,7 @@ class TraceSpec:
     one at a time.
     """
 
-    client_request_id: str
+    client_request_id: str | None
     experiment_id: str
     name: str
     native_session_id: str
@@ -465,6 +471,12 @@ class TraceSpec:
     artifact_snapshot_fingerprint: str
     artifact_relative_path: str
     root_status: str | None = None
+    historical: bool = False
+    trace_name: str | None = None
+    request_preview: str | None = None
+    response_preview: str | None = None
+    native_usage: Mapping[str, object] | None = None
+    native_cost: Mapping[str, object] | None = None
 
     def to_create_request(self) -> TraceCreateRequest:
         """Convert to the real gateway trace-create request (lazy boundary)."""
@@ -487,14 +499,23 @@ class TraceSpec:
             artifact_snapshot_fingerprint=self.artifact_snapshot_fingerprint,
             artifact_relative_path=self.artifact_relative_path,
             root_status=self.root_status,
+            historical=self.historical,
+            trace_name=self.trace_name,
+            request_preview=self.request_preview,
+            response_preview=self.response_preview,
+            native_usage=self.native_usage,
+            native_cost=self.native_cost,
         )
 
     def identity_envelope(self) -> ArtifactIdentityEnvelope:
         """The turn's pre-identity-map artifact identity, from the spec."""
+        from mlflow_import.compatibility import request_ownership
+
+        ownership = request_ownership(self)
         return ArtifactIdentityEnvelope(
-            session_id=self.native_session_id,
-            turn_key=self.metadata["opencode.turn_key"],
-            render_fingerprint=self.metadata["opencode.render_fingerprint"],
+            session_id=ownership.get("mlflow_import.qualified_session_id", self.native_session_id),
+            turn_key=ownership["opencode.turn_key"],
+            render_fingerprint=ownership["opencode.render_fingerprint"],
             snapshot_fingerprint=self.artifact_snapshot_fingerprint,
             artifact_relative_path=self.artifact_relative_path,
         )
@@ -902,8 +923,32 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     inline_limit = resolve_inline_limit(context.inline_limit_bytes)
 
     root_values = load_root_values(turn, inline_limit)
+    root_output = root_values.root_output
     effective = build_effective_turn(turn, IDENTITY_REDACTOR, context.redaction_mode)
     source_fp = source_fingerprint(effective, context.redaction_mode)
+    activity = None
+    if callable(getattr(turn, "iter_all_records", None)):
+        from mlflow_import.content.activity import project_activity
+
+        activity = project_activity(turn)
+        from mlflow_import.content.activity import chat_message
+        from mlflow_import.errors import ItemImportError
+
+        final_call = next(
+            (
+                call
+                for call in activity.calls.values()
+                if any(record.source_id == summary.root_result_source_id for record in call.records)
+            ),
+            None,
+        )
+        if root_output is not None and final_call is not None and len(final_call.records) > 1:
+            root_output = chat_message(final_call, {})["content"]
+            if len(canonical_json(root_output)) > inline_limit:
+                raise ItemImportError(
+                    "payload_too_large", "the complete coalesced assistant result exceeds the qualified envelope"
+                )
+        source_fp = hashlib.sha256(canonical_json({"source": source_fp, "accounting": activity.provenance})).hexdigest()
     render_fp = render_fingerprint(
         source_fp,
         context.artifact_schema_version,
@@ -913,6 +958,10 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     )
     snapshot_fp = artifact_snapshot_fingerprint(turn, context.redaction_mode)
     relative_path = artifact_relative_path(header.session_id, summary.turn_key, render_fp, snapshot_fp)
+    if callable(getattr(turn, "iter_all_records", None)):
+        from mlflow_import.content.bundles import session_prefix
+
+        relative_path = f"{session_prefix(turn, context.redaction_mode)}/turns/{summary.turn_key}/{render_fp}.json"
 
     scan = _scan_turn(turn)
     start_ns, start_estimated = _start_time_ns(header, summary, scan)
@@ -925,30 +974,191 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
     timing_estimated = start_estimated or end_estimated
     outcome, root_status = _terminal_outcome(summary, scan)
     source_outcome = scan.source_outcome or summary.source_outcome or outcome
+    if activity is not None and root_status == "OK":
+        result = next(
+            (record for record in activity.records if record.source_id == summary.root_result_source_id), None
+        )
+        observed = decoded_source_outcome(result.decoded_value) if result is not None else None
+        if observed is None or observed.strip().lower() not in {
+            "stop",
+            "end_turn",
+            "completed",
+            "complete",
+            "success",
+            "succeeded",
+            "done",
+            "length",
+            "max_tokens",
+        }:
+            source_outcome = "unknown" if observed is None else observed
+            root_status = "ERROR"
     operation = operation_key(context.experiment_id, header.session_id, summary.turn_key, render_fp)
 
     metadata = _ownership_metadata(
         header, summary, context, source_fp, render_fp, operation, source_outcome, timing_estimated
     )
-    root_attributes = _root_attributes(header, summary, context, source_outcome, timing_estimated, inline_limit)
+    native_session_id = header.session_id
+    current_tags: dict[str, str] = {}
+    if callable(getattr(turn, "iter_all_records", None)):
+        from mlflow_import.identity import harness_name, native_metadata, qualified_session
 
+        harness = harness_name(header)
+        metadata["mlflow_import.qualified_session_id"] = qualified_session(header)
+        immutable = {
+            "opencode.importer",
+            "opencode.session_id",
+            "opencode.turn_index",
+            "opencode.turn_key",
+            "mlflow_import.source_fingerprint",
+            "mlflow_import.source_schema",
+            "opencode.importer_version",
+            "opencode.mapping_version",
+            "opencode.artifact_schema_version",
+            "opencode.redaction_mode",
+            "opencode.render_fingerprint",
+            "opencode.operation_key",
+            "opencode.outcome",
+            "opencode.timing_estimated",
+            "opencode.warnings",
+            "opencode.catalog_version",
+            "opencode.first_user_source_id",
+            "opencode.root_result_source_id",
+            "opencode.turn_record_count",
+            "opencode.turn_user_record_count",
+            "opencode.turn_assistant_record_count",
+            "mlflow.source.name",
+            "mlflow_import.source",
+            "mlflow_import.qualified_session_id",
+        }
+        current_tags = {
+            "mlflow_import.current." + key.removeprefix("opencode."): value
+            for key, value in metadata.items()
+            if key not in immutable and key != "mlflow_import.source_database_fingerprint"
+        }
+        current_tags["mlflow_import.current.session_fingerprint"] = snapshot_fp
+        current_tags["mlflow_import.current.turn_index"] = str(summary.turn_index)
+        current_tags["mlflow_import.turn_index"] = str(summary.turn_index)
+        current_tags["mlflow_import.source_revision"] = snapshot_fp
+        current_tags["mlflow_import.metadata_fingerprint"] = hashlib.sha256(canonical_json(current_tags)).hexdigest()
+        metadata = {key: value for key, value in metadata.items() if key in immutable}
+        metadata.update(
+            {
+                "mlflow.source.name": harness,
+                "mlflow_import.source": harness,
+                "mlflow_import.importer": IMPORTER_IDENTITY,
+                "mlflow_import.harness": harness,
+                "mlflow_import.source_namespace": header.source_fingerprint or "unqualified",
+                "mlflow_import.session_id": header.session_id,
+                "mlflow_import.turn_key": summary.turn_key,
+                "mlflow_import.turn_fingerprint": render_fp,
+                "mlflow_import.projection_version": context.mapping_version,
+                "mlflow_import.importer_version": context.importer_version,
+                "mlflow_import.mapping_version": context.mapping_version,
+                "mlflow_import.artifact_schema_version": context.artifact_schema_version,
+                "mlflow_import.source_format": header.catalog_version,
+                "mlflow_import.redaction_mode": context.redaction_mode.value,
+            }
+        )
+        metadata.update(native_metadata(header))
+    root_attributes = _root_attributes(header, summary, context, source_outcome, timing_estimated, inline_limit)
+    if current_tags:
+        for key in (
+            "opencode.cost",
+            "opencode.logical_turn_count",
+            "mlflow_import.source_message_count",
+            "mlflow_import.source_part_count",
+        ):
+            root_attributes.pop(key, None)
+        root_attributes.pop("opencode.turn_index", None)
+        root_attributes = {
+            key: value for key, value in root_attributes.items() if not key.startswith("opencode.tokens.")
+        }
+    if activity is not None:
+        from mlflow_import.content.coverage import coverage
+
+        root_attributes["mlflow_import.accounting"] = activity.provenance
+        root_attributes["mlflow_import.coverage"] = coverage(header, activity)
+        # Root totals are authoritative. MLflow's DFS aggregation suppresses
+        # child totals beneath a root observation rather than counting twice.
+        if activity.usage:
+            root_attributes["mlflow.chat.tokenUsage"] = activity.usage
+        root_attributes["mlflow.llm.cost"] = activity.cost
+        if start_ns is None or end_ns is None:
+            start_ns = start_ns if start_ns is not None else 1
+            end_ns = end_ns if end_ns is not None else start_ns
+            root_attributes["mlflow_import.timing"] = "synthetic-container"
+        else:
+            root_attributes["mlflow_import.timing"] = "synthetic-container" if timing_estimated else "timestamp-derived"
+        if root_status == "UNSET":
+            # Pinned LiveSpan.end coerces UNSET to OK. ERROR is the supported
+            # non-success state; distinct source outcome remains explicit.
+            root_status = "ERROR"
+
+    request_id = None if activity is not None else operation
+    request_origin = "absent"
+    if activity is not None:
+        source_metadata = header.metadata if isinstance(header.metadata, Mapping) else {}
+        first_record = next(iter(activity.records), None)
+        first_decoded = first_record.decoded_value if first_record is not None else None
+        first_decoded = first_decoded if isinstance(first_decoded, Mapping) else {}
+        recorded_request = metadata.get(
+            "mlflow_import.client_request_id",
+            source_metadata.get("client_request_id", first_decoded.get("request_id", first_decoded.get("requestID"))),
+        )
+        if isinstance(recorded_request, str):
+            request_id = recorded_request
+            request_origin = "source"
+        metadata["mlflow_import.client_request_id_origin"] = request_origin
+    native_usage = root_attributes.get("mlflow.chat.tokenUsage")
+    native_cost = root_attributes.get("mlflow.llm.cost")
+    request_preview = response_preview = None
+    if activity is not None and harness == "opencode":
+        request_preview, response_preview, semantic_start, semantic_end = _opencode_projection(turn)
+        start_ns = semantic_start if semantic_start is not None else start_ns
+        end_ns = semantic_end if semantic_end is not None else end_ns
+        usage = dict(cast(Mapping[str, object], native_usage or {}))
+        projected_usage: dict[str, object] = {
+            key: usage[key] for key in ("input_tokens", "output_tokens") if key in usage
+        }
+        reasoning = _opencode_reasoning(activity)
+        if projected_usage:
+            projected_usage["total_tokens"] = sum(cast(int, value) for value in projected_usage.values()) + reasoning
+        native_usage = projected_usage
+        native_cost = None
+    elif activity is not None:
+        import json
+
+        request_preview = (
+            json.dumps(root_values.root_input, ensure_ascii=False)[:1000]
+            if root_values.root_input is not None else None
+        )
+        response_preview = json.dumps(root_output, ensure_ascii=False)[:1000] if root_output is not None else None
+    creation_tags = dict(metadata) if activity is not None else {}
+    if activity is not None:
+        metadata = {key: value for key, value in metadata.items() if key == "parent_session_id"}
+    root_input = root_values.root_input
+    if activity is not None and harness == "opencode":
+        # Empty source containers have no semantic input/output. Omitting their
+        # span attributes also prevents MLflow from inventing JSON previews.
+        root_input = None if root_input in ({}, []) else root_input
+        root_output = None if root_output in ({}, []) else root_output
     return TraceSpec(
-        client_request_id=operation,
+        client_request_id=request_id,
         experiment_id=context.experiment_id,
         name=(
-            "opencode_conversation"
-            if context.source_schema == "legacy"
-            else f"{_TRACE_NAME_PREFIX} {summary.turn_index}"
+            ("opencode_conversation" if harness == "opencode" else f"{harness} {summary.turn_key}")
+            if current_tags
+            else (
+                "opencode_conversation"
+                if context.source_schema == "legacy"
+                else f"{_TRACE_NAME_PREFIX} {summary.turn_index}"
+            )
         ),
-        native_session_id=header.session_id,
+        native_session_id=native_session_id,
         root_inputs=(
-            _native_root_input(root_values.root_input) if context.source_schema == "legacy" else root_values.root_input
+            _native_root_input(root_input) if context.source_schema == "legacy" else root_input
         ),
-        root_outputs=(
-            _native_root_output(root_values.root_output)
-            if context.source_schema == "legacy"
-            else root_values.root_output
-        ),
+        root_outputs=(_native_root_output(root_output) if context.source_schema == "legacy" else root_output),
         root_attributes=MappingProxyType(root_attributes),
         # The artifact's exact relative path rides a trace TAG at root
         # creation (crash-survivable): candidate verification reads this
@@ -959,16 +1169,127 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         # A tag, not trace metadata: the pinned server silently truncates
         # metadata values at 250 characters while the path is typically
         # longer; tag values round-trip exactly up to 4096.
-        root_tags={ARTIFACT_PATH_TAG: relative_path},
+        root_tags={ARTIFACT_PATH_TAG: relative_path, **creation_tags, **current_tags},
         metadata=MappingProxyType(metadata),
         start_time_ns=start_ns,
         end_time_ns=end_ns,
-        child_specs=lambda: _iter_child_specs(turn, inline_limit),
+        child_specs=(
+            (lambda: _shared_child_specs(turn, activity, inline_limit))
+            if activity is not None
+            else (lambda: _iter_child_specs(turn, inline_limit))
+        ),
         expected_operation_key=operation,
         artifact_snapshot_fingerprint=snapshot_fp,
         artifact_relative_path=relative_path,
         root_status=root_status,
+        historical=activity is not None,
+        request_preview=request_preview,
+        response_preview=response_preview,
+        native_usage=cast(Mapping[str, object] | None, native_usage),
+        native_cost=cast(Mapping[str, object] | None, native_cost),
     )
+
+
+def _opencode_reasoning(activity: Activity) -> int:
+    """Apply the same parent-authoritative, missing-field rollup as native I/O."""
+    def observed(key: str) -> int:
+        call = activity.calls[key]
+        value = call.usage_observation.get("reasoning")
+        if type(value) is int and value >= 0:
+            return value
+        return sum(observed(child) for child in call.aggregate_children)
+
+    return sum(observed(key) for key, call in activity.calls.items() if call.parent_key is None)
+
+
+def _opencode_projection(turn: ReplayTurn) -> tuple[str | None, str | None, int | None, int | None]:
+    """Plugin text previews and semantic message time, independent of row updates."""
+    from mlflow_import.source.normalize import normalize_epoch_ms
+    from mlflow_import.storage import DiskMap
+
+    texts: DiskMap[str, tuple[str, str]] = DiskMap()
+
+    def preview(value: str) -> str:
+        # JS slice counts UTF-16 units and can leave a lone surrogate (which
+        # JSON.stringify escapes). Protobuf requires well-formed Unicode:
+        # replace that unit with U+FFFD, as JS TextEncoder does for UTF-8.
+        return value.encode("utf-16-le", "surrogatepass")[:2000].decode("utf-16-le", "replace")
+
+    for record in turn.iter_records():
+        decoded = record.decoded_value
+        if not isinstance(decoded, Mapping):
+            continue
+        if decoded.get("type") == "text" and isinstance(decoded.get("text"), str):
+            key = record.parent_source_id or ""
+            user_text, assistant_text = texts.get(key, ("", ""))
+            text = decoded["text"]
+            if text:
+                user_text = preview(user_text + ("\n" if user_text else "") + text[:1000])
+            if text.strip():
+                assistant_text = preview(assistant_text + ("\n" if assistant_text else "") + text[:1000])
+            texts[key] = user_text, assistant_text
+    prompt = response = None
+    start = end = None
+    for record in turn.iter_records():
+        if not _is_message_container(record) or not isinstance(record.decoded_value, Mapping):
+            continue
+        decoded = cast(Mapping[str, object], record.decoded_value)
+        role = decoded.get("role", record.source_type)
+        user_text, assistant_text = texts.get(record.source_id or "", ("", ""))
+        if not user_text:
+            content = decoded.get("content", decoded.get("text"))
+            if isinstance(content, str):
+                parts = [content]
+            elif isinstance(content, (list, tuple)):
+                parts = [
+                    str(part["text"]) for part in content
+                    if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                ]
+            else:
+                parts = []
+            user_text = preview("\n".join(text for text in parts if text))
+            assistant_text = preview("\n".join(text for text in parts if text.strip()))
+        time = decoded.get("time")
+        time = time if isinstance(time, Mapping) else {}
+        created, _ = normalize_epoch_ms(time.get("created"))
+        if role == "user":
+            if start is None:
+                instant = created or record.timestamp
+                start = instant.nanoseconds if instant is not None else None
+            value = user_text
+            if value:
+                prompt = value
+        elif role == "assistant":
+            completed, _ = normalize_epoch_ms(time.get("completed"))
+            # An invalid semantic completion must not erase the adapter's
+            # validated fallback. An absent completion still means creation,
+            # not a later row update (the reference plugin's timing rule).
+            fallback = record.completion_timestamp if time.get("completed") is not None else None
+            instant = completed or fallback or created or record.timestamp
+            end = instant.nanoseconds if instant is not None else None
+            value = assistant_text
+            if value:
+                response = value
+    return prompt, response, start, end
+
+
+def _shared_child_specs(turn: ReplayTurn, activity: object, inline_limit: int) -> Iterator[SpanSpec | EventSpec]:
+    from mlflow_import.content.activity import Activity, iter_activity_specs
+
+    assert isinstance(activity, Activity)
+    for spec in iter_activity_specs(activity, turn):
+        if spec.span_type == "LLM" and "mlflow.llm.cost" not in spec.attributes:
+            spec = replace(spec, attributes={**spec.attributes, "mlflow.llm.cost": {}})
+        if spec.span_type in {"AGENT", "LLM", "TOOL"}:
+            from mlflow_import.errors import ItemImportError
+
+            if any(
+                value is not None and len(canonical_json(value)) > inline_limit for value in (spec.inputs, spec.outputs)
+            ):
+                raise ItemImportError(
+                    "payload_too_large", "a complete structured activity value exceeds the qualified envelope"
+                )
+        yield _bound_child(spec, inline_limit)
 
 
 def _scan_turn(turn: ReplayTurn) -> _TurnScan:

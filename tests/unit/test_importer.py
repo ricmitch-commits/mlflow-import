@@ -22,7 +22,6 @@ from typing import Any
 
 import pytest
 
-import mlflow_import.importer as importer_module
 from mlflow_import.config import ImportConfig
 from mlflow_import.content.fingerprint import build_effective_turn, source_fingerprint
 from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
@@ -128,7 +127,8 @@ def test_rerun_converges_with_unchanged_skips(import_dependencies, config):
     assert all(turn["reason"] == "unchanged" for turn in turns)
     assert all(turn["trace_id"] for turn in turns)
     assert len(import_dependencies.gateway.mutations) == mutations_after_first
-    assert second.report["summary"]["turns_skipped"] == 2
+    assert second.report["summary"]["turns_skipped"] == 0
+    assert second.report["summary"]["unchanged_turns"] == 2
 
 
 def test_dry_run_exits_zero_without_writes(import_dependencies, config):
@@ -718,7 +718,7 @@ def test_dry_run_reports_selected_malformed_candidate_as_ownership_conflict(
     trace_id = first.report["sessions"][0]["turns"][0]["trace_id"]
     trace = dependencies.gateway.stored_trace(trace_id)
     assert trace is not None
-    trace.metadata["mlflow_import.source_fingerprint"] = None
+    trace.tags.pop("mlflow_import.source_fingerprint")
 
     result = run_import(replace(config, dry_run=True), dependencies)
 
@@ -957,7 +957,7 @@ def test_pre_redaction_selection_evidence_rejects_independent_directory_and_mode
     assert exit_status(result) == 0
     scans = {item["session_id"]: item for item in result.report["sessions"]}
     assert scans["ses-selection-match"]["selected"] is True
-    assert scans["ses-selection-directory-decoy"]["selected"] is False
+    assert "ses-selection-directory-decoy" not in scans
     assert scans["ses-selection-model-decoy"]["selected"] is False
     assert result.report["summary"]["selected_sessions"] == 1
     serialized = render_json(result)
@@ -1066,7 +1066,9 @@ def test_run_root_cleanup_failure_is_reported_without_paths(
         rmtree_kwargs.append(kwargs)
         raise OSError("secret temporary path")
 
-    monkeypatch.setattr(importer_module.shutil, "rmtree", failing_rmtree)
+    from mlflow_import import resources
+
+    monkeypatch.setattr(resources.shutil, "rmtree", failing_rmtree)
     dependencies = build_import_fakes(
         restrictive_tmp_path=restrictive_tmp_path,
         gateway=FakeMlflowGateway(compatible=compatible),
@@ -1079,7 +1081,7 @@ def test_run_root_cleanup_failure_is_reported_without_paths(
     assert result.report["summary"]["turns_failed"] == 0
     warning_codes = [warning["code"] for warning in result.report["summary"]["warnings"]]
     assert warning_codes.count("temporary_run_cleanup_failed") == 1
-    assert rmtree_kwargs == [{}]
+    assert rmtree_kwargs and all(kwargs == {} for kwargs in rmtree_kwargs)
     assert "secret temporary path" not in render_json(result)
     assert str(restrictive_tmp_path) not in render_json(result)
     if compatible:
@@ -1089,6 +1091,8 @@ def test_run_root_cleanup_failure_is_reported_without_paths(
         assert result.error is not None
         assert result.error.code == "mlflow_capability_unsupported"
         assert exit_status(result) == 2
+    monkeypatch.undo()
+    result.close()
 
 
 def test_snapshot_cleanup_warning_reaches_report_human_and_json_with_item_failure(

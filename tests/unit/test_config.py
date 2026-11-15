@@ -188,7 +188,8 @@ def test_parse_config_discovers_claude_session_source(
 
     config = parse_config(["import", "--experiment-name", "exp", "--harness", "claude", "--session", session_id])
 
-    assert config.db_path == source
+    # Keep the owning root so related sessions and sidecars remain discoverable.
+    assert config.db_path == source.parent.parent
 
 
 def test_parse_config_does_not_fall_back_to_opencode_for_missing_claude_source(

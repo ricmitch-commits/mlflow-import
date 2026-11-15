@@ -1,15 +1,12 @@
 # Requirements: Coding-Agent Session Importer for MLflow
 
-**Date:** 2026-10-21 | **Reviewed:** 2026-11-04 | **Updated:** 2026-11-05
+**Date:** 2026-10-21 | **Reviewed:** 2026-11-13 | **Updated:** 2026-11-13
 
 **Status:** Approved target requirements; the shipped v0.1 implementation has documented deviations.
 **Working utility name:** `mlflow-import`
 
 These requirements define the harness-neutral importer contract. Source-schema
-examples below are explicitly scoped to the adapter they describe.
-The shipped v0.1.0 writer retains legacy `opencode.*` metadata/tag keys and
-the `opencode-mlflow.result.v1` identifier; these names are compatibility
-identifiers, not source-harness restrictions. The namespaced
+examples below are explicitly scoped to the adapter they describe. The namespaced
 `mlflow_import.*` fields below are the target contract for a versioned
 metadata migration. This checkout contains a target design, not the shipped
 implementation. The snapshot, privacy, compatibility, and recovery rules in
@@ -21,7 +18,7 @@ implementation. The snapshot, privacy, compatibility, and recovery rules in
 local coding-agent sources and imports them into an MLflow experiment. The
 first supported harnesses are OpenCode, Claude Code, Codex, PI, and Gemini
 CLI. It must
-preserve the session identity, turn ordering, trace structure, source timing,
+preserve the session identity, trace and span structure, source timing,
 model/tool metadata, token usage, costs, status, and other MLflow-relevant
 metadata. It must also retain a lossless JSON representation of the imported
 source records, except for explicitly excluded secret-bearing records/fields, so that
@@ -45,6 +42,10 @@ not a live plugin for any supported harness and does not modify source data.
    traces created by other tools, subject to Section 9's verification gate.
 5. Make selection safe and predictable for large local sources and active
    harness processes.
+6. Meet or exceed the data coverage of each harness's documented MLflow tracing
+   integration for facts retained in supported local sources, with explicit
+   reporting of live-only or otherwise unavailable data. Section 8.6 defines
+   this parity contract and the Pi baseline limitation.
 
 ## 3. Non-goals
 
@@ -158,7 +159,7 @@ mlflow-import \
   [--session SESSION-ID] \
   [--on-conflict duplicate|overwrite|ignore] \
   [--tracking-uri URI] \
-  [--from-time ISO-8601] [--to-time ISO-8601] \
+  [--from-time YYYY-MM-DD|ISO-8601] [--to-time YYYY-MM-DD|ISO-8601] \
   [--directory PATH] \
   [--model PROVIDER/MODEL] \
   [--min-user-turns N] \
@@ -171,8 +172,8 @@ mlflow-import \
 | Option | Requirement |
 | --- | --- |
 | `--experiment-name` | Required. Resolve by name and create if absent. |
-| `--harness` | Optional. Select a supported harness adapter (`opencode`, `claude`, `codex`, `pi`, or `gemini`). With no `--source`, use that adapter's default source location(s). |
-| `--source` | Optional. Use the supplied local harness session source path. If `--harness` is omitted, detect exactly one compatible harness format; if both are supplied, reject a mismatch before writes. |
+| `--harness` | Optional. Select a supported harness adapter (`opencode`, `claude`, `codex`, `pi`, or `gemini`). Never requires `--source`; use that adapter's default source location(s) when it is omitted. |
+| `--source` | Optional location override, needed only when harness data is in a non-standard location. If `--harness` is omitted, detect exactly one compatible harness format at the supplied path; if both are supplied, reject a mismatch before writes. |
 | `--on-conflict` | Optional. Choices are `duplicate`, `overwrite`, and `ignore`; default is `overwrite`. This effective policy applies regardless of trace ownership; see Section 9. |
 | `--tracking-uri` | Optional. Use the supplied MLflow tracking URI; otherwise honor standard MLflow client/environment configuration. |
 | authentication/TLS settings | Use standard MLflow client configuration. Credentials must not appear in command output or logs. |
@@ -189,12 +190,20 @@ harness from the explicit path. With both options, it uses the explicit path
 and validates that it belongs to the requested harness. Each adapter owns its
 default paths, environment-variable overrides, format detection, and
 read-only opening behavior; the CLI does not encode harness-specific paths.
+The `--source` option changes only where data is read; default and explicit
+locations use the same harness-neutral normalization and MLflow mapping contract.
 
 ### 6.2 Selection options
 
-- `--from-time` and `--to-time` accept ISO-8601 timestamps with an explicit
-  timezone offset or `Z`. Boundaries are inclusive. Either boundary may be
-  omitted to create an open-ended range.
+- `--from-time` and `--to-time` accept either a date in `YYYY-MM-DD` format or
+  an ISO-8601 timestamp with an explicit timezone offset or `Z`. A date-only
+  `--from-time` defaults to `00:00:00 GMT` (`00:00:00Z`); a date-only `--to-time`
+  defaults to `23:59:59 GMT` (`23:59:59Z`) on the supplied date, independent of
+  the machine's local timezone. Boundaries are inclusive and comparisons retain
+  source timestamp precision: `23:59:59.500Z` is later than a date-only upper
+  bound of `23:59:59Z` and is excluded. Either boundary may be omitted to create
+  an open-ended range. Reject invalid dates and any range whose normalized
+  lower bound is later than its upper bound with exit status `2` before writes.
 - `--session SESSION-ID` restricts selection to the source session whose
   adapter-provided session ID matches the supplied ID. It selects the session
   as a whole, including all of its importable logical turns.
@@ -208,8 +217,7 @@ read-only opening behavior; the CLI does not encode harness-specific paths.
   the path to exist or resolving symlinks.
 - `--model` is an exact normalized provider/model identity. A session matches
   when that model occurs anywhere in persisted records that can carry model
-  identity; checking only the session-level default is insufficient. For
-  OpenCode, this includes message, session-message, and part records.
+  identity; checking only the session-level default is insufficient.
   A canonical provider/model value is formed as `providerID/modelID`, with
   surrounding whitespace removed and case preserved; incomplete source values
   are matched only when the requested value has the same available form.
@@ -303,6 +311,60 @@ existence must not affect session selection.
 
 ## 8. MLflow data model and mapping
 
+### 8.0 Harness-neutral native field contract
+
+The supported native trace fields for every harness are the columns in MLflow's
+`trace_info` table. All adapters map available source values to this same target
+contract; a harness-specific source schema must not define a different set of
+supported target fields. Populate fields through supported MLflow APIs, never
+through direct backend-table writes. Missing optional source values remain
+absent rather than being fabricated; Section 8.6 explicitly permits
+provenance-labeled cost estimates derived from usage and versioned pricing.
+
+The inspected local MLflow schema contains these columns:
+
+| `trace_info` columns | Mapping requirement |
+| --- | --- |
+| `request_id`, `experiment_id` | MLflow trace identity and resolved destination experiment; preserve source IDs separately. |
+| `timestamp_ms`, `execution_time_ms`, `status` | Source turn start time, duration, and normalized outcome, as defined in Section 8.3. |
+| `client_request_id`, `trace_name` | Attributable source values only; absent values stay NULL. Root span name and operation key are separate fields. |
+| `request_preview`, `response_preview` | Explicit reference-equivalent previews; OpenCode newline-joins text parts (including synthetic user parts), truncated to 1000 UTF-16 units. Retain complete structured inputs/outputs separately. |
+| `session_id` | Bare native source session ID; qualified harness/source/session identity remains in `mlflow_import.qualified_session_id` creation tags and artifacts. |
+| `input_tokens`, `output_tokens`, `total_tokens` | Available normalized turn token usage, without double-counting cumulative or repeated totals. |
+| `cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation_input_tokens_above_1hr` | Available cache usage with matching source semantics; do not invent an unavailable cache lifetime breakdown. |
+| `input_cost`, `output_cost`, `total_cost` | Available costs or qualified Section 8.6 estimates, normalized to USD with original amounts/units and conversion provenance retained; avoid double-counting. |
+| `db_payload_generation` | MLflow-managed storage state; do not copy a harness value into this column. |
+
+The target MLflow version's supported schema/API governs availability; report a
+compatibility error when a required mapping cannot be represented. Table names
+describe the storage contract, not permission to bypass the MLflow client.
+Metadata, spans, and canonical artifacts supplement the native columns; they
+do not replace an available native mapping.
+
+When present in the source, the following additional value may be stored in
+`trace_request_metadata` under this exact, harness-neutral key:
+
+| Metadata key | Value |
+| --- | --- |
+| `parent_session_id` | Bare native source parent session ID. |
+
+Omit this entry when unavailable. Use the MLflow API's metadata representation
+for serialization. This entry must not require OpenCode-specific attributes.
+Any native cache-token mapping must retain the source's semantics and must not
+count the same usage twice. Other importer identity and reconciliation metadata required below
+remains separate from this optional source value.
+
+This is the only arbitrary physical request-metadata entry. Ownership, operation
+keys, versions, fingerprints, source/harness/user/Git facts and instance identity
+belong in initial creation tags/artifacts. MLflow owns `mlflow.trace.infoFinalized`;
+the promoted API keys `mlflow.trace.session`, `mlflow.trace.tokenUsage` and
+`mlflow.trace.cost` remain permitted. Verify native NULLs as well as values.
+OpenCode's native reference projection uses initiating-user creation through final
+assistant semantic completion (or creation), input + output + reasoning total,
+and NULL cache/cost columns. Preserve explicit source totals and costs in canonical
+accounting without substituting them into these reference-native fields. Other
+harnesses retain their qualified native cache/cost mappings.
+
 ### 8.1 Experiment
 
 - Resolve the requested experiment by exact name.
@@ -316,14 +378,11 @@ existence must not affect session selection.
 
 Every imported turn trace must carry:
 
-- the native MLflow session identifier set to the normalized source session
-  identity, consistently qualified by harness and source namespace regardless
-  of how the source was selected. On the inspected MLflow server this is
-  visible as `mlflow.trace.session`;
+- the native MLflow session identifier set to the bare source session ID,
+  visible through `mlflow.trace.session`; retain the qualified identity in the
+  immutable `mlflow_import.qualified_session_id` tag regardless of selection;
 - an explicit namespaced `mlflow_import.session_id` field for robust reconciliation;
-- title, slug, directory, path, project/workspace/parent/fork IDs;
-- when available, the normalized parent session ID as the typed root trace
-  attribute `opencode.parent_session_id`; omit it when the source has no parent;
+- title, slug, directory, path, project/workspace/fork IDs;
 - harness, agent, configured model, harness version, source schema generation;
 - session creation/update/lifecycle timestamps;
 - session cost and token aggregates;
@@ -331,13 +390,20 @@ Every imported turn trace must carry:
 - source identity/fingerprint where available, represented as a
   non-secret fingerprint rather than an absolute local path by default;
 - a `source` value equal to the canonical harness name (`opencode`, `claude`,
-  `codex`, `pi`, or `gemini`), stored as native `mlflow.source.name` metadata on
-  every turn trace and used consistently in normalized session/trace artifacts.
-  It must not be the importer name, model/provider, or `--source` filesystem
-  path; source namespace/fingerprint and Git provenance remain separate fields;
+   `codex`, `pi`, or `gemini`), stored as `mlflow.source.name` creation tags on
+   every turn trace and used consistently in normalized session/trace artifacts.
+   It must not be the importer name, model/provider, or `--source` filesystem
+  path. Plugin defaults, OTLP `service.name`, raw source-record `source` fields,
+  and SDK automatic metadata must never override this canonical harness value;
+  source namespace/fingerprint and Git provenance remain separate fields;
 - available user and Git metadata, using native MLflow fields when applicable.
   Apply Section 10's user-identity masking before populating any native or
   namespaced user field; omit absent values rather than inventing them.
+
+Parent-session metadata is optional and follows Section 8.0.
+Historical user, working-directory, and Git facts must come from attributable
+source records. Do not fill missing historical values from the importing
+process's user, working directory, current Git checkout, or SDK defaults.
 
 Mutable session metadata describes the current verified source projection.
 Refreshing it must not replace an unchanged turn trace. Use mutable trace tags
@@ -392,6 +458,18 @@ span back to the harness source. Per-span token usage and cost must be retained,
 trace-level aggregates must be calculated from the source rather than inferred
 from truncated previews.
 
+Use an `AGENT` root for each turn and `LLM` and `TOOL` spans for model calls and
+tools. Preserve nested subagent `AGENT` spans under their invoking tool/agent
+when the source records establish that relationship. Retain skill invocations
+and results as tool/agent activity; injected skill text must not become a new
+user turn. Correlate tool calls/results by source call IDs, including failed
+calls and multiple calls in one model response. Populate MLflow-compatible
+structured chat inputs/outputs and model/provider attributes so conversations,
+reasoning content, and tool interactions are renderable, not just raw artifacts.
+Exact plugin span names are not required; equivalent types, hierarchy, content,
+and attribution are. Missing parentage or execution timing stays explicitly
+unknown rather than being fabricated.
+
 ### 8.5 Lossless artifacts
 
 Each imported session/turn must include a canonical JSON artifact containing:
@@ -412,6 +490,62 @@ turn changed. Prior verified generations remain intact when a write fails.
 Artifact paths must be deterministic and namespaced by harness and source session ID and
 turn identity. With `--redact`, redaction applies to the artifact as well as
 trace data; the unredacted source must never be uploaded under another path.
+
+### 8.6 Integration data parity
+
+The reviewed baseline is the official MLflow integration documentation checked
+on 2026-11-13, with source-verified qualifications recorded in
+[`integration-parity.md`](integration-parity.md). That document distinguishes
+published integration promises, implementation observations, and the importer's
+requirements. It is part of this requirements contract.
+
+| Harness | Minimum coverage beyond the shared native-field contract |
+| --- | --- |
+| OpenCode | Prompts/responses, model and tool activity, per-turn timing, input/output/total usage, available user metadata, and available cache/cost details. |
+| Claude Code | Prompts/responses, tool inputs/results, nested subagents and steps, skill activity, model, working directory, available user metadata, per-call/session usage and costs, and attributable timing. |
+| Codex | Prompts/responses, tool activity, model, input/output/total usage, API-pricing cost estimates, session/user metadata, and available Git repository URL, commit, and branch. |
+| PI | Shared trace/span contract applied to Pi's persisted session tree, structured messages, models, tools, usage, costs, and lifecycle records. No official Pi-specific MLflow integration baseline was verified; do not claim official-plugin parity. |
+| Gemini CLI | Prompts/responses including persisted thinking, model calls, tools/results, agent hierarchy, token usage, costs, and session metadata corresponding to its native OTLP integration. |
+
+For each supported source version, an adapter must document and verify how
+each baseline item is represented: directly recorded, deterministically
+derived, or unavailable. Persist this coverage/provenance information with the
+canonical artifact and summarize unavailable baseline items in the import
+report. An available baseline field must not be discarded or preserved only
+in a raw artifact when an equivalent structured MLflow field/span exists.
+Missing live-only content, metrics, timing, or identity cannot be reconstructed
+by assertion; report the gap and do not claim full data parity for that item.
+Secret exclusions and explicit redaction remain governed by Sections 7 and 10.
+
+Token accounting must define whether input includes cache reads/creation,
+whether output includes reasoning, and whether counters are per call, per turn,
+or cumulative. Coalesce split records for the same model call before aggregating
+usage, and do not assign a turn-wide counter to every child span. Preserve
+source totals when their semantics differ from simple input-plus-output sums.
+Cache lifetime subsets must not be added again or mapped to a differently
+defined target bucket. Preserve recorded zero counts; missing counts stay absent.
+
+Persisted costs take precedence. Record cost origin (persisted or
+importer-derived) separately from calculation method (estimated, provider-billed,
+or unknown); a persisted estimate must not be relabeled as billed spend. When
+integration-equivalent cost requires pricing-derived estimates and model/usage
+data is sufficient, support a deterministic estimate with a versioned pricing
+snapshot, currency/unit, model mapping, and calculation provenance in the
+artifact. Populate supported structured span costs and native trace cost
+aggregates with these estimates, explicitly labeled through associated
+metadata/provenance. Native MLflow costs are USD; preserve original source
+amounts/units and any versioned conversion basis in the artifact. Unknown
+currency or missing pricing/usage must produce an explicit coverage gap, not a
+fabricated zero. Never present estimates as actual subscription spend. An
+unchanged rerun must reuse the same pricing basis; changing it is an explicit
+projection change.
+
+Import all persisted logical turns and associated sidecars, including historical
+turns that a live plugin exports only on an idle/Stop/notify event. Apply source
+replay/update/compaction rules and preserve subagent relationships; live-plugin
+batch limits and preview truncation must not limit historical import coverage.
+Distinguish measured execution duration from timestamp-derived intervals, and
+never copy a plugin's synthetic timing or unconditional success as source fact.
 
 ## 9. Reconciliation and updates
 
@@ -588,11 +722,21 @@ Suggested exit-status contract:
 - With no harness or source option, all available adapter-owned default sources
   are eligible.
 - `--harness` alone restricts discovery to that harness's default source(s).
+  It must not require `--source` for any supported harness.
 - `--source` alone detects exactly one compatible harness from the explicit
   path.
 - Supplying both options rejects a harness/source mismatch before MLflow
   writes.
+- Supplying a non-standard location with `--source` uses the same normalization
+  and native MLflow field mapping as default discovery for that harness.
 - A session at exactly `fromTime` or `toTime` is included.
+- Date-only `--from-time 2026-11-13` means `2026-11-13T00:00:00Z`, and date-only
+  `--to-time 2026-11-13` means `2026-11-13T23:59:59Z`, regardless of local timezone.
+  Sessions exactly at these boundaries are included; sessions before the lower
+  bound or after the upper bound, including `23:59:59.500Z`, are excluded.
+- Date-only and timezone-qualified timestamp boundaries can be mixed, and either
+  can be omitted. Invalid calendar dates and reversed normalized ranges exit
+  with status `2` before writes.
 - A session outside the source creation-time range is excluded even if a later
   record falls inside the range.
 - A directory filter includes descendants and excludes similarly prefixed
@@ -607,9 +751,15 @@ Suggested exit-status contract:
 
 ### Mapping and fidelity
 
-- Every selected logical turn produces one MLflow trace with the consistently
-  encoded qualified source identity as its MLflow session identifier and the
-  native source session ID in `mlflow_import.session_id`.
+- Every harness maps available native trace fields to the shared `trace_info`
+  column contract in Section 8.0 through MLflow APIs. Harness choice changes
+  source interpretation, not supported target fields.
+- When supplied by the source, `parent_session_id` can be retained under that
+  exact key in `trace_request_metadata`. Absent values are omitted, and parent
+  linkage requires no harness-specific attribute.
+- Every selected logical turn produces one MLflow trace with its bare source
+  session ID as the native MLflow session identifier and its consistently encoded
+  qualified source identity in `mlflow_import.qualified_session_id` creation tags.
 - Traces in one source session are separately addressable by MLflow trace ID
   and groupable by the shared session ID.
 - Every turn's `mlflow.source.name` and normalized session/trace `source` equal
@@ -618,6 +768,24 @@ Suggested exit-status contract:
   never replace that value.
 - Root input/output, timestamps, status, model/tool spans, token usage, costs,
   source IDs, and relevant metadata are preserved.
+- For each supported harness/source version, fixtures exercise the baseline
+  items in Section 8.6 and the linked parity matrix. Every item has a verified
+  structured mapping or an explicit unavailable-data diagnostic and artifact
+  provenance; a missing persisted value is never reported as fully captured.
+- Nested subagents retain their invoking parent and their own model/tool spans.
+  Skill injections and tool-result records do not introduce extra user turns.
+  Split model messages and repeated/cumulative usage do not double-count calls
+  or tokens; source-specific cache and reasoning accounting preserves totals.
+- Persisted/importer-derived cost origin and estimated/provider-billed/unknown
+  calculation method remain distinguishable. Estimates populate supported span
+  and native trace USD cost fields and reproduce from recorded pricing/conversion
+  snapshots. Missing usage/pricing/currency remains unknown; rerunning unchanged
+  data does not silently reprice traces.
+- Missing historical user, working-directory, or Git metadata is not replaced
+  by the importer's current environment. Live-only timing/data gaps are reported.
+- A conflicting raw `source`, plugin source default, or OTLP `service.name`
+  never replaces the canonical `mlflow.source.name` harness value, under either
+  privacy mode or discovery method.
 - The canonical artifact contains unknown and raw source fields that cannot be
   represented as native MLflow fields.
 - The six-trace session pattern inspected in the local MLflow instance is

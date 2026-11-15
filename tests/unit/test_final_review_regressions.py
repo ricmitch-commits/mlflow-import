@@ -68,7 +68,7 @@ def test_share_url_sentinel_stays_out_of_every_import_output_surface(tmp_path: P
     dependencies = build_import_fakes(restrictive_tmp_path=tmp_path)
     result = run_import(ImportConfig(f"share-url-{generation}", path), dependencies)
 
-    assert exit_status(result) == (1 if generation == "legacy" else 0)
+    assert exit_status(result) == 0
     warning_codes = {warning["code"] for warning in result.report["summary"]["warnings"]}
     assert "session_share_omitted" in warning_codes
     assert sentinel not in render_json(result)
@@ -123,7 +123,8 @@ def test_typed_headers_and_valid_raw_json_are_redacted_before_persistence_and_ar
     assert secret not in repr(trace)
     artifact = json.loads(dependencies.gateway.stored_artifact(trace_id, trace.tags["opencode.artifact_path"]))
     assert artifact["artifact"]["redaction_mode"] == "redacted"
-    assert manifest.snapshot_fingerprint in trace.tags["opencode.artifact_path"]
+    assert len(manifest.snapshot_fingerprint) == 64
+    assert artifact["artifact"]["artifact_snapshot_fingerprint"] == manifest.snapshot_fingerprint
 
 
 def test_unknown_type_and_key_columns_are_redacted_without_changing_typed_identity(tmp_path):
@@ -220,8 +221,8 @@ def test_identity_like_transcript_keys_do_not_leak_but_structural_ids_and_turn_k
     redacted_turn = redacted.report["sessions"][0]["turns"][0]
     assert redacted_turn["turn_key"] == verbatim_turn["turn_key"]
     trace = redacted_dependencies.gateway.stored_trace(redacted_turn["trace_id"])
-    assert trace.metadata["opencode.session_id"] == "ses-identity-boundary"
-    assert trace.metadata["opencode.turn_key"] == verbatim_turn["turn_key"]
+    assert trace.tags["opencode.session_id"] == "ses-identity-boundary"
+    assert trace.tags["opencode.turn_key"] == verbatim_turn["turn_key"]
     artifact_bytes = redacted_dependencies.gateway.stored_artifact(
         trace.trace_id,
         trace.tags["opencode.artifact_path"],
@@ -259,11 +260,19 @@ def test_missing_id_turn_key_is_content_independent_across_redaction_modes(tmp_p
     assert exit_status(verbatim) == exit_status(redacted) == 0
     verbatim_turn = verbatim.report["sessions"][0]["turns"][0]
     redacted_turn = redacted.report["sessions"][0]["turns"][0]
-    assert [warning["code"] for warning in verbatim_turn["warnings"]] == [
+    assert [
+        warning["code"]
+        for warning in verbatim_turn["warnings"]
+        if not warning["code"].startswith("coverage_unavailable_")
+    ] == [
         "turn_key_fallback_identity",
         "unknown_source_field",
     ]
-    assert [warning["code"] for warning in redacted_turn["warnings"]] == [
+    assert [
+        warning["code"]
+        for warning in redacted_turn["warnings"]
+        if not warning["code"].startswith("coverage_unavailable_")
+    ] == [
         "turn_key_fallback_identity",
         "unknown_source_field",
     ]
@@ -310,7 +319,7 @@ def test_missing_id_structural_identity_is_stable_when_only_secret_changes(tmp_p
         trace = dependencies.gateway.stored_trace(turn["trace_id"])
         return (
             turn["turn_key"],
-            trace.metadata["mlflow_import.source_fingerprint"],
+            trace.tags["mlflow_import.source_fingerprint"],
             trace.tags["opencode.artifact_path"],
         )
 
@@ -375,7 +384,7 @@ def test_model_filter_ignores_scoped_record_decoy(tmp_path):
     assert result.report["summary"]["selected_sessions"] == 0
 
 
-def test_exporter_orphan_and_missing_id_warnings_reach_end_to_end_report(tmp_path):
+def test_exporter_orphan_warning_survives_but_required_session_identity_corruption_blocks_writes(tmp_path):
     path = build_current_source_db(
         tmp_path,
         name="export-warning-report.db",
@@ -383,7 +392,6 @@ def test_exporter_orphan_and_missing_id_warnings_reach_end_to_end_report(tmp_pat
         messages=[("msg-export-warning", "ses-export-warning", "user", 1, "{}")],
     )
     with sqlite3.connect(path) as connection:
-        connection.execute("INSERT INTO session_v2 (id, time_created) VALUES (NULL, 2000)")
         connection.execute(
             "CREATE TABLE session_pending ("
             "id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT, data TEXT, "
@@ -398,8 +406,16 @@ def test_exporter_orphan_and_missing_id_warnings_reach_end_to_end_report(tmp_pat
     result = run_import(ImportConfig("export-warning-report", path, dry_run=True), dependencies)
 
     warning_codes = {warning["code"] for warning in result.report["summary"]["warnings"]}
-    assert {"session_missing_id", "unassociated_record"} <= warning_codes
+    assert "unassociated_record" in warning_codes
+    assert exit_status(result) == 0
     assert "ses-not-exported" not in repr(result.report)
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO session_v2 (id,time_created) VALUES (NULL,2000)")
+    invalid = run_import(ImportConfig("export-warning-report", path), dependencies)
+    assert exit_status(invalid) == 2
+    assert invalid.error.code == "invalid_session_identity"
+    assert dependencies.gateway.mutations == []
 
 
 @pytest.mark.parametrize("generation", ["legacy", "current"])
@@ -455,8 +471,8 @@ def test_adapter_snapshot_turn_mapping_preserves_session_lifecycle_outcomes(
             ),
         )
 
-    assert spec.root_status == expected_status
-    assert spec.metadata["opencode.outcome"] == f"lifecycle_{status}"
+    assert spec.root_status == ("ERROR" if expected_status == "UNSET" else expected_status)
+    assert spec.root_tags["opencode.outcome"] == f"lifecycle_{status}"
 
     if generation == "current" and status == "pending":
         path = build_current_source_db(
@@ -582,8 +598,8 @@ def test_legacy_merge_order_keeps_later_assistant_parts_and_complete_prompt(tmp_
     result = run_import(ImportConfig("legacy", path), dependencies)
     assert exit_status(result) == 0
     trace = dependencies.gateway.stored_trace(result.report["sessions"][0]["turns"][-1]["trace_id"])
-    assert trace.metadata["mlflow_import.source_message_count"] == "3"
-    assert trace.metadata["mlflow_import.source_part_count"] == "3"
+    assert trace.tags["mlflow_import.current.mlflow_import.source_message_count"] == "3"
+    assert trace.tags["mlflow_import.current.mlflow_import.source_part_count"] == "3"
 
 
 def test_missing_id_part_ownership_is_session_scoped(tmp_path):
@@ -709,17 +725,17 @@ def test_realistic_model_aliases_drive_selection_and_llm_mapping(tmp_path, gener
     )
 
 
-def test_missing_timestamps_fail_item_without_trace_create(tmp_path):
+def test_missing_timestamps_use_explicit_synthetic_container(tmp_path):
     path = build_current_source_db(tmp_path, sessions=[("s1", 1000)], messages=[("u", "s1", "user", 1, "{}")])
     with sqlite3.connect(path) as connection:
         connection.execute("UPDATE session_message SET time_created=NULL, time_updated=NULL")
         connection.execute("UPDATE session_v2 SET time_created=NULL, time_updated=NULL")
     dependencies = build_import_fakes(restrictive_tmp_path=tmp_path)
     result = run_import(ImportConfig("missing-time", path), dependencies)
-    assert exit_status(result) == 1
+    assert exit_status(result) == 0
     turn = result.report["sessions"][0]["turns"][0]
-    assert turn["error"]["code"] == "source_timestamp_missing"
-    assert not any(event.kind == "trace_create" for event in dependencies.gateway.events)
+    trace = dependencies.gateway.stored_trace(turn["trace_id"])
+    assert trace.root_attributes["mlflow_import.timing"] == "synthetic-container"
 
 
 def test_duplicate_stale_trace_results_do_not_collapse_and_report_contract():
@@ -858,14 +874,17 @@ def test_shared_instruction_blob_survives_selecting_only_later_session(tmp_path)
     assert blobs[0]["raw_columns"]["value"] == "synthetic instruction blob content"
 
 
-def test_ci_job_gate_uses_supported_variable_context_not_secrets():
+def test_ci_integration_is_disposable_and_scale_is_manually_gated():
     workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text())
     gated = [job for job in workflow["jobs"].values() if "if" in job]
     assert len(gated) == 1
     assert "secrets." not in gated[0]["if"]
-    assert "vars.MLFLOW_INTEGRATION_ENABLED" in gated[0]["if"]
-    step = next(step for step in gated[0]["steps"] if "env" in step)
-    assert "secrets.MLFLOW_INTEGRATION_URI" in step["env"]["MLFLOW_TRACKING_URI"]
+    assert "inputs.run_scale" in gated[0]["if"]
+    assert "if" not in workflow["jobs"]["integration"]
+    for job_name in ("integration", "scale"):
+        step = next(step for step in workflow["jobs"][job_name]["steps"] if "env" in step)
+        assert "MLFLOW_TRACKING_URI" not in step["env"]
+        assert "env -u MLFLOW_TRACKING_URI" in step["run"]
 
 
 def test_corrected_mapping_contract_replaces_old_version_once(tmp_path):
@@ -882,7 +901,7 @@ def test_corrected_mapping_contract_replaces_old_version_once(tmp_path):
     assert exit_status(second) == 0
     assert second.report["sessions"][0]["turns"][0]["action"] == "updated"
     trace = dependencies.gateway.stored_trace(second.report["sessions"][0]["turns"][0]["trace_id"])
-    assert trace.metadata["opencode.mapping_version"] == "mapping-v4"
+    assert trace.tags["opencode.mapping_version"] == "mapping-v8"
     marker = len(dependencies.gateway.mutations)
     third = run_import(config, dependencies)
     assert exit_status(third) == 0

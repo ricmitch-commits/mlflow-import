@@ -9,11 +9,12 @@ live connection immediately after extraction. Discovery, capability
 checks, and MLflow writes then use only the read-only replay connection
 over the temporary copy — never the live database.
 
-The temporary snapshot lives in a mode-``0o700`` directory under the
-requested temp root, its file is mode ``0o600``, and it contains only the
-``snapshot_sessions`` and ``snapshot_records`` tables. Rows are written
-in bounded batches through :class:`SnapshotWriter`, whose surface is
-exactly ``write_session``/``write_record``/``finalize``.
+The temporary snapshot lives in a mode-``0o700`` directory under the requested
+temp root; its files are mode ``0o600``. Complete permitted payloads and headers
+live in a sequential ``snapshot.payloads`` spool. SQLite stores summaries,
+occurrence/entity/call locators, model identities and byte offsets. Bounded
+writer batches can defer finalization while required relatives are frozen
+in the same live read transaction after direct content-filter evaluation.
 
 Storage format (internal to the source layer; ``canonical-json-v1``
 arrives in Task 4A and does not bind it): each canonical row column holds
@@ -45,8 +46,8 @@ import base64
 import json
 import os
 import re
+import shutil
 import sqlite3
-import tempfile
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
@@ -56,7 +57,9 @@ from typing import Protocol, cast, runtime_checkable
 from mlflow_import.contracts import PROTECTED_IDENTITY_FIELDS, CanonicalRecordEnvelope, DuplicateKeyObject
 from mlflow_import.errors import ImporterError, SnapshotError
 from mlflow_import.json_values import json_text_from_decoded
+from mlflow_import.retry import check_budget
 from mlflow_import.source.connection import open_live_connection
+from mlflow_import.source.id_index import DiskIds
 from mlflow_import.source.model import (
     SchemaDescription,
     SchemaGeneration,
@@ -64,9 +67,11 @@ from mlflow_import.source.model import (
     SourceRecord,
     TimestampValue,
     source_database_fingerprint,
+    source_namespace,
 )
 from mlflow_import.source.normalize import decode_json_column
 from mlflow_import.source.selection import SelectionEvidence, SelectionEvidenceEvaluator
+from mlflow_import.source.spool import PayloadSpool
 
 RedactionCallback = Callable[[object, Collection[str]], object]
 """Redaction policy applied to values before they are persisted."""
@@ -80,7 +85,8 @@ CREATE TABLE snapshot_sessions (
     schema TEXT NOT NULL,
     canonical_session_row TEXT NOT NULL,
     directory_filter_match INTEGER NOT NULL,
-    model_filter_match INTEGER NOT NULL
+    model_filter_match INTEGER NOT NULL,
+    creation_ns INTEGER
 );
 CREATE TABLE snapshot_records (
     session_id TEXT NOT NULL,
@@ -88,8 +94,46 @@ CREATE TABLE snapshot_records (
     source_table TEXT NOT NULL,
     source_id TEXT,
     canonical_record TEXT NOT NULL,
-    raw_permitted_fields TEXT NOT NULL
+    raw_permitted_fields TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    path_ordinal INTEGER,
+    anchor_ordinal INTEGER,
+    entity_id TEXT,
+    invocation_id TEXT,
+    call_id TEXT,
+    parent_id TEXT,
+    occurrence_id TEXT,
+    payload_offset INTEGER,
+    payload_length INTEGER,
+    raw_offset INTEGER,
+    raw_length INTEGER,
+    occurrence_kind TEXT NOT NULL DEFAULT 'original',
+    record_scope TEXT NOT NULL DEFAULT '',
+    parent_entity_id TEXT
 );
+CREATE INDEX snapshot_session_lookup ON snapshot_sessions(session_id);
+CREATE TABLE source_identity_headers(id TEXT PRIMARY KEY);
+CREATE INDEX snapshot_record_lookup ON snapshot_records(session_id);
+CREATE INDEX snapshot_locator_lookup ON snapshot_records(canonical_record);
+CREATE INDEX snapshot_effective_lookup ON snapshot_records(session_id,active,path_ordinal);
+CREATE INDEX snapshot_entity_lookup ON snapshot_records(session_id,entity_id);
+CREATE INDEX snapshot_parent_lookup ON snapshot_records(session_id,source_id);
+CREATE INDEX snapshot_call_lookup ON snapshot_records(session_id,call_id);
+CREATE INDEX snapshot_invocation_lookup ON snapshot_records(session_id,invocation_id);
+CREATE INDEX snapshot_ancestry_lookup ON snapshot_records(session_id,parent_id);
+CREATE TABLE model_identities(session_id TEXT,identity TEXT,PRIMARY KEY(session_id,identity));
+CREATE TABLE source_summaries(session_id TEXT PRIMARY KEY,
+    record_count INTEGER,message_count INTEGER,part_count INTEGER,
+    physical_count INTEGER,derived_count INTEGER,effective_count INTEGER,entity_count INTEGER DEFAULT 0);
+CREATE TABLE calls(session_id TEXT,call_id TEXT,invocation_id TEXT,locator TEXT,fragment INTEGER,
+    PRIMARY KEY(locator,fragment));
+CREATE INDEX call_fragments ON calls(session_id,call_id);
+CREATE TABLE agent_links(session_id TEXT,agent_id TEXT,occurrence INTEGER,
+    PRIMARY KEY(session_id,agent_id,occurrence));
+CREATE TABLE entities(session_id TEXT, entity_id TEXT, parent_id TEXT, occurrence INTEGER,
+    ordinal INTEGER, visited INTEGER NOT NULL DEFAULT 0, scope TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(session_id,entity_id));
+CREATE INDEX entity_parents ON entities(session_id,parent_id);
 """
 
 _BYTES_TAG = "__mlflow_import_bytes_b64__"
@@ -151,7 +195,7 @@ class SourceExporter(Protocol):
         writer: SnapshotWriter,
         redaction: RedactionCallback,
         session_id: str | None = None,
-        session_ids: frozenset[str] | None = None,
+        session_ids: Collection[str] | None = None,
     ) -> ExportStats: ...
 
 
@@ -178,11 +222,16 @@ class SourceSnapshot:
     cleanup_warnings: list[str] = field(default_factory=list)
     selection_evidence_enabled: bool = False
     export_warnings: tuple[str, ...] = ()
+    turn_index: sqlite3.Connection | None = field(default=None, repr=False)
+    source_namespace: str | None = None
 
     @property
     def warning_codes(self) -> tuple[str, ...]:
         """Safe exporter warning codes preserved without reducing them to a count."""
         return self.export_warnings
+
+
+MAX_SESSION_HEADER_BYTES = 8 * 1024 * 1024
 
 
 class SnapshotWriter:
@@ -195,6 +244,8 @@ class SnapshotWriter:
     while raw-column projections are redacted as content. ``finalize`` is idempotent and
     flushes any pending batch. Each flush uses one explicit SQLite
     transaction, including when its connection is configured for autocommit.
+    In the quota profile private journals are disabled: any failed scratch
+    snapshot is discarded, never published or reused as a partial transaction.
     An optional progress callback receives committed session and record counts.
     """
 
@@ -214,21 +265,55 @@ class SnapshotWriter:
         self._redaction_policy = redaction
         self._selection_evaluator = selection_evaluator
         self._progress_callback = progress_callback
-        self._write_batch = write_batch
-        self._session_rows: list[tuple[str, str, str, int, int]] = []
-        self._record_rows: list[tuple[str, str, str, str | None, str, str]] = []
+        self._write_batch = min(write_batch, 256)
+        self._session_buffer_bytes = 0
+        self._session_rows: list[tuple[str, str, str, int, int, int | None]] = []
+        self._record_rows: list[tuple[object, ...]] = []
         self._session_count = 0
         self._record_count = 0
+        self._buffer_bytes = 0
         self._committed_session_count = 0
         self._committed_record_count = 0
         self._warning_count = 0
         self._stats: ExportStats | None = None
         self._current_session_id: str | None = None
         self._current_evidence = SelectionEvidence()
+        database = connection.execute("PRAGMA database_list").fetchone()[2]
+        self._spool = PayloadSpool(Path(database).with_suffix(".payloads")) if database else None
+        self._models: list[tuple[str, str]] = []
+        self._calls: list[tuple[object, ...]] = []
+        self.defer_finalization = False
+
+    def close(self) -> None:
+        """Close a partially populated spool on every failure/interrupt path."""
+        if self._spool is not None:
+            self._spool.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Adapter-owned replay working index, never a live-source connection."""
+        return self._connection
+
+    def flush(self) -> None:
+        """Make occurrence locators visible to adapter replay."""
+        self._flush_sessions()
+        self._flush_records()
+
+    def _payload(self, value: object, *, header: bool = False) -> str:
+        text = dumps_snapshot_json(value)
+        if header and len(text.encode("utf-8")) > MAX_SESSION_HEADER_BYTES:
+            from mlflow_import.errors import SourceCompatibilityError
+
+            raise SourceCompatibilityError(
+                "source_metadata_too_large", "the merged source header exceeds the qualified metadata envelope"
+            )
+        self._buffer_bytes += len(text.encode("utf-8"))
+        return self._spool.append(text) if self._spool is not None else text
 
     def write_session(self, header: SessionHeader, canonical_session_row: CanonicalRecordEnvelope) -> None:
         """Write one normalized session row from its header and envelope."""
         self._ensure_open()
+        check_budget()
         evidence = (
             self._selection_evaluator.session_evidence(header)
             if self._selection_evaluator is not None
@@ -251,14 +336,18 @@ class SnapshotWriter:
             (
                 header.session_id,
                 header.adapter_generation,
-                dumps_snapshot_json(stored),
+                self._payload(stored, header=True),
                 int(evidence.directory_match),
                 int(evidence.model_match),
+                header.time_created.nanoseconds if header.time_created else None,
             )
         )
         self._session_count += 1
+        self._session_buffer_bytes += sum(
+            len(item.encode("utf-8")) for item in self._session_rows[-1] if isinstance(item, str)
+        )
         self._warning_count += len(canonical_session_row.warnings) + len(header.warnings)
-        if len(self._session_rows) >= self._write_batch:
+        if len(self._session_rows) >= self._write_batch or self._session_buffer_bytes >= 4 * 1024 * 1024:
             self._flush_sessions()
 
     def write_record(
@@ -270,6 +359,7 @@ class SnapshotWriter:
     ) -> None:
         """Write one normalized record row from its record, order key, and envelope."""
         self._ensure_open()
+        check_budget()
         if record.session_id is None:
             raise ValueError("a snapshot record must carry its session_id")
         if (
@@ -290,19 +380,79 @@ class SnapshotWriter:
             redacted_permitted_fields = self._redaction(raw_permitted_fields, ())
         finally:
             self._end_redaction_record()
+        canonical_locator = self._payload(stored)
+        raw_locator = self._payload(redacted_permitted_fields)
+        native_key = record.source_id or record.source_identity
+        file_record = record.source_table in {"jsonl", "jsonl_message"}
+        entity = (
+            record.entity_id
+            if file_record
+            else record.entity_id or (record.source_table + ":" + native_key if native_key is not None else None)
+        )
+        parent_entity = (
+            record.parent_source_id
+            if file_record
+            else (
+                (record.parent_source_table or "message") + ":" + record.parent_source_id
+                if record.parent_source_id is not None
+                else None
+            )
+        )
+        invocation = record.invocation_id
+        if (
+            invocation is None
+            and record.classification == "assistant"
+            and record.source_table in {"message", "session_message", "part"}
+        ):
+            invocation = (
+                parent_entity if record.derived_child_ordinal is not None or record.source_table == "part" else entity
+            )
         self._record_rows.append(
             (
                 record.session_id,
                 dumps_json_value(list(order_key)),
                 record.source_table,
                 record.source_id,
-                dumps_snapshot_json(stored),
-                dumps_snapshot_json(redacted_permitted_fields),
+                canonical_locator,
+                raw_locator,
+                entity,
+                invocation,
+                record.call_id,
+                record.parent_source_id,
+                record.occurrence_id or record.source_identity,
+                *_spool_offsets(canonical_locator),
+                *_spool_offsets(raw_locator),
+                "effective"
+                if "effective_from_occurrence" in record.raw_columns
+                else "derived"
+                if record.derived_child_ordinal is not None
+                else "original",
+                record.raw_columns.get("subagent") or "",
+                parent_entity,
             )
         )
         self._record_count += 1
+        from mlflow_import.source.model_identity import extract_model_identity
+
+        identity = extract_model_identity(stored["decoded"])
+        if identity is not None:
+            self._models.append((record.session_id, identity))
+        first_call: str | None = None
+        multiple_calls = False
+        for fragment, call in enumerate(_call_ids(record)):
+            if first_call is None:
+                first_call = call
+            elif first_call != call:
+                multiple_calls = True
+            self._calls.append((record.session_id, call, invocation, self._record_rows[-1][4], fragment))
+        if record.call_id is None and first_call is not None and not multiple_calls:
+            row = self._record_rows[-1]
+            self._record_rows[-1] = (*row[:8], first_call, *row[9:])
+        self._buffer_bytes += sum(
+            len(value.encode("utf-8")) for value in self._record_rows[-1] if isinstance(value, str)
+        )
         self._warning_count += len(canonical_record.warnings)
-        if len(self._record_rows) >= self._write_batch:
+        if len(self._record_rows) >= self._write_batch or self._buffer_bytes >= 4 * 1024 * 1024:
             self._flush_records()
 
     def finalize(self) -> ExportStats:
@@ -311,6 +461,27 @@ class SnapshotWriter:
             return self._stats
         self._flush_sessions()
         self._flush_records()
+        if self.defer_finalization:
+            return ExportStats(
+                self._session_count, self._record_count, self._warning_count, True, self._schema_generation
+            )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO source_identity_headers SELECT session_id FROM snapshot_sessions"
+        )
+        self._connection.execute("""INSERT INTO source_summaries
+            (session_id,record_count,message_count,part_count,physical_count,derived_count,effective_count)
+            SELECT session_id,COUNT(*),SUM(source_table!='part'),SUM(source_table='part'),
+                SUM(occurrence_kind='original'),SUM(occurrence_kind='derived'),SUM(occurrence_kind='effective')
+            FROM snapshot_records GROUP BY session_id""")
+        self._connection.execute("""INSERT OR IGNORE INTO entities
+            (session_id,entity_id,parent_id,occurrence,ordinal,visited)
+            SELECT session_id,source_table || ':' || COALESCE(source_id,occurrence_id,CAST(rowid AS TEXT)),
+                parent_entity_id,rowid,rowid,0 FROM snapshot_records
+            WHERE source_table NOT IN ('jsonl','jsonl_message')""")
+        self._connection.execute("""UPDATE source_summaries SET entity_count=
+            (SELECT COUNT(*) FROM entities WHERE entities.session_id=source_summaries.session_id)""")
+        if self._spool is not None:
+            self._spool.close()
         self._stats = ExportStats(
             session_count=self._session_count,
             record_count=self._record_count,
@@ -409,7 +580,7 @@ class SnapshotWriter:
             self._current_evidence = replace(self._current_evidence, model_match=True)
         for index, row in enumerate(self._session_rows):
             if row[0] == session_id:
-                self._session_rows[index] = (*row[:4], 1)
+                self._session_rows[index] = (*row[:4], 1, row[5])
                 return
         self._connection.execute(
             "UPDATE snapshot_sessions SET model_filter_match = 1 WHERE session_id = ?",
@@ -421,12 +592,13 @@ class SnapshotWriter:
             return
         self._execute_batch(
             "INSERT INTO snapshot_sessions"
-            " (session_id, schema, canonical_session_row, directory_filter_match, model_filter_match)"
-            " VALUES (?, ?, ?, ?, ?)",
+            " (session_id, schema, canonical_session_row, directory_filter_match, model_filter_match,creation_ns)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             self._session_rows,
         )
         self._committed_session_count += len(self._session_rows)
         self._session_rows.clear()
+        self._session_buffer_bytes = 0
         self._report_progress()
 
     def _flush_records(self) -> None:
@@ -434,12 +606,21 @@ class SnapshotWriter:
             return
         self._execute_batch(
             "INSERT INTO snapshot_records"
-            " (session_id, order_key, source_table, source_id, canonical_record, raw_permitted_fields)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (session_id, order_key, source_table, source_id, canonical_record, raw_permitted_fields,"
+            " entity_id,invocation_id,call_id,parent_id,occurrence_id,"
+            " payload_offset,payload_length,raw_offset,raw_length,occurrence_kind,record_scope,parent_entity_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             self._record_rows,
         )
         self._committed_record_count += len(self._record_rows)
+        if self._models:
+            self._execute_batch("INSERT OR IGNORE INTO model_identities VALUES(?,?)", self._models)
+            self._models.clear()
+        if self._calls:
+            self._execute_batch("INSERT INTO calls VALUES(?,?,?,?,?)", self._calls)
+            self._calls.clear()
         self._record_rows.clear()
+        self._buffer_bytes = 0
         self._report_progress()
 
     def _execute_batch(self, statement: str, rows: Iterable[Sequence[object]]) -> None:
@@ -483,7 +664,7 @@ def create_normalized_snapshot(
     write_batch: int = 256,
     selection_evaluator: SelectionEvidenceEvaluator | None = None,
     session_id: str | None = None,
-    session_ids: frozenset[str] | None = None,
+    session_ids: Collection[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> Iterator[SourceSnapshot]:
     """Extract a normalized read-only snapshot of the source at ``path``.
@@ -504,25 +685,48 @@ def create_normalized_snapshot(
     path raises with code ``source_unavailable``.
     """
     try:
-        temp_dir = Path(tempfile.mkdtemp(prefix="mlflow-import-snapshot-", dir=temp_root))
+        from mlflow_import import resources
+
+        temp_dir = resources.make_temp_dir(prefix="mlflow-import-snapshot-", dir=temp_root)
     except OSError as error:
         raise SnapshotError("source_snapshot_failed", _SNAPSHOT_CREATE_FAILED) from error
     snapshot_path = temp_dir / SNAPSHOT_FILENAME
     cleanup_warnings: list[str] = []
     snapshot: SourceSnapshot | None = None
+    provisional: SourceSnapshot | None = None
     returned: ExportStats | None = None
     stats: ExportStats | None = None
     snapshot_error: SnapshotError | None = None
     importer_error: ImporterError | None = None
+    selection_warnings: set[str] = set()
     try:
         try:
             with open_live_connection(path, busy_timeout_ms) as live:
                 fingerprint = source_database_fingerprint(exporter.schema_generation, path)
                 exporter.bind_connection(live.connection)
                 description = exporter.inspect()
-                writer_connection = sqlite3.connect(snapshot_path, isolation_level=None)
+                # Enumeration and extraction must observe the same committed
+                # WAL view. The earlier probe is advisory, never the selector.
+                if selection_evaluator is not None:
+                    from mlflow_import.source.candidates import candidate_session_ids
+
+                    content_filters = (
+                        selection_evaluator.filters.model is not None
+                        or selection_evaluator.filters.min_user_turns is not None
+                    )
+                    session_ids = candidate_session_ids(
+                        live.connection,
+                        description,
+                        selection_evaluator.filters,
+                        session_id,
+                        include_relatives=not content_filters,
+                        warnings=selection_warnings,
+                    )
+                writer_connection = resources.sqlite_connect(snapshot_path, isolation_level=None)
                 try:
                     writer_connection.executescript(_SNAPSHOT_SCHEMA)
+                    writer_connection.execute("PRAGMA cache_size=-2048")
+                    writer_connection.execute("PRAGMA max_page_count=2097152")
                     os.chmod(snapshot_path, 0o600)
                     writer = SnapshotWriter(
                         writer_connection,
@@ -532,13 +736,55 @@ def create_normalized_snapshot(
                         selection_evaluator,
                         progress_callback,
                     )
+                    writer.defer_finalization = (
+                        selection_evaluator is not None
+                        and (
+                            selection_evaluator.filters.model is not None
+                            or selection_evaluator.filters.min_user_turns is not None
+                        )
+                        and session_ids is not None
+                    )
                     try:
+                        if shutil.disk_usage(temp_dir).free < 64 * 1024 * 1024:
+                            raise SnapshotError("temporary_storage_exhausted", "insufficient temporary storage")
                         if session_id is None and session_ids is None:
                             returned = exporter.export_to_snapshot(writer, redaction)
                         else:
                             returned = exporter.export_to_snapshot(writer, redaction, session_id, session_ids)
+                        if writer.defer_finalization:
+                            from mlflow_import.source.planning import content_matches
+
+                            assert selection_evaluator is not None and session_ids is not None
+                            provisional = SourceSnapshot(
+                                fingerprint=fingerprint,
+                                snapshot_path=snapshot_path,
+                                schema_description=description,
+                                connection=writer_connection,
+                                stats=returned,
+                                selection_evidence_enabled=True,
+                            )
+                            matching = DiskIds(content_matches(provisional, selection_evaluator.filters))
+                            required = candidate_session_ids(
+                                live.connection, description, selection_evaluator.filters, seed_ids=matching
+                            )
+                            additional = DiskIds(native for native in (required or ()) if native not in session_ids)
+                            if additional:
+                                returned = exporter.export_to_snapshot(writer, redaction, session_ids=additional)
+                            writer.defer_finalization = False
                     finally:
-                        stats = writer.finalize()
+                        try:
+                            import sys
+
+                            active = sys.exception()
+                            if active is None or isinstance(active, Exception):
+                                stats = writer.finalize()
+                        finally:
+                            writer.close()
+                    if isinstance(session_ids, DiskIds):
+                        writer_connection.executemany(
+                            "INSERT OR IGNORE INTO source_identity_headers VALUES(?)",
+                            session_ids.db.execute("SELECT id FROM headers"),
+                        )
                 finally:
                     writer_connection.close()
             if returned is None or not returned.complete or stats is None:
@@ -547,13 +793,15 @@ def create_normalized_snapshot(
             replay_connection = _open_replay_connection(snapshot_path)
             snapshot = SourceSnapshot(
                 fingerprint=fingerprint,
+                source_namespace=source_namespace(path),
                 snapshot_path=snapshot_path,
                 schema_description=description,
                 connection=replay_connection,
                 stats=stats,
-                export_warnings=_export_warning_codes(exporter),
+                export_warnings=(*_export_warning_codes(exporter), *sorted(selection_warnings)),
                 selection_evidence_enabled=selection_evaluator is not None,
                 cleanup_warnings=cleanup_warnings,
+                turn_index=provisional.turn_index if provisional else None,
             )
         except SnapshotError as error:
             snapshot_error = error
@@ -569,6 +817,8 @@ def create_normalized_snapshot(
             raise snapshot_error from error
         yield snapshot
     finally:
+        if snapshot is None and provisional is not None and provisional.turn_index is not None:
+            provisional.turn_index.close()
         _cleanup_snapshot(snapshot, snapshot_path, cleanup_warnings)
         failure = snapshot_error or importer_error
         if failure is not None:
@@ -578,7 +828,12 @@ def create_normalized_snapshot(
 def _open_replay_connection(snapshot_path: Path) -> sqlite3.Connection:
     """Open the temporary snapshot read-only in one deferred replay transaction."""
     uri = Path(os.path.abspath(snapshot_path)).as_uri() + "?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    from mlflow_import.resources import reader_connect
+
+    connection = reader_connect(uri, uri=True, isolation_level=None)
+    from mlflow_import.resources import configure_reader
+
+    configure_reader(connection)
     connection.execute("PRAGMA query_only = ON")
     connection.execute("BEGIN")
     return connection
@@ -629,6 +884,9 @@ def _cleanup_snapshot(
     content; cleanup itself never raises.
     """
     if snapshot is not None:
+        if snapshot.turn_index is not None:
+            snapshot.turn_index.close()
+            snapshot.turn_index = None
         try:
             snapshot.connection.close()
         except sqlite3.Error:
@@ -636,11 +894,22 @@ def _cleanup_snapshot(
     for suffix in ("", "-wal", "-shm", "-journal"):
         candidate = Path(str(snapshot_path) + suffix)
         try:
-            candidate.unlink(missing_ok=True)
+            from mlflow_import.resources import remove_file
+
+            remove_file(candidate)
+        except OSError:
+            _record_cleanup_failure(cleanup_warnings)
+    for name in ("turn-index.db", "turn-index.db-journal", "snapshot.payloads"):
+        try:
+            remove_file(snapshot_path.parent / name)
         except OSError:
             _record_cleanup_failure(cleanup_warnings)
     try:
         snapshot_path.parent.rmdir()
+        from mlflow_import.resources import current_storage
+
+        if budget := current_storage():
+            budget.forget(snapshot_path.parent)
     except OSError:
         _record_cleanup_failure(cleanup_warnings)
 
@@ -681,6 +950,10 @@ def _record_storage_fields(record: SourceRecord) -> dict[str, object]:
         "timestamp": _timestamp_storage_value(record.timestamp),
         "completion_timestamp": _timestamp_storage_value(record.completion_timestamp),
         "classification": record.classification,
+        "occurrence_id": record.occurrence_id,
+        "entity_id": record.entity_id,
+        "invocation_id": record.invocation_id,
+        "call_id": record.call_id,
     }
 
 
@@ -689,6 +962,40 @@ def _timestamp_storage_value(value: object) -> object:
         return None
     timestamp = cast(TimestampValue, value)
     return {"value": timestamp.value, "unit": timestamp.unit}
+
+
+def _call_ids(record: SourceRecord) -> Iterator[str]:
+    """Index attributable call fragments without creating a second payload copy."""
+    if record.call_id is not None:
+        yield record.call_id
+    value = record.decoded_value
+    if not isinstance(value, Mapping):
+        return
+    for key in ("callID", "call_id", "toolCallId", "tool_use_id"):
+        call = value.get(key)
+        if isinstance(call, str) and call != record.call_id:
+            yield call
+    for field_name in ("content", "toolCalls"):
+        items = value.get(field_name)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            kind = item.get("type")
+            if field_name == "toolCalls" or kind in {"tool_use", "tool_call", "tool_result", "toolCall"}:
+                call = item.get("tool_use_id", item.get("id"))
+                if isinstance(call, str):
+                    yield call
+
+
+def _spool_offsets(locator: str) -> tuple[int | None, int | None]:
+    from mlflow_import.source.spool import PREFIX
+
+    if locator.startswith(PREFIX):
+        offset, length = json.loads(locator[len(PREFIX) :])
+        return int(offset), int(length)
+    return None, None
 
 
 def dumps_snapshot_json(value: object) -> str:

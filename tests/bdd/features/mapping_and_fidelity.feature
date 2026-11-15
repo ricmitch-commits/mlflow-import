@@ -10,7 +10,7 @@ Feature: Turn-to-trace mapping and content fidelity
     When I map every replayed turn to a trace spec
     Then the mapping produces 6 trace specs
     And every spec carries the native session id "ses-synthetic-1"
-    And the specs carry 6 distinct client request ids
+    And the specs carry 6 distinct operation keys and absent client request ids
     And every spec metadata records "opencode.session_id" as "ses-synthetic-1"
     And every spec metadata records "opencode.importer" as "mlflow-import"
 
@@ -25,8 +25,8 @@ Feature: Turn-to-trace mapping and content fidelity
   Scenario: Source outcomes map to authoritative root statuses
     Given the synthetic six-turn session fixture
     When I map every replayed turn to a trace spec
-    Then turn 1 maps to root status "OK" with outcome "assistant_result"
-    And turn 3 maps to root status "UNSET" with outcome "lifecycle_observed"
+    Then turn 1 maps to root status "OK" with outcome "stop"
+    And turn 3 maps to root status "ERROR" with outcome "lifecycle_observed"
     And turn 4 maps to root status "ERROR" with outcome "explicit_failure"
 
   Scenario: Typed children preserve the turn's source records

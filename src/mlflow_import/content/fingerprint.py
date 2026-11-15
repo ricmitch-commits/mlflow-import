@@ -121,6 +121,10 @@ _RECORD_OPTIONAL_FIELDS = (
     "source_identity",
     "join_projection_key",
     "classification",
+    "occurrence_id",
+    "entity_id",
+    "invocation_id",
+    "call_id",
 )
 
 
@@ -203,6 +207,21 @@ def session_context_fingerprint(turn: EffectiveTurn) -> str:
     excluded, so lifecycle updates never replace a turn.
     """
     header = turn.session_header
+    if callable(getattr(turn.replay, "iter_all_records", None)):
+        from mlflow_import.identity import native_metadata, qualified_session
+
+        return _hash_chunks(
+            "native-context-v2",
+            [
+                canonical_json(
+                    {
+                        "identity": qualified_session(header),
+                        "native": native_metadata(header),
+                        "source_schema": header.catalog_version,
+                    }
+                )
+            ],
+        )
     context: dict[str, object] = {
         "session_id": header.session_id,
         "schema_generation": header.adapter_generation,
@@ -237,6 +256,14 @@ def source_fingerprint(turn: EffectiveTurn, redaction_mode: RedactionMode) -> st
     if turn.session_header.catalog_version:
         material_value["catalog_version"] = turn.session_header.catalog_version
     material = canonical_json(material_value)
+    scoped = getattr(turn.replay, "scoped_records_fingerprint", None)
+    if callable(scoped) and turn.summary.source_fingerprint is not None:
+        # The frozen disk index already hashed each effective occurrence in
+        # source order. Reuse that digest rather than reserializing the same
+        # transcript on every mapping and verification call.
+        material_value["turn_records_fingerprint"] = turn.summary.source_fingerprint
+        material_value["session_records_fingerprint"] = scoped()
+        return _hash_chunks("indexed-turn-source-v2", [canonical_json(material_value)])
     return _hash_chunks(
         _DOMAIN_TURN_SOURCE,
         chain((material,), turn.iter_canonical_session_records(), turn.iter_canonical_records()),
@@ -290,6 +317,9 @@ def artifact_snapshot_fingerprint(turn: ReplayTurn, redaction_mode: RedactionMod
     fingerprint, so a derived artifact section can never drift from
     this hash silently.
     """
+    shared = getattr(turn, "session_snapshot_fingerprint", None)
+    if callable(shared):
+        return str(shared(redaction_mode.value))
     return _hash_chunks(_DOMAIN_ARTIFACT_SNAPSHOT, _iter_artifact_snapshot_chunks(turn, redaction_mode))
 
 

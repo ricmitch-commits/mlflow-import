@@ -36,6 +36,50 @@ def test_main_without_a_subcommand_exits_two() -> None:
     assert main([]) == 2
 
 
+@pytest.mark.parametrize("prefix", [[], ["import"]])
+def test_flat_and_explicit_import_enter_same_pipeline(prefix, config, import_dependencies, capsys, monkeypatch):
+    from mlflow_import import config as config_module
+
+    original = config_module.normalize_argv
+    normalized = []
+
+    def once(argv):
+        normalized.append(list(argv))
+        return original(argv)
+
+    monkeypatch.setattr(config_module, "normalize_argv", once)
+    status = main(
+        [*prefix, "--experiment-name", "synthetic", "--db", str(config.db_path), "--dry-run", "--output", "json"],
+        import_dependencies,
+    )
+    assert status == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["summary"]["selected_turns"] == 2
+    assert len(normalized) == 1
+
+
+def test_minimal_flat_invocation_reaches_pipeline(monkeypatch, capsys):
+    from mlflow_import import cli
+    from mlflow_import.contracts import RedactionMode
+    from mlflow_import.importer import ImportResult
+    from mlflow_import.reporting import ReportBuilder
+
+    called = []
+
+    def run(config, dependencies):
+        called.append(config.experiment_name)
+        return ImportResult(
+            False,
+            ReportBuilder(
+                dry_run=False, experiment_name=config.experiment_name, redaction_mode=RedactionMode.VERBATIM
+            ).build(),
+        )
+
+    monkeypatch.setattr(cli, "run_import", run)
+    assert cli.main(["--experiment-name", "synthetic"]) == 0
+    assert called == ["synthetic"]
+
+
 def test_main_missing_experiment_name_exits_two() -> None:
     assert main(["import"]) == 2
 

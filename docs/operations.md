@@ -1,0 +1,167 @@
+# Import operations
+
+Use the [qualified MLflow profile](compatibility.md), the
+[supported source representations](source-adapters.md), and the documented
+[temporary resource limits](temporary-resources.md). This is a sequential one-shot
+importer using public MLflow APIs, not a synchronization service.
+
+## Preview and import
+
+```sh
+mlflow-import --experiment-name coding-sessions --dry-run --output json
+mlflow-import --experiment-name coding-sessions --harness pi --redact
+mlflow-import --experiment-name coding-sessions --source /path/to/session-source --output json
+```
+
+The flat form above and an explicit `import` subcommand are accepted. The
+experiment name is required. An explicit source must match one qualified harness;
+`--harness` may disambiguate and must agree with the source. Without `--source`,
+available adapter-owned default roots are discovered, optionally restricted by
+`--harness`. Root overrides are listed in [source-adapters.md](source-adapters.md).
+
+Selection filters combine with AND. `--session` selects the whole native session;
+`--from-time`/`--to-time` are inclusive creation-time bounds; `--directory` matches
+component descendants; `--model` is an exact normalized identity; and
+`--min-user-turns N` means strictly more than N. Required ancestors/descendants of
+direct matches are retained without selecting unrelated siblings through an
+ancestor. No optional selection filter produces a `broad_selection` report warning.
+
+All default roots freeze and complete read-only identity/conflict/projection
+preflight before writes. Global ordering is creation time (missing last), native
+session ID, harness, then namespace. Dry-run uses that same schedule and performs
+no target writes or writer-lock acquisition. Sources are read-only; no credential
+tables or excluded access/share columns are exported. SQLite input stays in one
+read transaction; selected file streams receive stability checks.
+
+Source discovery evaluates attributable header metadata before freezing bodies.
+Claude mode/cwd preludes and fork-context sidecars, and Gemini's qualified
+persisted project-registry lookup, are described in
+[source-adapters.md](source-adapters.md). Collisions in provably excluded sessions
+do not block the plan. If eligible/unknown or required-relative files still claim
+one native identity, `ambiguous_source` identifies the harness and fails before
+writes; creation time, size and filename are not authority. Narrow the source or
+filter scope, or establish authoritative source data, rather than automatically
+choosing a newest file. Unsupported selected formats and metadata mutations
+remain explicit failures.
+
+The post-correction default-source production dry-run completed with exit 0:
+8 sessions scanned, 4 selected, 9 selected turns, 157 source records and no error
+codes. It imported/updated no turns and retired no traces. Sanitized evidence and
+test commands are in [errors.md](errors.md#source-discovery-correction).
+
+## Remote artifact configuration
+
+The pinned client/server pair supports bounded reads through `mlflow-artifacts:/`
+and the MLflow HTTP(S) artifact proxy. The machine running the importer does not
+need access to the proxy's backing filesystem. Scheme/binding/auth/TLS validation
+and a bounded read-only listing precede target writes, including in dry-run.
+New experiment creation explicitly pins a qualified unique location beneath the
+public Default experiment's location; an unavailable/unqualified hint fails
+before creation rather than trusting an undisclosed server default.
+
+Use standard MLflow settings for both version attestation and artifact reads:
+
+- `MLFLOW_TRACKING_USERNAME` **and** `MLFLOW_TRACKING_PASSWORD` enable Basic
+  authentication, taking precedence over `MLFLOW_TRACKING_TOKEN` (Bearer).
+  Missing environment components fall back to `[mlflow]` entries
+  `mlflow_tracking_username` / `mlflow_tracking_password` in
+  `~/.mlflow/credentials` (bounded to 64 KiB).
+- `MLFLOW_TRACKING_SERVER_CERT_PATH` selects a CA bundle/directory;
+  `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` are fallbacks. An explicit selection
+  replaces default trust roots for artifact GETs and version attestation; it does
+  not add the selected CA to the OS/default trust store.
+- `MLFLOW_TRACKING_CLIENT_CERT_PATH` selects the PEM client certificate/key file.
+- `MLFLOW_TRACKING_INSECURE_TLS=true` disables verification and cannot be combined
+  with `MLFLOW_TRACKING_SERVER_CERT_PATH`.
+
+Custom `MLFLOW_TRACKING_AUTH` plugins and AWS SigV4 are unqualified and fail
+configuration validation. Redirects and HTTP compression are rejected. Listing
+and download envelopes are in [temporary-resources.md](temporary-resources.md).
+An authorization/transport error is never treated as proof that an object is
+absent. `artifact_transport_failed`, `artifact_listing_invalid`,
+`artifact_listing_exhausted`, `artifact_verification_failed` and
+`artifact_http_configuration_invalid` are safe failures, not permission to skip
+verification. Fix the reported condition and rerun for normal recovery.
+
+## Conflict policy and reruns
+
+| `--on-conflict` | Behavior |
+| --- | --- |
+| `overwrite` (default) | Reconcile the canonical imported instance; replace conflicting foreign sessions only after the complete incoming replacement verifies. |
+| `ignore` | Preserve the existing conflicting copy and skip the incoming session after required recovery handling. |
+| `duplicate` | Create an independent import instance; an interrupted same-input attempt resumes that instance. |
+
+Qualified native/legacy aliases are read from both tags and metadata. Bare native
+IDs require an unambiguous source identity; contradictory or cross-root ambiguous
+identity fails rather than guessing. An unchanged verified import reuses trace/map
+IDs and performs zero trace/artifact/tag/state mutations. An append reuses existing
+turns; an edit replaces affected immutable content. Managed mutable tags are
+refreshed/deleted with readback when needed.
+
+With `mapping-v8`, the native session/parent IDs are bare source IDs. Use the
+immutable `mlflow_import.qualified_session_id` creation tag to distinguish source
+stores, and ownership/operation tags to diagnose recovery. Request metadata carries
+only optional `parent_session_id` plus MLflow-owned/promoted API fields. OpenCode
+native cache/cost columns intentionally remain NULL; use canonical accounting in
+the turn/session artifacts for richer raw observations. Absent native client IDs
+and trace names are NULL; `opencode_conversation` is the root span name. Old
+ownership metadata is still read, with conflicting aliases rejected. A mapping
+version change replaces affected traces through the normal verified recovery
+workflow; it does not copy or move reference traces between experiments.
+
+## Recovery and concurrency
+
+A session publishes a bound `prepared` journal, stages tagged traces and shared
+artifacts, verifies the complete replacement set and manifest, publishes
+`ready_to_retire`, retires authorized exact IDs, and publishes `complete`.
+`aborted` records rejected pre-ready work. A source change before ready aborts only
+new staging; a verified ready batch finishes before reconciling changed input.
+Prior verified traces survive failed staging. Partial deletions resume with
+confirmed counts, including empty/zero-turn completion.
+
+Retry the invocation after resolving the safe reported failure. Filters do not
+authorize deletion of unrelated work; pending recovery excluded by selection is
+reported rather than silently ignored. A checksum alone is not retirement
+authority: source/namespace/attempt/instance/chain, manifest, replacement and target
+identity checks must all pass. Old unbound in-flight artifacts fail with
+`attempt_state_invalid`; follow the non-destructive
+[operator procedure](temporary-resources.md#old-unbound-in-flight-journals).
+There is no automatic trust upgrade or destructive repair command.
+
+An OS advisory lock serializes local writers per tracking endpoint/experiment.
+Multi-host writers need external serialization. Retries share finite invocation
+deadlines/work allowances; exhaustion is a reported failure, not a reason to
+continue with incomplete state.
+
+## Privacy, output and lifetime
+
+Default mode is **verbatim** permitted content. `--redact` applies defined secret
+and user-identity detectors before outbound hashing/publication, including encoded
+JSON fragments, malformed assignments, native user metadata and retained raw
+copies. Structural reconciliation IDs and the `user` conversation role remain.
+The result contains safe identifiers/counts/codes, not transcript or tool content.
+`--log-level DEBUG` emits phase/count progress to stderr; final output is stdout.
+
+Exit codes: **0** complete/no-op, **1** item/operational or pending-recovery failure,
+**2** invalid invocation or pre-write failure. Argument syntax errors use argparse
+diagnostics; do not assume every syntax-error response is a JSON result.
+See [result-schema.md](result-schema.md) for machine-readable fields, dry-run plans
+and incomplete emergency accounting.
+
+The CLI streams and closes its result. API users should close the lazy report:
+
+```python
+from contextlib import closing
+from mlflow_import.config import parse_config
+from mlflow_import.importer import build_dependencies, run_import
+from mlflow_import.reporting import iter_json
+
+config = parse_config(["--experiment-name", "coding-sessions", "--dry-run"])
+with closing(run_import(config, build_dependencies(config))) as result:
+    for chunk in iter_json(result):
+        print(chunk, end="")
+```
+
+Do not access the report after close. `render_json()`/`render_human()` intentionally
+materialize strings. Shared temporary exhaustion is terminal; quota increases do
+not make unsupported artifact transports, schemas or journals compatible.
