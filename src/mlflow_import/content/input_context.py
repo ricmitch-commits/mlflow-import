@@ -23,9 +23,10 @@ TURN_MAP_VERSION = "mlflow-import.turn-map.v2"
 
 def context_identity(session: str, turn: str, scope: str, invocation: str) -> str:
     """Logical identity independent of session snapshots and artifact placement."""
-    return "context:" + hashlib.sha256(
-        canonical_json([INPUT_CONTEXT_VERSION, session, turn, scope, invocation])
-    ).hexdigest()
+    return (
+        "context:"
+        + hashlib.sha256(canonical_json([INPUT_CONTEXT_VERSION, session, turn, scope, invocation])).hexdigest()
+    )
 
 
 def source_reference(record: SourceRecord, source_key: str, component: str) -> dict[str, Any]:
@@ -169,8 +170,10 @@ def validate_input_contexts(
         key = record.get("source_key")
         occurrence, entity = record.get("occurrence_id"), record.get("entity_id")
         scope = record.get("scope")
-        if not isinstance(key, str) or not isinstance(scope, str) or any(
-            value is not None and not isinstance(value, str) for value in (occurrence, entity)
+        if (
+            not isinstance(key, str)
+            or not isinstance(scope, str)
+            or any(value is not None and not isinstance(value, str) for value in (occurrence, entity))
         ):
             return False
         refs[(key, occurrence, entity)] = scope
@@ -219,9 +222,8 @@ def validate_input_contexts(
             or type(descriptor.get("empty")) is not bool
             or not isinstance(origin, str)
             or origin not in {"derived-observed-conversation", "recorded-request-input", "unavailable"}
-            or descriptor.get("provider_request") != (
-                "recorded-input-only" if origin == "recorded-request-input" else "unknown"
-            )
+            or descriptor.get("provider_request")
+            != ("recorded-input-only" if origin == "recorded-request-input" else "unknown")
         ):
             return False
         for field_name in ("invocation_sources", "delta"):

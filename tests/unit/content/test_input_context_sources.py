@@ -42,21 +42,47 @@ def values(harness):
     if harness == "claude":
         return [
             {"sessionId": "s", "type": "user", "uuid": "u", "message": {"role": "user", "content": "prompt"}},
-            {"sessionId": "s", "type": "assistant", "uuid": "a", "parentUuid": "u",
-             "message": {**assistant, "id": "inv-a", "content": [{"type": "tool_use", **tool}]}},
-            {"sessionId": "s", "type": "user", "uuid": "r", "parentUuid": "a", "message": {
-                "role": "user", "content": [{"type": "tool_result", "tool_use_id": "c", "content": "actual result"}]}},
-            {"sessionId": "s", "type": "assistant", "uuid": "z", "parentUuid": "r",
-             "message": {**final, "id": "inv-z"}},
+            {
+                "sessionId": "s",
+                "type": "assistant",
+                "uuid": "a",
+                "parentUuid": "u",
+                "message": {**assistant, "id": "inv-a", "content": [{"type": "tool_use", **tool}]},
+            },
+            {
+                "sessionId": "s",
+                "type": "user",
+                "uuid": "r",
+                "parentUuid": "a",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "c", "content": "actual result"}],
+                },
+            },
+            {
+                "sessionId": "s",
+                "type": "assistant",
+                "uuid": "z",
+                "parentUuid": "r",
+                "message": {**final, "id": "inv-z"},
+            },
         ]
     if harness == "pi":
         return [
             {"type": "session", "version": 3, "id": "s"},
             {"type": "message", "id": "u", "parentId": None, "message": {"role": "user", "content": "prompt"}},
-            {"type": "message", "id": "a", "parentId": "u", "message": {
-                **assistant, "content": [{"type": "toolCall", **tool, "arguments": tool["input"]}]}},
-            {"type": "message", "id": "r", "parentId": "a", "message": {
-                "role": "toolResult", "toolCallId": "c", "content": "actual result"}},
+            {
+                "type": "message",
+                "id": "a",
+                "parentId": "u",
+                "message": {**assistant, "content": [{"type": "toolCall", **tool, "arguments": tool["input"]}]},
+            },
+            {
+                "type": "message",
+                "id": "r",
+                "parentId": "a",
+                "message": {"role": "toolResult", "toolCallId": "c", "content": "actual result"},
+            },
             {"type": "message", "id": "z", "parentId": "r", "message": final},
         ]
     if harness == "gemini":
@@ -64,8 +90,13 @@ def values(harness):
             {"sessionId": "s", "projectHash": "synthetic"},
             {"type": "user", "id": "u", "content": "prompt"},
             {"type": "gemini", "id": "a", "model": "synthetic/model", "content": "obsolete"},
-            {"type": "gemini", "id": "a", "model": "synthetic/model", "content": "before",
-             "toolCalls": [{"id": "c", "name": "read", "args": tool["input"]}]},
+            {
+                "type": "gemini",
+                "id": "a",
+                "model": "synthetic/model",
+                "content": "before",
+                "toolCalls": [{"id": "c", "name": "read", "args": tool["input"]}],
+            },
             {"$patch": {"id": "a", "toolCalls": [{"id": "c", "result": "actual result"}]}},
             {"type": "gemini", "id": "z", "model": "synthetic/model", "content": "final"},
             {"type": "user", "id": "discarded", "content": "inactive private branch"},
@@ -76,11 +107,20 @@ def values(harness):
         {"type": "response_item", "payload": {"id": "u", "type": "message", "role": "user", "content": "prompt"}},
         {"type": "turn_context", "payload": {"model": "synthetic/model"}},
         {"type": "response_item", "payload": {"id": "a", "type": "message", **assistant}},
-        {"type": "response_item", "payload": {
-            "id": "call", "type": "function_call", "call_id": "c", "name": "read",
-            "arguments": '{"path":"literal path"}'}},
-        {"type": "response_item", "payload": {
-            "id": "r", "type": "function_call_output", "call_id": "c", "output": "actual result"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "id": "call",
+                "type": "function_call",
+                "call_id": "c",
+                "name": "read",
+                "arguments": '{"path":"literal path"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"id": "r", "type": "function_call_output", "call_id": "c", "output": "actual result"},
+        },
         {"type": "response_item", "payload": {"id": "z", "type": "message", **final}},
     ]
 
@@ -100,16 +140,29 @@ def frozen(tmp_path, source, mode):
 
     if source.startswith("opencode"):
         user = {"role": "user", "content": "prompt"}
-        assistant = {"role": "assistant", "model": "synthetic/model", "content": [{
-            "type": "tool", "tool": "read", "callID": "c",
-            "state": {"input": {"path": "literal path"}, "output": "actual result", "status": "completed"}}]}
+        assistant = {
+            "role": "assistant",
+            "model": "synthetic/model",
+            "content": [
+                {
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": "c",
+                    "state": {"input": {"path": "literal path"}, "output": "actual result", "status": "completed"},
+                }
+            ],
+        }
         final = {"role": "assistant", "model": "synthetic/model", "content": "final", "finish": "stop"}
         if source == "opencode-current":
-            path = build_current_source_db(tmp_path, sessions=[("s", 1000)], messages=[
-                ("u", "s", "user", 1, json.dumps(user)),
-                ("a", "s", "assistant", 2, json.dumps(assistant)),
-                ("z", "s", "assistant", 3, json.dumps(final)),
-            ])
+            path = build_current_source_db(
+                tmp_path,
+                sessions=[("s", 1000)],
+                messages=[
+                    ("u", "s", "user", 1, json.dumps(user)),
+                    ("a", "s", "assistant", 2, json.dumps(assistant)),
+                    ("z", "s", "assistant", 3, json.dumps(final)),
+                ],
+            )
             db = sqlite3.connect(path)
             try:
                 exporter = CurrentAdapter(db, CURRENT_CATALOG_V1)
@@ -123,8 +176,10 @@ def frozen(tmp_path, source, mode):
                     db.execute(f"DELETE FROM {table}")
                 db.execute("INSERT INTO session(id,time_created) VALUES('s',1000)")
                 for i, (key, value) in enumerate((("u", user), ("a", assistant), ("z", final)), 1):
-                    db.execute("INSERT INTO message(id,session_id,time_created,data) VALUES(?,'s',?,?)",
-                               (key, i * 1000, json.dumps(value)))
+                    db.execute(
+                        "INSERT INTO message(id,session_id,time_created,data) VALUES(?,'s',?,?)",
+                        (key, i * 1000, json.dumps(value)),
+                    )
                 exporter = LegacyAdapter(db, LEGACY_CATALOG_V1)
         context = create_normalized_snapshot(path, tmp_path, exporter, redact)
     else:
@@ -164,8 +219,14 @@ def test_six_source_deltas_map_and_full_artifact_remain_consistent(tmp_path, sou
             assert b"obsolete" not in canonical_json([s.inputs for s in calls])
             origin = calls[0].attributes[INPUT_CONTEXT_ATTRIBUTE]["invocation_sources"][0]["occurrence_id"]
             assert "effective:" in origin
-        context = MappingContext("0.1.0", MAPPING_VERSION, ARTIFACT_SCHEMA_VERSION,
-                                 turn.session_header.adapter_generation, mode, "local-only")
+        context = MappingContext(
+            "0.1.0",
+            MAPPING_VERSION,
+            ARTIFACT_SCHEMA_VERSION,
+            turn.session_header.adapter_generation,
+            mode,
+            "local-only",
+        )
         mapped = map_turn_to_trace(turn, context)
         assert b"prompt" in canonical_json(mapped.root_inputs)
         repeated = map_turn_to_trace(turn, context)
@@ -220,12 +281,15 @@ def test_upload_bundle_persists_validator_compatible_linear_index_without_target
         value = captured["map.json"]
         assert validate_input_contexts(value, ownership)
         spans = [SimpleNamespace(span_id="root", trace_id="trace", parent_id=None, attributes={})]
-        spans.extend(SimpleNamespace(span_id=span_ids[s.source_key], trace_id="trace", parent_id="root",
-                                     attributes=s.attributes) for s in specs)
+        spans.extend(
+            SimpleNamespace(span_id=span_ids[s.source_key], trace_id="trace", parent_id="root", attributes=s.attributes)
+            for s in specs
+        )
         assert validate_input_contexts(value, ownership, spans=spans)
         assert len(value["input_contexts"]) == 2
-        assert value["input_contexts"][1]["descriptor"]["previous_context_id"] == (
-            value["input_contexts"][0]["descriptor"]["context_id"]
+        assert (
+            value["input_contexts"][1]["descriptor"]["previous_context_id"]
+            == (value["input_contexts"][0]["descriptor"]["context_id"])
         )
 
 
@@ -240,18 +304,26 @@ def test_sibling_append_changes_session_artifact_but_not_existing_turn_context_o
             header = next(adapter.iter_session_headers())
             summary = next(indexed_turn_summaries(snapshot, header.session_id))
             turn = build_replay_turn(snapshot, header, summary)
-            context = MappingContext("0.1.0", MAPPING_VERSION, ARTIFACT_SCHEMA_VERSION,
-                                     header.adapter_generation, RedactionMode.VERBATIM, "local-only")
+            context = MappingContext(
+                "0.1.0",
+                MAPPING_VERSION,
+                ARTIFACT_SCHEMA_VERSION,
+                header.adapter_generation,
+                RedactionMode.VERBATIM,
+                "local-only",
+            )
             mapped = map_turn_to_trace(turn, context)
             full = io.BytesIO()
             stream_session_object(turn, full, RedactionMode.VERBATIM)
             return mapped, list(mapped.child_specs()), full.getvalue()
 
     before, before_children, before_artifact = capture()
-    original.extend([
-        {"type": "user", "id": "sibling-user", "content": "later sibling prompt"},
-        {"type": "gemini", "id": "sibling-answer", "model": "synthetic/model", "content": "later answer"},
-    ])
+    original.extend(
+        [
+            {"type": "user", "id": "sibling-user", "content": "later sibling prompt"},
+            {"type": "gemini", "id": "sibling-answer", "model": "synthetic/model", "content": "later answer"},
+        ]
+    )
     path.write_text("".join(json.dumps(value) + "\n" for value in original))
     after, after_children, after_artifact = capture()
     assert before_artifact != after_artifact
@@ -277,13 +349,26 @@ def test_pi_persisted_accounting_entries_do_not_consume_conversation_inputs(
     else:
         sequence = original[:2]
         parent = "u"
-    sequence.append({"type": operation, "id": "accounting", "parentId": parent,
-                     "usage": {"input": 1, "output": 1}, "summary": "accounting-only summary"})
+    sequence.append(
+        {
+            "type": operation,
+            "id": "accounting",
+            "parentId": parent,
+            "usage": {"input": 1, "output": 1},
+            "summary": "accounting-only summary",
+        }
+    )
     sequence.append({**original[-1], "parentId": "accounting"})
     monkeypatch.setitem(globals(), "values", lambda _: sequence)
     with frozen(tmp_path, "pi", RedactionMode.VERBATIM) as turn:
-        context = MappingContext("0.1.0", MAPPING_VERSION, ARTIFACT_SCHEMA_VERSION,
-                                 turn.session_header.adapter_generation, RedactionMode.VERBATIM, "local-only")
+        context = MappingContext(
+            "0.1.0",
+            MAPPING_VERSION,
+            ARTIFACT_SCHEMA_VERSION,
+            turn.session_header.adapter_generation,
+            RedactionMode.VERBATIM,
+            "local-only",
+        )
         request = admit_trace(map_turn_to_trace(turn, context).to_create_request()).request
         children = list(request.child_specs())
         unavailable = next(s for s in children if s.attributes.get("mlflow_import.source_id") == "accounting")
@@ -295,8 +380,9 @@ def test_pi_persisted_accounting_entries_do_not_consume_conversation_inputs(
             assert final.inputs["messages"][0]["tool_calls"][0]["id"] == "c"
         else:
             assert final.inputs["messages"] == [{"role": "user", "content": "prompt"}]
-        assert final.attributes[INPUT_CONTEXT_ATTRIBUTE]["previous_context_id"] == (
-            unavailable.attributes[INPUT_CONTEXT_ATTRIBUTE]["context_id"]
+        assert (
+            final.attributes[INPUT_CONTEXT_ATTRIBUTE]["previous_context_id"]
+            == (unavailable.attributes[INPUT_CONTEXT_ATTRIBUTE]["context_id"])
         )
         validate_turn_map_admission(turn, request, RedactionMode.VERBATIM)
         value = json.loads(b"".join(iter_canonical_json(_prospective_turn_map(turn, request, RedactionMode.VERBATIM))))

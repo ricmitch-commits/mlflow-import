@@ -200,7 +200,8 @@ def test_historical_marker_is_recognized_but_unqualified_migration_is_blocked(
     def artifact_snapshot():
         return {
             str(path.relative_to(artifact_root)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in artifact_root.rglob("*") if path.is_file()
+            for path in artifact_root.rglob("*")
+            if path.is_file()
         }
 
     artifacts_before = artifact_snapshot()
@@ -212,6 +213,7 @@ def test_historical_marker_is_recognized_but_unqualified_migration_is_blocked(
         def forbidden(*args, **kwargs):
             forbidden_calls.append(name)
             raise AssertionError("unqualified historical migration reached " + name)
+
         return forbidden
 
     with monkeypatch.context() as patch:
@@ -225,8 +227,13 @@ def test_historical_marker_is_recognized_but_unqualified_migration_is_blocked(
         for name in ("start_trace", "log_spans"):
             patch.setattr(TracingClient, name, forbid("TracingClient." + name, getattr(TracingClient, name)))
         for name in (
-            "create_trace", "upload_named_json", "publish_experiment_file", "record_artifact_verification",
-            "reconcile_tags", "retire_trace", "retire_conflict",
+            "create_trace",
+            "upload_named_json",
+            "publish_experiment_file",
+            "record_artifact_verification",
+            "reconcile_tags",
+            "retire_trace",
+            "retire_conflict",
         ):
             patch.setattr(MlflowGateway, name, forbid("MlflowGateway." + name, getattr(MlflowGateway, name)))
         patch.setattr(AttemptJournal, "publish", forbid("AttemptJournal.publish", AttemptJournal.publish))

@@ -412,9 +412,7 @@ def test_root_status_outcome_and_timing_metadata(imported: ImportedSession, expe
         # Source-derived timing, never the local wall clock.
         assert root.start_time_ns == request.start_time_ns
         assert root.end_time_ns == request.end_time_ns
-        assert trace.info.tags.get("opencode.timing_estimated") == request.root_tags.get(
-            "opencode.timing_estimated"
-        )
+        assert trace.info.tags.get("opencode.timing_estimated") == request.root_tags.get("opencode.timing_estimated")
 
 
 def test_token_and_cost_metadata(imported: ImportedSession, expected: ExpectedMapping) -> None:

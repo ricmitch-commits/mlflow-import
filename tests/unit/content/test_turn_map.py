@@ -45,22 +45,30 @@ def admitted(records, *, harness="claude", mode=RedactionMode.VERBATIM):
         "opencode.importer_version": "0.1.0",
         "opencode.redaction_mode": mode.value,
     }
-    envelope = admit_trace(trace_spec(
-        metadata={}, root_tags=ownership, root_attributes={"mlflow_import.accounting": activity.provenance},
-        children=children, owned=False,
-    ))
+    envelope = admit_trace(
+        trace_spec(
+            metadata={},
+            root_tags=ownership,
+            root_attributes={"mlflow_import.accounting": activity.provenance},
+            children=children,
+            owned=False,
+        )
+    )
     return turn, envelope
 
 
 def actual_map(turn, request, *, trace_id="tr-" + "a" * 32, short_spans=False):
     children = tuple(request.child_specs())
-    span_ids = {child.source_key: (f"s{i}" if short_spans else f"{i:016x}")
-                for i, child in enumerate(children, 1)}
+    span_ids = {child.source_key: (f"s{i}" if short_spans else f"{i:016x}") for i, child in enumerate(children, 1)}
     return build_turn_map(
-        turn, children=children, accounting=request.root_attributes["mlflow_import.accounting"],
-        ownership=request_ownership(request), trace_id=trace_id,
+        turn,
+        children=children,
+        accounting=request.root_attributes["mlflow_import.accounting"],
+        ownership=request_ownership(request),
+        trace_id=trace_id,
         root_span_id="root" if short_spans else "f" * MAX_GENERATED_SPAN_ID_CHARS,
-        span_ids_by_source=span_ids, mode=RedactionMode.VERBATIM,
+        span_ids_by_source=span_ids,
+        mode=RedactionMode.VERBATIM,
     )
 
 
@@ -70,8 +78,7 @@ def streamed_size(value):
 
 def test_finite_trace_with_500_long_source_ids_is_rejected_by_turn_map_preflight():
     records = [record("u", "user", "prompt")]
-    records.extend(record(f"{i:03}-" + "x" * 1800, "assistant", "answer", model="synthetic/model")
-                   for i in range(500))
+    records.extend(record(f"{i:03}-" + "x" * 1800, "assistant", "answer", model="synthetic/model") for i in range(500))
     turn, envelope = admitted(records)
     assert envelope.span_count == 501
     assert envelope.serialized_span_upper_bound < MAX_TRACE_SERIALIZED_SPAN_BYTES
@@ -139,11 +146,17 @@ def test_preflight_uses_the_admitted_snapshot_once_without_reprojecting_or_repri
 def test_late_artifact_nonce_tags_and_session_pointer_do_not_change_prospective_map():
     turn, envelope = admitted(conversation(3))
     request = envelope.request
-    decorated = replace(request, artifact_relative_path="changed-create-nonce.json", root_tags={
-        **request.root_tags, "opencode.artifact_path": "changed-create-nonce.json",
-        "mlflow_import.turn_map": "changed-create-nonce.json", "mlflow_import.session_artifact": "later.json",
-        "mlflow_import.attempt_id": "late-attempt",
-    })
+    decorated = replace(
+        request,
+        artifact_relative_path="changed-create-nonce.json",
+        root_tags={
+            **request.root_tags,
+            "opencode.artifact_path": "changed-create-nonce.json",
+            "mlflow_import.turn_map": "changed-create-nonce.json",
+            "mlflow_import.session_artifact": "later.json",
+            "mlflow_import.attempt_id": "late-attempt",
+        },
+    )
     before = b"".join(iter_turn_map_json(_prospective_turn_map(turn, request, RedactionMode.VERBATIM)))
     after = b"".join(iter_turn_map_json(_prospective_turn_map(turn, decorated, RedactionMode.VERBATIM)))
     assert before == after
@@ -152,15 +165,23 @@ def test_late_artifact_nonce_tags_and_session_pointer_do_not_change_prospective_
 def test_shared_builder_indexes_aliases_contexts_root_targets_and_all_actual_spans():
     records = conversation(2)
     first = records[1]
-    records.insert(2, replace(first, source_id="fragment", occurrence_id="effective:fragment",
-                              decoded_value={"role": "assistant", "content": "coalesced"}))
+    records.insert(
+        2,
+        replace(
+            first,
+            source_id="fragment",
+            occurrence_id="effective:fragment",
+            decoded_value={"role": "assistant", "content": "coalesced"},
+        ),
+    )
     turn, envelope = admitted(records)
     request = envelope.request
     value = json.loads(b"".join(iter_turn_map_json(actual_map(turn, request))))
     spans = [SimpleNamespace(span_id="f" * 16, trace_id="tr-" + "a" * 32, parent_id=None, attributes={})]
-    spans.extend(SimpleNamespace(span_id=f"{i:016x}", trace_id="tr-" + "a" * 32,
-                                 parent_id="f" * 16, attributes=child.attributes)
-                 for i, child in enumerate(request.child_specs(), 1))
+    spans.extend(
+        SimpleNamespace(span_id=f"{i:016x}", trace_id="tr-" + "a" * 32, parent_id="f" * 16, attributes=child.attributes)
+        for i, child in enumerate(request.child_specs(), 1)
+    )
     assert validate_input_contexts(value, request_ownership(request), spans=spans)
     assert value["records"][0]["span_ids"] == ["f" * 16]
     by_source = {entry["source_id"]: entry["span_ids"] for entry in value["records"]}
@@ -178,13 +199,24 @@ def test_context_validation_accepts_real_pinned_sdk_span_entities_without_a_targ
     children = tuple(request.child_specs())
 
     def span(span_id, parent, attributes):
-        return Span.from_dict({
-            "trace_id": trace_id, "span_id": span_id, "parent_span_id": parent, "name": "local-only",
-            "start_time_unix_nano": 1, "end_time_unix_nano": 2, "status": {"code": "STATUS_CODE_OK"},
-            "attributes": {key: json.dumps(val) for key, val in {
-                **attributes, "mlflow.traceRequestId": trace_id,
-            }.items()},
-        })
+        return Span.from_dict(
+            {
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "parent_span_id": parent,
+                "name": "local-only",
+                "start_time_unix_nano": 1,
+                "end_time_unix_nano": 2,
+                "status": {"code": "STATUS_CODE_OK"},
+                "attributes": {
+                    key: json.dumps(val)
+                    for key, val in {
+                        **attributes,
+                        "mlflow.traceRequestId": trace_id,
+                    }.items()
+                },
+            }
+        )
 
     spans = [span("f" * 16, None, {})]
     spans.extend(span(f"{i:016x}", "f" * 16, child.attributes) for i, child in enumerate(children, 1))

@@ -506,8 +506,7 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         results = [
             (ordinal, part)
             for ordinal, part in enumerate(parts)
-            if enum_text(part.get("type")) in {"tool_result", "function_call_output"}
-            or part.get("functionResponse")
+            if enum_text(part.get("type")) in {"tool_result", "function_call_output"} or part.get("functionResponse")
         ]
         if root_part is not None:
             results.append((-1, root_part))
@@ -520,7 +519,8 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         def references(component: str, record: SourceRecord = record, key: str = key) -> list[dict[str, Any]]:
             children = children_by_parent.get(record.source_id or "", [])
             if (
-                component == "content" and children
+                component == "content"
+                and children
                 and not isinstance(object_map(record.decoded_value).get("content"), str)
             ):
                 return [source_reference(child, SourceIdentity.of(child).key, "content") for child in children]
@@ -544,12 +544,14 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         call = call_by_record.get(key)
         if call is not None and call.key not in call_inputs:
             source_keys = [SourceIdentity.of(item).key for item in call.records]
-            sources = [source_reference(item, item_key, "assistant") for item, item_key in zip(
-                call.records, source_keys, strict=True
-            )]
+            sources = [
+                source_reference(item, item_key, "assistant")
+                for item, item_key in zip(call.records, source_keys, strict=True)
+            ]
             sources.extend(
                 source_reference(child, SourceIdentity.of(child).key, "content")
-                for item in call.records for child in children_by_parent.get(item.source_id or "", [])
+                for item in call.records
+                for child in children_by_parent.get(item.source_id or "", [])
             )
             call_inputs[call.key], call_contexts[call.key] = context.consume(
                 scope,
@@ -561,18 +563,29 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
             if not accounting_only:
                 context.assistant(scope, chat_message(call, children_by_parent), sources)
         elif call is None and container and record.classification == "assistant" and not accounting_only:
-            context.assistant(scope, chat_message(Invocation(key, records=[record]), children_by_parent),
-                              references("assistant"))
+            context.assistant(
+                scope, chat_message(Invocation(key, records=[record]), children_by_parent), references("assistant")
+            )
         if call is None and decoded.get("type") == "function_call":
             arguments = decoded.get("arguments")
             context.observe(
                 scope,
-                {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": decoded.get("call_id"),
-                    "type": "function",
-                    "function": {"name": decoded.get("name"), "arguments": arguments
-                                 if isinstance(arguments, str) else json.dumps(arguments, sort_keys=True)},
-                }]},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": decoded.get("call_id"),
+                            "type": "function",
+                            "function": {
+                                "name": decoded.get("name"),
+                                "arguments": arguments
+                                if isinstance(arguments, str)
+                                else json.dumps(arguments, sort_keys=True),
+                            },
+                        }
+                    ],
+                },
                 references("function_call"),
             )
         for ordinal, part in results:

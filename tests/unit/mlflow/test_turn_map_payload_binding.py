@@ -34,8 +34,12 @@ def test_checksummed_context_map_must_bind_to_actual_writer_created_spans(tmp_pa
         created = gateway.create_trace(request)
         gateway.verify_trace(created, request)
         uploaded = upload_artifact(
-            turn, created, request.artifact_relative_path, RedactionMode.VERBATIM,
-            gateway=gateway, temporary_directory=tmp_path,
+            turn,
+            created,
+            request.artifact_relative_path,
+            RedactionMode.VERBATIM,
+            gateway=gateway,
+            temporary_directory=tmp_path,
         )
     gateway.record_artifact_verification(created.trace_id, uploaded.sha256, uploaded.size)
     reference = gateway.replacement_reference(created.trace_id)
@@ -63,7 +67,9 @@ def test_checksummed_context_map_must_bind_to_actual_writer_created_spans(tmp_pa
         old_context, old_invocation = descriptor["context_id"], descriptor["invocation_id"]
         descriptor["invocation_id"] = "forged-invocation"
         descriptor["context_id"] = context_identity(
-            descriptor["qualified_session_id"], descriptor["turn_key"], descriptor["scope"],
+            descriptor["qualified_session_id"],
+            descriptor["turn_key"],
+            descriptor["scope"],
             descriptor["invocation_id"],
         )
         for entry in value["input_contexts"]:

@@ -37,20 +37,39 @@ def preview_server():
 def _request(experiment_id, prompt, response, status="OK"):
     start = 1_794_580_115_471_000_000
     child = TraceChildRequest(
-        source_key="tool", name="tool", span_type="TOOL", parent_source_key=None,
-        inputs={"query": "structured request"}, outputs={"result": "structured response"},
-        attributes={}, tags={}, start_time_ns=start + 100, end_time_ns=start + 1000, status="UNSET",
+        source_key="tool",
+        name="tool",
+        span_type="TOOL",
+        parent_source_key=None,
+        inputs={"query": "structured request"},
+        outputs={"result": "structured response"},
+        attributes={},
+        tags={},
+        start_time_ns=start + 100,
+        end_time_ns=start + 1000,
+        status="UNSET",
     )
     return TraceCreateRequest(
-        client_request_id=None, experiment_id=experiment_id, name="synthetic root",
+        client_request_id=None,
+        experiment_id=experiment_id,
+        name="synthetic root",
         native_session_id="preview-session",
         root_inputs={"messages": [{"role": "user", "content": [{"type": "image", "url": "synthetic"}]}]},
         root_outputs={"tool_calls": [{"name": "synthetic", "arguments": {"query": "structured"}}]},
-        root_attributes={}, root_tags={}, metadata={}, start_time_ns=start, end_time_ns=start + 2_000_000,
-        child_specs=lambda: iter((child,)), expected_operation_key="synthetic",
-        artifact_snapshot_fingerprint="a" * 64, artifact_relative_path="synthetic.json",
-        root_status=status, historical=True, trace_name="opencode",
-        request_preview=prompt, response_preview=response,
+        root_attributes={},
+        root_tags={},
+        metadata={},
+        start_time_ns=start,
+        end_time_ns=start + 2_000_000,
+        child_specs=lambda: iter((child,)),
+        expected_operation_key="synthetic",
+        artifact_snapshot_fingerprint="a" * 64,
+        artifact_relative_path="synthetic.json",
+        root_status=status,
+        historical=True,
+        trace_name="opencode",
+        request_preview=prompt,
+        response_preview=response,
     )
 
 
@@ -110,12 +129,21 @@ def test_unprojected_nulls_autofill_and_still_fail_strict_verification(preview_s
 def test_session_import_prepared_resume_and_mutation_free_rerun(preview_server, tmp_path, monkeypatch, interruption):
     # Neither message has display text, but both retain structured source content.
     user = {"content": [{"type": "image", "url": "synthetic-image"}]}
-    assistant = {"finish": "stop", "content": [{
-        "type": "tool", "tool": "synthetic", "call_id": "synthetic-call",
-        "state": {"input": {"query": "synthetic"}, "output": {"result": "synthetic"}, "status": "completed"},
-    }]}
+    assistant = {
+        "finish": "stop",
+        "content": [
+            {
+                "type": "tool",
+                "tool": "synthetic",
+                "call_id": "synthetic-call",
+                "state": {"input": {"query": "synthetic"}, "output": {"result": "synthetic"}, "status": "completed"},
+            }
+        ],
+    }
     source = build_current_source_db(
-        tmp_path, sessions=[("preview-session", 1000)], messages=[
+        tmp_path,
+        sessions=[("preview-session", 1000)],
+        messages=[
             ("u", "preview-session", "user", 1000, json.dumps(user)),
             ("a", "preview-session", "assistant", 2000, json.dumps(assistant)),
         ],
@@ -146,6 +174,7 @@ def test_session_import_prepared_resume_and_mutation_free_rerun(preview_server, 
 
         gateway.create_trace = capture
         if captured["seed_autofill"]:
+
             def interrupted_rollback(*args, **kwargs):
                 raise ItemImportError("injected_rollback_interruption", "synthetic interruption")
 
@@ -154,8 +183,11 @@ def test_session_import_prepared_resume_and_mutation_free_rerun(preview_server, 
 
     def run(gateway_factory=factory):
         result = run_real_import(
-            server_uri=preview_server.uri, source=source, experiment_name=name,
-            tmp_root=tmp_path, gateway_factory=gateway_factory,
+            server_uri=preview_server.uri,
+            source=source,
+            experiment_name=name,
+            tmp_root=tmp_path,
+            gateway_factory=gateway_factory,
         )
         runs.append(result)
         return result
@@ -219,8 +251,11 @@ def test_session_import_prepared_resume_and_mutation_free_rerun(preview_server, 
                 pytest.fail("unchanged preview rerun must not mutate the target")
 
             for method in (
-                "create_trace", "retire_trace", "record_artifact_verification",
-                "upload_named_json", "publish_experiment_file",
+                "create_trace",
+                "retire_trace",
+                "record_artifact_verification",
+                "upload_named_json",
+                "publish_experiment_file",
             ):
                 monkeypatch.setattr(gateway, method, forbidden)
             for method in ("set_trace_tag", "delete_trace_tag", "delete_traces"):

@@ -43,7 +43,7 @@ class ContainerProfile:
             # Read only these owned containers' cgroups. The shell reads avoid
             # requiring any optional Python/ps utility in postgres:alpine.
             script = (
-                'for f in memory.current memory.peak memory.events; do '
+                "for f in memory.current memory.peak memory.events; do "
                 'while IFS= read -r line; do printf "%s %s\\n" "$f" "$line"; '
                 'done < "/sys/fs/cgroup/$f"; done'
             )
@@ -107,10 +107,22 @@ def disposable_container_profile():
                 engine("image", "inspect", base)
             probe = prefix + "-driver-check"
             containers.append(probe)
-            installed = engine(
-                "run", "--rm", "--name", probe, "--network", "none", MLFLOW_IMAGE,
-                "python", "-c", "import psycopg2", check=False,
-            ).returncode == 0
+            installed = (
+                engine(
+                    "run",
+                    "--rm",
+                    "--name",
+                    probe,
+                    "--network",
+                    "none",
+                    MLFLOW_IMAGE,
+                    "python",
+                    "-c",
+                    "import psycopg2",
+                    check=False,
+                ).returncode
+                == 0
+            )
             selected_image = MLFLOW_IMAGE
             if not installed:
                 (directory / "Dockerfile").write_text(
@@ -132,10 +144,26 @@ def disposable_container_profile():
                 volumes.append(volume)
             containers.append(db)
             engine(
-                "run", "--detach", "--name", db, "--network", network,
-                "--memory", "1g", "--memory-swap", "1g", "--restart", "no",
-                "--env", "POSTGRES_USER=synthetic", "--env", "POSTGRES_PASSWORD=synthetic-local-only",
-                "--env", "POSTGRES_DB=synthetic", "--volume", f"{volumes[0]}:/var/lib/postgresql/data",
+                "run",
+                "--detach",
+                "--name",
+                db,
+                "--network",
+                network,
+                "--memory",
+                "1g",
+                "--memory-swap",
+                "1g",
+                "--restart",
+                "no",
+                "--env",
+                "POSTGRES_USER=synthetic",
+                "--env",
+                "POSTGRES_PASSWORD=synthetic-local-only",
+                "--env",
+                "POSTGRES_DB=synthetic",
+                "--volume",
+                f"{volumes[0]}:/var/lib/postgresql/data",
                 POSTGRES_IMAGE,
             )
             deadline = time.monotonic() + 90
@@ -145,14 +173,40 @@ def disposable_container_profile():
                 time.sleep(0.5)
             containers.append(server)
             engine(
-                "run", "--detach", "--name", server, "--network", network,
-                "--memory", "8g", "--memory-swap", "8g", "--restart", "no",
-                "--publish", "127.0.0.1::5000", "--volume", f"{volumes[1]}:/artifacts",
-                "--env", "MLFLOW_ENABLE_TELEMETRY=false", selected_image,
-                "mlflow", "server", "--workers", "1", "--host", "0.0.0.0", "--port", "5000",
-                "--backend-store-uri", f"postgresql+psycopg2://synthetic:synthetic-local-only@{db}:5432/synthetic",
-                "--artifacts-destination", "/artifacts", "--serve-artifacts",
-                "--allowed-hosts", "127.0.0.1,localhost,127.0.0.1:*,localhost:*",
+                "run",
+                "--detach",
+                "--name",
+                server,
+                "--network",
+                network,
+                "--memory",
+                "8g",
+                "--memory-swap",
+                "8g",
+                "--restart",
+                "no",
+                "--publish",
+                "127.0.0.1::5000",
+                "--volume",
+                f"{volumes[1]}:/artifacts",
+                "--env",
+                "MLFLOW_ENABLE_TELEMETRY=false",
+                selected_image,
+                "mlflow",
+                "server",
+                "--workers",
+                "1",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "5000",
+                "--backend-store-uri",
+                f"postgresql+psycopg2://synthetic:synthetic-local-only@{db}:5432/synthetic",
+                "--artifacts-destination",
+                "/artifacts",
+                "--serve-artifacts",
+                "--allowed-hosts",
+                "127.0.0.1,localhost,127.0.0.1:*,localhost:*",
             )
             binding = engine("port", server, "5000/tcp").stdout.strip()
             assert binding.startswith("127.0.0.1:") and "\n" not in binding
@@ -174,8 +228,7 @@ def disposable_container_profile():
                     if time.monotonic() > deadline or not state["Running"]:
                         logs = engine("logs", "--tail", "40", server, check=False)
                         raise RuntimeError(
-                            f"owned MLflow did not become ready (HTTP {last_status}): "
-                            + logs.stdout + logs.stderr
+                            f"owned MLflow did not become ready (HTTP {last_status}): " + logs.stdout + logs.stderr
                         )
                     time.sleep(0.5)
             yield ContainerProfile(uri, server, db, directory)

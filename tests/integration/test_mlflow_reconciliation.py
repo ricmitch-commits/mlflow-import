@@ -256,9 +256,7 @@ class Baseline:
         page = self.client.search_traces(
             locations=[self.experiment_id], max_results=100, include_spans=False, flush=True
         )
-        return {
-            trace.trace_id for trace in page if trace.info.tags.get("opencode.importer") == "mlflow-import"
-        }
+        return {trace.trace_id for trace in page if trace.info.tags.get("opencode.importer") == "mlflow-import"}
 
 
 def _variant_source(baseline: Baseline, name: str) -> Path:

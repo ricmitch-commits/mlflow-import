@@ -87,15 +87,26 @@ def test_compact_production_mapper_complete_linear_source(tmp_path, calls):
         stream_session_object(turn, retained, RedactionMode.VERBATIM)
         artifact = json.loads(retained.getvalue())
         assert artifact["schema_version"] == "mlflow-import.session.v1"
-        records = {record["source_id"]: record for record in artifact["records"]
-                   if record.get("source_table") == "session_message"}
+        records = {
+            record["source_id"]: record
+            for record in artifact["records"]
+            if record.get("source_table") == "session_message"
+        }
         assert {"u0", *(f"a{i}" for i in range(calls))} <= set(records)
         assert records["u0"]["decoded"]["content"] == PROMPT
         for index in range(calls):
             assert_exact_value(records[f"a{index}"]["decoded"], answer(index, final=index == calls - 1))
-        print(json.dumps({"mapper_calls": calls, "mapped_children": len(children),
-                          "model_input_bytes": input_bytes, "session_bytes": len(retained.getvalue()),
-                          "serialized_span_bound": envelope.serialized_span_upper_bound}))
+        print(
+            json.dumps(
+                {
+                    "mapper_calls": calls,
+                    "mapped_children": len(children),
+                    "model_input_bytes": input_bytes,
+                    "session_bytes": len(retained.getvalue()),
+                    "serialized_span_bound": envelope.serialized_span_upper_bound,
+                }
+            )
+        )
 
 
 def test_compact_production_contexts_resolve_source_values_within_each_scope(tmp_path):
@@ -249,18 +260,27 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
         gateway.create_trace, gateway.publish_experiment_file = create_trace, publish_file
         gateway.replacement_reference = replacement_reference
         if phase == "noop":
+
             def forbidden(*args, **kwargs):
                 pytest.fail("unchanged import attempted a mutation")
-            for method in ("create_trace", "retire_trace", "record_artifact_verification",
-                           "upload_named_json", "publish_experiment_file", "reconcile_tags"):
+
+            for method in (
+                "create_trace",
+                "retire_trace",
+                "record_artifact_verification",
+                "upload_named_json",
+                "publish_experiment_file",
+                "reconcile_tags",
+            ):
                 setattr(gateway, method, forbidden)
             for method in ("set_trace_tag", "delete_trace_tag", "delete_traces", "create_experiment"):
                 setattr(gateway._client, method, forbidden)
         return gateway
 
     def run():
-        result = run_real_import(server_uri=target.uri, source=source, experiment_name=experiment,
-                                 tmp_root=tmp_path, gateway_factory=factory)
+        result = run_real_import(
+            server_uri=target.uri, source=source, experiment_name=experiment, tmp_root=tmp_path, gateway_factory=factory
+        )
         runs.append(result)
         return result
 
@@ -294,8 +314,11 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
             for child in children:
                 span = by_id[created.span_ids_by_source[child.source_key]]
                 assert span.span_type == child.span_type
-                parent = (created.span_ids_by_source[child.parent_source_key]
-                          if child.parent_source_key else created.root_span_id)
+                parent = (
+                    created.span_ids_by_source[child.parent_source_key]
+                    if child.parent_source_key
+                    else created.root_span_id
+                )
                 assert span.parent_id == parent
                 assert_exact_value(span.inputs, child.inputs)
                 assert_exact_value(span.outputs, child.outputs)
@@ -330,8 +353,9 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
                     assert source_record.get("occurrence_id") == ref["occurrence_id"]
             assert PROMPT in [r.get("decoded", {}).get("content") for r in session["records"]]
             for index in range(target.calls):
-                assert_exact_value(records[("session_message", f"a{index}")]["decoded"],
-                                   answer(index, final=index == target.calls - 1))
+                assert_exact_value(
+                    records[("session_message", f"a{index}")]["decoded"], answer(index, final=index == target.calls - 1)
+                )
         assert len(immutable_maps) == len(creates), "physical creates shared an immutable map path"
         phase = "noop"
         again = run()
@@ -341,9 +365,17 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
         with sqlite3.connect(source) as connection:
             connection.executemany(
                 "INSERT INTO session_message(id,session_id,type,seq,time_created,data) VALUES(?,?,?,?,?,?)",
-                [("append-u", SESSION, "user", 10000, 200000, '{"text":"APPEND:prompt"}'),
-                 ("append-a", SESSION, "assistant", 10001, 200001,
-                  '{"model":"synthetic/model","text":"APPEND:answer","finish":"stop"}')],
+                [
+                    ("append-u", SESSION, "user", 10000, 200000, '{"text":"APPEND:prompt"}'),
+                    (
+                        "append-a",
+                        SESSION,
+                        "assistant",
+                        10001,
+                        200001,
+                        '{"model":"synthetic/model","text":"APPEND:answer","finish":"stop"}',
+                    ),
+                ],
             )
         appended = run()
         assert appended.exit_status == 0, appended.report
@@ -372,8 +404,10 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
         gateway._client.delete_trace_tag(proof_id, TRACE_RESOURCE_SPANS_TAG)
         try:
             with monkeypatch.context() as patch:
+
                 def forbidden_full(*args, **kwargs):
                     pytest.fail("unqualified trace reached full-payload retrieval")
+
                 patch.setattr(gateway._client, "get_trace", forbidden_full)
                 assert gateway.trace_exists(proof_id)
                 with pytest.raises(ItemImportError) as caught:
@@ -381,9 +415,17 @@ def test_compact_full_journal_crash_resume_and_logical_reuse(compact_owned_targe
                 assert caught.value.code == "trace_resource_profile_unverified"
         finally:
             gateway._client.set_trace_tag(proof_id, TRACE_RESOURCE_SPANS_TAG, original_proof)
-        print(json.dumps({"backend": "postgres" if target.profile else "sqlite", "calls": target.calls,
-                          "physical_creates": len(creates), "publications": publications,
-                          "artifact_uploads": len(uploads)}))
+        print(
+            json.dumps(
+                {
+                    "backend": "postgres" if target.profile else "sqlite",
+                    "calls": target.calls,
+                    "physical_creates": len(creates),
+                    "publications": publications,
+                    "artifact_uploads": len(uploads),
+                }
+            )
+        )
     finally:
         for result in runs:
             result.result.close()

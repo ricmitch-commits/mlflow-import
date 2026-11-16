@@ -47,8 +47,14 @@ def container_profile():
 
 @pytest.fixture
 def wire(container_profile, monkeypatch):
-    observations = {"requests": 0, "otlp_requests": 0, "otlp_wire_bytes": 0,
-                    "max_full_response_bytes": 0, "full_responses": 0, "max_response_bytes": 0}
+    observations = {
+        "requests": 0,
+        "otlp_requests": 0,
+        "otlp_wire_bytes": 0,
+        "max_full_response_bytes": 0,
+        "full_responses": 0,
+        "max_response_bytes": 0,
+    }
     send = requests.Session.send
     target = urlsplit(container_profile.uri)
 
@@ -80,8 +86,12 @@ def wire(container_profile, monkeypatch):
 @contextmanager
 def memory_observation(profile):
     stop = threading.Event()
-    memory = {"client_peak_rss_bytes": 0, "server_sample_peak_rss_bytes": 0,
-              "db_sample_peak_rss_bytes": 0, "memory_samples": 0}
+    memory = {
+        "client_peak_rss_bytes": 0,
+        "server_sample_peak_rss_bytes": 0,
+        "db_sample_peak_rss_bytes": 0,
+        "memory_samples": 0,
+    }
     errors = []
 
     def observe():
@@ -89,7 +99,10 @@ def memory_observation(profile):
             while not stop.is_set():
                 rss = subprocess.run(
                     ["ps", "-p", str(os.getpid()), "-o", "rss="],
-                    capture_output=True, text=True, check=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=5,
                 )
                 memory["client_peak_rss_bytes"] = max(memory["client_peak_rss_bytes"], int(rss.stdout) * 1024)
                 resources = profile.resources()
@@ -137,11 +150,13 @@ def _request(experiment_id, shape):
         from mlflow_import.contracts import RedactionMode
 
         base = qualification_request(experiment_id, 8)
-        value = DeterministicRedactor(RedactionMode.REDACTED).redact({
-            "password": "synthetic-must-never-persist",
-            "Authorization": "Bearer synthetic-authorization-value",
-            "types": [None, False, True, 0, 7, "7", {"unicode": '雪😀"\\\n'}],
-        })
+        value = DeterministicRedactor(RedactionMode.REDACTED).redact(
+            {
+                "password": "synthetic-must-never-persist",
+                "Authorization": "Bearer synthetic-authorization-value",
+                "types": [None, False, True, 0, 7, "7", {"unicode": '雪😀"\\\n'}],
+            }
+        )
         assert value["password"] == "[REDACTED]"
         assert value["Authorization"] == "Bearer [REDACTED]"
         children = tuple(replace(child, inputs=value, outputs=value) for child in base.child_specs())
@@ -166,11 +181,13 @@ def _artifact_and_read_checks(profile, gateway, created, request):
     trace_id = created.trace_id
     bases = {"synthetic-call": {"catalog": "synthetic-pinned", "input_per_million": 1.25}}
     payload = {
-        "schema_version": "mlflow-import.turn-map.v1", "turn_key": "synthetic-turn",
+        "schema_version": "mlflow-import.turn-map.v1",
+        "turn_key": "synthetic-turn",
         "turn_fingerprint": "a" * 64,
-        "identity_map": {"trace_id": trace_id, **{
-            "span:" + key: value for key, value in created.span_ids_by_source.items()
-        }},
+        "identity_map": {
+            "trace_id": trace_id,
+            **{"span:" + key: value for key, value in created.span_ids_by_source.items()},
+        },
         "accounting": {"invocations": {key: {"cost": {"basis": value}} for key, value in bases.items()}},
     }
     for kind, content in (("turn", json.dumps(payload).encode()), ("session", b'{"synthetic":true}')):
@@ -181,8 +198,10 @@ def _artifact_and_read_checks(profile, gateway, created, request):
         proof = gateway.publish_experiment_file(request.experiment_id, path, local)
         assert proof.sha256 == hashlib.sha256(content).hexdigest()
         if kind == "turn":
-            for key, value in {"opencode.artifact_sha256": proof.sha256,
-                               "opencode.artifact_size": str(proof.size)}.items():
+            for key, value in {
+                "opencode.artifact_sha256": proof.sha256,
+                "opencode.artifact_size": str(proof.size),
+            }.items():
                 gateway._client.set_trace_tag(trace_id, key, value)
         else:
             for suffix, value in (("", path), ("_sha256", proof.sha256), ("_size", str(proof.size))):
@@ -199,9 +218,16 @@ def _artifact_and_read_checks(profile, gateway, created, request):
     assert caught.value.code == "replacement_verification_failed"
 
 
-@pytest.mark.parametrize("shape", [
-    "measured_2105_children", "few_large", "many_small", "combined_near_bound", "redacted_strict_types",
-])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "measured_2105_children",
+        "few_large",
+        "many_small",
+        "combined_near_bound",
+        "redacted_strict_types",
+    ],
+)
 def test_container_trace_capacity(container_profile, wire, shape):
     from mlflow_import.mlflow.trace_envelope import (
         MAX_TRACE_SERIALIZED_SPAN_BYTES,
@@ -217,17 +243,28 @@ def test_container_trace_capacity(container_profile, wire, shape):
         request = _request(experiment_id, shape)
         # Physical creation tags, following the historical gateway contract.
         expected_path = "mlflow-import/v2/qualification/PLACEHOLDER/turn.json"
-        request = replace(request, root_tags={
-            "mlflow_import.importer": "mlflow-import", "mlflow_import.harness": "opencode",
-            "mlflow_import.source_namespace": "synthetic-local",
-            "mlflow_import.session_id": request.native_session_id,
-            "mlflow_import.qualified_session_id": json.dumps([
-                "v1", "opencode", "synthetic-local", request.native_session_id,
-            ]),
-            "mlflow_import.turn_key": "synthetic-turn", "opencode.turn_index": "1",
-            "opencode.render_fingerprint": "a" * 64,
-            "opencode.artifact_path": expected_path, "mlflow_import.turn_map": expected_path,
-        })
+        request = replace(
+            request,
+            root_tags={
+                "mlflow_import.importer": "mlflow-import",
+                "mlflow_import.harness": "opencode",
+                "mlflow_import.source_namespace": "synthetic-local",
+                "mlflow_import.session_id": request.native_session_id,
+                "mlflow_import.qualified_session_id": json.dumps(
+                    [
+                        "v1",
+                        "opencode",
+                        "synthetic-local",
+                        request.native_session_id,
+                    ]
+                ),
+                "mlflow_import.turn_key": "synthetic-turn",
+                "opencode.turn_index": "1",
+                "opencode.render_fingerprint": "a" * 64,
+                "opencode.artifact_path": expected_path,
+                "mlflow_import.turn_map": expected_path,
+            },
+        )
         envelope = admit_trace(request)
         if shape == "measured_2105_children":
             smaller = admit_trace(measured_shape_request(experiment_id, calls=100))
@@ -258,13 +295,24 @@ def test_container_trace_capacity(container_profile, wire, shape):
         actual_path = expected_path.replace("PLACEHOLDER", created.trace_id)
         for key in ("opencode.artifact_path", "mlflow_import.turn_map"):
             gateway._client.set_trace_tag(created.trace_id, key, actual_path)
-        request = replace(request, root_tags={**request.root_tags,
-                          "opencode.artifact_path": actual_path, "mlflow_import.turn_map": actual_path})
+        request = replace(
+            request,
+            root_tags={
+                **request.root_tags,
+                "opencode.artifact_path": actual_path,
+                "mlflow_import.turn_map": actual_path,
+            },
+        )
         del trace, by_id
         _artifact_and_read_checks(container_profile, gateway, created, request)
-    evidence = {"shape": shape, "span_count": envelope.span_count,
-                "serialized_span_bound_bytes": envelope.serialized_span_upper_bound,
-                "seconds": round(time.monotonic() - started, 3), **wire, **memory}
+    evidence = {
+        "shape": shape,
+        "span_count": envelope.span_count,
+        "serialized_span_bound_bytes": envelope.serialized_span_upper_bound,
+        "seconds": round(time.monotonic() - started, 3),
+        **wire,
+        **memory,
+    }
     print(json.dumps(evidence, sort_keys=True))
     assert wire["otlp_requests"] == 1
     assert wire["full_responses"] >= 8
@@ -283,8 +331,9 @@ def test_container_oversize_preflight_zero_calls(container_profile, wire, monkey
     from mlflow_import.mlflow.trace_envelope import MAX_TRACE_SPANS
 
     gateway, experiment_id = _gateway(container_profile)
-    request = qualification_request(experiment_id, MAX_TRACE_SPANS if shape == "too_many" else 10,
-                                    16 if shape == "too_many" else 7 * MIB)
+    request = qualification_request(
+        experiment_id, MAX_TRACE_SPANS if shape == "too_many" else 10, 16 if shape == "too_many" else 7 * MIB
+    )
     attempts = []
 
     def forbidden(*args, **kwargs):

@@ -26,15 +26,15 @@ def emergency_document(config):
 
 
 @pytest.mark.parametrize("failure", ["timeout", "quota", "rendering"])
-def test_cli_emergency_output_roundtrips_through_v1_decoder(
-    config, import_dependencies, monkeypatch, capsys, failure
-):
+def test_cli_emergency_output_roundtrips_through_v1_decoder(config, import_dependencies, monkeypatch, capsys, failure):
     if failure == "rendering":
+
         def fail_render(*args, **kwargs):
             raise RuntimeError("PRIVATE rendering detail")
 
         monkeypatch.setattr(cli, "_stage_output", fail_render)
     else:
+
         def fail_pipeline(*args, **kwargs):
             if failure == "timeout":
                 _BUDGET.get().deadline = -1
@@ -55,11 +55,14 @@ def test_cli_emergency_output_roundtrips_through_v1_decoder(
     assert decoded.original_schema_version == "mlflow-import.result.v1"
     assert document["summary"]["counts_complete"] is False
     assert document["summary"]["turns_imported"] is None
-    assert document["errors"][0]["code"] == {
-        "timeout": "retry_budget_exhausted",
-        "quota": "temporary_storage_exhausted",
-        "rendering": "result_render_failed",
-    }[failure]
+    assert (
+        document["errors"][0]["code"]
+        == {
+            "timeout": "retry_budget_exhausted",
+            "quota": "temporary_storage_exhausted",
+            "rendering": "result_render_failed",
+        }[failure]
+    )
     assert status == 2
     assert "PRIVATE" not in captured.out + captured.err
     assert captured.err == ""
@@ -167,9 +170,7 @@ def test_unavailable_emergency_counters_must_still_be_present(emergency_document
     ],
 )
 @pytest.mark.parametrize("invalid", [-1, True, 0.5, "unavailable", []])
-def test_emergency_count_exception_allows_only_null_or_nonnegative_integer(
-    emergency_document, section, key, invalid
-):
+def test_emergency_count_exception_allows_only_null_or_nonnegative_integer(emergency_document, section, key, invalid):
     emergency_document[section][key] = invalid
     with pytest.raises(ConfigurationError, match="typed v1 schema"):
         decode_result(emergency_document)

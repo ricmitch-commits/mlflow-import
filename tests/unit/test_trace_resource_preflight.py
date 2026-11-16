@@ -26,9 +26,7 @@ def test_later_trace_overflow_prevents_experiment_and_all_writes(import_dependen
         request = original(turn, context)
         projected.append(turn.summary.turn_key)
         if len(projected) == 2:
-            return replace(request, child_specs=lambda: (
-                child_spec(str(index)) for index in range(MAX_TRACE_SPANS)
-            ))
+            return replace(request, child_specs=lambda: (child_spec(str(index)) for index in range(MAX_TRACE_SPANS)))
         return request
 
     dependencies = replace(import_dependencies, mapper=mapper)
@@ -72,8 +70,10 @@ def test_oversize_map_blocks_existing_pending_recovery_before_any_target_mutatio
         interrupted = run_import(config, dependencies)
     assert interrupted.error is None, interrupted.error
     assert interrupted.failed_items > 0
-    assert journals, [(session.get("error_code"), [turn.get("error_code") for turn in session["turns"]])
-                      for session in interrupted.report["sessions"]]
+    assert journals, [
+        (session.get("error_code"), [turn.get("error_code") for turn in session["turns"]])
+        for session in interrupted.report["sessions"]
+    ]
     experiment_id, prefix = journals[-1]
     states = list(AttemptJournal(gateway, experiment_id, prefix).attempts())
     assert len(states) == 1 and pending_state in states[0]
@@ -88,10 +88,16 @@ def test_oversize_map_blocks_existing_pending_recovery_before_any_target_mutatio
             "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)"
             " VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
             [
-                (f"assistant-{index}-" + "x" * 2000, SESSION, 2000 + index,
-                 DEFAULT_SESSION_CREATED_MS + 2010000 + index * 1000,
-                 DEFAULT_SESSION_CREATED_MS + 2010000 + index * 1000,
-                 json.dumps({"role": "assistant", "model": "synthetic/model", "content": "answer", "finish": "stop"}))
+                (
+                    f"assistant-{index}-" + "x" * 2000,
+                    SESSION,
+                    2000 + index,
+                    DEFAULT_SESSION_CREATED_MS + 2010000 + index * 1000,
+                    DEFAULT_SESSION_CREATED_MS + 2010000 + index * 1000,
+                    json.dumps(
+                        {"role": "assistant", "model": "synthetic/model", "content": "answer", "finish": "stop"}
+                    ),
+                )
                 for index in range(500)
             ],
         )
@@ -116,11 +122,18 @@ def test_oversize_map_blocks_existing_pending_recovery_before_any_target_mutatio
         def forbidden(*args, **kwargs):
             mutation_calls.append(name)
             raise AssertionError("oversize map reached a target mutation: " + name)
+
         return forbidden
 
     for name in (
-        "create_trace", "retire_trace", "retire_conflict", "record_artifact_verification",
-        "upload_named_json", "publish_experiment_file", "reconcile_tags", "reconcile_current_tags",
+        "create_trace",
+        "retire_trace",
+        "retire_conflict",
+        "record_artifact_verification",
+        "upload_named_json",
+        "publish_experiment_file",
+        "reconcile_tags",
+        "reconcile_current_tags",
     ):
         monkeypatch.setattr(gateway, name, forbid(name))
     for name in ("create_experiment", "set_trace_tag", "delete_trace_tag", "delete_traces"):

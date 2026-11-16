@@ -84,7 +84,7 @@ class _ValueCounter:
             # Never ask json.dumps/encode to copy an unbounded source string.
             self.token('""')
             for offset in range(0, len(value), 4096):
-                self.token(json.dumps(value[offset:offset + 4096], ensure_ascii=True)[1:-1])
+                self.token(json.dumps(value[offset : offset + 4096], ensure_ascii=True)[1:-1])
             return value
         if isinstance(value, Mapping):
             if len(value) > self.limit // 8:
@@ -123,9 +123,7 @@ class SpanBudget:
     DTO. It returns a detached bounded copy. The root counts toward 4096.
     """
 
-    def __init__(
-        self, *, max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES, max_spans: int = MAX_TRACE_SPANS
-    ) -> None:
+    def __init__(self, *, max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES, max_spans: int = MAX_TRACE_SPANS) -> None:
         self.max_bytes = min(max_bytes, MAX_TRACE_SERIALIZED_SPAN_BYTES)
         self.max_spans = min(max_spans, MAX_TRACE_SPANS)
         self.serialized_span_upper_bound = 0
@@ -139,8 +137,10 @@ class SpanBudget:
         # messages, SDK-owned attributes and length-delimited field framing.
         # 4 KiB includes 10-byte varints at every enclosing protobuf level.
         counter.charge(4096)
-        fields = ("root_inputs", "root_outputs", "root_attributes") if root else (
-            "inputs", "outputs", "attributes", "tags", "source_key", "parent_source_key", "span_type"
+        fields = (
+            ("root_inputs", "root_outputs", "root_attributes")
+            if root
+            else ("inputs", "outputs", "attributes", "tags", "source_key", "parent_source_key", "span_type")
         )
         changes = {name: counter.value(getattr(spec, name)) for name in ("name", *fields)}
         for name in ("start_time_ns", "end_time_ns"):
@@ -188,19 +188,26 @@ def admit_trace(request: TraceCreateRequest, *, reserve_late_control: bool = Fal
     """
     if len(request.root_tags) > MAX_TRACE_CONTROL_BYTES // 128:
         _fail()
-    request = replace(request, root_tags={
-        key: value for key, value in request.root_tags.items() if key not in PROOF_TAG_KEYS
-    })
+    request = replace(
+        request, root_tags={key: value for key, value in request.root_tags.items() if key not in PROOF_TAG_KEYS}
+    )
     budget = SpanBudget()
     root = budget.account_spec(request, root=True)
-    controls = _ValueCounter(MAX_TRACE_CONTROL_BYTES - (
-        LATE_CONTROL_RESERVATION_BYTES if reserve_late_control else 0
-    ))
+    controls = _ValueCounter(MAX_TRACE_CONTROL_BYTES - (LATE_CONTROL_RESERVATION_BYTES if reserve_late_control else 0))
     changes = {}
     for name in (
-        "metadata", "native_session_id", "client_request_id", "experiment_id", "expected_operation_key",
-        "artifact_snapshot_fingerprint", "artifact_relative_path", "trace_name", "request_preview",
-        "response_preview", "native_usage", "native_cost",
+        "metadata",
+        "native_session_id",
+        "client_request_id",
+        "experiment_id",
+        "expected_operation_key",
+        "artifact_snapshot_fingerprint",
+        "artifact_relative_path",
+        "trace_name",
+        "request_preview",
+        "response_preview",
+        "native_usage",
+        "native_cost",
     ):
         changes[name] = controls.value(getattr(root, name))
     # Root tags are trace-info control data, not serialized span attributes.
@@ -217,10 +224,13 @@ def admit_trace(request: TraceCreateRequest, *, reserve_late_control: bool = Fal
     accepted = tuple(children)
     root = replace(root, **changes, child_specs=lambda: iter(accepted))
     envelope = TraceEnvelope(root, budget.serialized_span_upper_bound, budget.span_count, controls.size)
-    root = replace(root, root_tags={
-        **{key: value for key, value in root.root_tags.items() if key not in PROOF_TAG_KEYS},
-        **envelope.proof_tags,
-    })
+    root = replace(
+        root,
+        root_tags={
+            **{key: value for key, value in root.root_tags.items() if key not in PROOF_TAG_KEYS},
+            **envelope.proof_tags,
+        },
+    )
     return replace(envelope, request=root)
 
 
@@ -252,7 +262,9 @@ def require_trace_proof(info: Any) -> tuple[int, int]:
     except (KeyError, ValueError, TypeError):
         _fail("trace_resource_profile_unverified")
     validate_control_metadata(
-        tags, getattr(info, "trace_metadata", {}), native_fields=[
+        tags,
+        getattr(info, "trace_metadata", {}),
+        native_fields=[
             getattr(info, name, None) for name in ("client_request_id", "request_preview", "response_preview")
         ],
     )

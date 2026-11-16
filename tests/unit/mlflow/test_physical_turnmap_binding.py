@@ -25,26 +25,33 @@ POLICY = RetryPolicy(max_attempts=2, initial_delay_seconds=0, max_delay_seconds=
 
 
 def request():
-    return trace_spec(artifact_relative_path=PATH, root_tags={
-        "opencode.artifact_path": PATH,
-        "mlflow_import.turn_map": PATH,
-        "mlflow_import.attempt_id": "d" * 32,
-        "mlflow_import.attempt_state": "staged",
-        "opencode.turn_index": "1",
-    })
+    return trace_spec(
+        artifact_relative_path=PATH,
+        root_tags={
+            "opencode.artifact_path": PATH,
+            "mlflow_import.turn_map": PATH,
+            "mlflow_import.attempt_id": "d" * 32,
+            "mlflow_import.attempt_state": "staged",
+            "opencode.turn_index": "1",
+        },
+    )
 
 
 def work_for(mapped):
     key = rec.OwnershipKey(mapped.native_session_id, mapped.metadata["opencode.turn_key"])
     return rec._IdentityWork(
-        key=key, entry=SimpleNamespace(session_id=key.session_id, turn_key=key.turn_key, turn_index=1),
-        replay=Mock(), request=mapped, redaction_mode=RedactionMode.VERBATIM,
+        key=key,
+        entry=SimpleNamespace(session_id=key.session_id, turn_key=key.turn_key, turn_index=1),
+        replay=Mock(),
+        request=mapped,
+        redaction_mode=RedactionMode.VERBATIM,
     )
 
 
 def candidate_for(mapped, trace_id="old"):
     return rec.OwnedTraceCandidate.from_owned_trace(
-        OwnedTrace(trace_id, 1, mapped.root_tags, mapped.metadata), mapped.experiment_id,
+        OwnedTrace(trace_id, 1, mapped.root_tags, mapped.metadata),
+        mapped.experiment_id,
     )
 
 
@@ -97,7 +104,9 @@ def test_ambiguous_survivor_is_verified_by_operation_not_new_path(matches):
     gateway.create_trace.side_effect = MlflowException("synthetic", "TEMPORARILY_UNAVAILABLE")
     gateway.iter_owned_traces.return_value = [OwnedTrace("old", 1, logical.root_tags, logical.metadata)]
     gateway.verify_owned_candidate.return_value = rec.CandidateVerification(
-        "old", matches=matches, reason=None if matches else "artifact_digest_missing",
+        "old",
+        matches=matches,
+        reason=None if matches else "artifact_digest_missing",
     )
     plan = rec.ReconciliationPlan()
     if matches:
@@ -126,8 +135,10 @@ def test_partial_create_cleanup_keeps_bound_request():
     assert work.request is gateway.create_trace.call_args.args[0]
     assert work.request.artifact_relative_path != PATH
     gateway.retire_trace.assert_called_once_with(
-        work.request.experiment_id, created.trace_id,
-        session_id=work.key.session_id, turn_key=work.key.turn_key,
+        work.request.experiment_id,
+        created.trace_id,
+        session_id=work.key.session_id,
+        turn_key=work.key.turn_key,
         expected_metadata=rec._request_creation_metadata(work.request),
     )
 
@@ -147,13 +158,16 @@ def test_import_and_replacement_keep_bound_path_across_upload_retry(replacement)
         return ArtifactVerification(created.trace_id, path, "f" * 64, 2)
 
     dependencies = rec.ReconciliationDependencies(
-        replay=lambda entry: work.replay, map_trace=lambda turn: logical,
+        replay=lambda entry: work.replay,
+        map_trace=lambda turn: logical,
         artifact_snapshot=lambda turn: logical.artifact_snapshot_fingerprint,
-        upload_artifact=upload, defer_retirement=True,
+        upload_artifact=upload,
+        defer_retirement=True,
     )
     plan = rec.ReconciliationPlan()
     action = rec.ReconciliationAction(
-        action="updated" if replacement else "imported", turn=work.entry,
+        action="updated" if replacement else "imported",
+        turn=work.entry,
         candidates=(candidate_for(logical),) if replacement else (),
     )
     if replacement:
@@ -174,7 +188,10 @@ def test_import_and_replacement_keep_bound_path_across_upload_retry(replacement)
 
 @pytest.mark.parametrize("alias", ["present", "missing", "contradictory"])
 def test_reused_payload_adopts_recorded_pointers_without_masking_corruption(
-    fake_mlflow_client, tmp_path, monkeypatch, alias,
+    fake_mlflow_client,
+    tmp_path,
+    monkeypatch,
+    alias,
 ):
     gateway = fake_mlflow_client.gateway()
     assert gateway.probe(CapabilityRequest()).is_compatible
@@ -188,7 +205,8 @@ def test_reused_payload_adopts_recorded_pointers_without_masking_corruption(
     created = gateway.create_trace(original)
     stored = fake_mlflow_client._traces[created.trace_id]
     candidate = rec.OwnedTraceCandidate.from_owned_trace(
-        OwnedTrace(created.trace_id, 1, stored.info.tags, stored.info.trace_metadata), original.experiment_id,
+        OwnedTrace(created.trace_id, 1, stored.info.tags, stored.info.trace_metadata),
+        original.experiment_id,
     )
     artifact = tmp_path / "map.json"
     artifact.write_text(json.dumps({"identity_map": {"trace_id": created.trace_id}}))

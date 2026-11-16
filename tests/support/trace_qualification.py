@@ -33,20 +33,39 @@ def qualification_request(experiment_id: str, children: int, value_bytes: int = 
     def specs():
         for index in range(children):
             yield TraceChildRequest(
-                source_key=f"child-{index}", name=f"synthetic-{index}", span_type="TOOL",
-                parent_source_key=None, inputs=value, outputs={"index": index, "ok": True},
-                attributes={"synthetic.index": index}, tags={},
-                start_time_ns=START + index + 1, end_time_ns=END - 1, status="OK",
+                source_key=f"child-{index}",
+                name=f"synthetic-{index}",
+                span_type="TOOL",
+                parent_source_key=None,
+                inputs=value,
+                outputs={"index": index, "ok": True},
+                attributes={"synthetic.index": index},
+                tags={},
+                start_time_ns=START + index + 1,
+                end_time_ns=END - 1,
+                status="OK",
             )
 
     return TraceCreateRequest(
-        client_request_id=None, experiment_id=experiment_id, name="synthetic qualification",
-        native_session_id="synthetic-qualification", root_inputs={"synthetic": True},
-        root_outputs={"complete": True}, root_attributes={"synthetic": True}, root_tags={}, metadata={},
-        start_time_ns=START, end_time_ns=END, child_specs=specs,
-        expected_operation_key="synthetic-qualification", artifact_snapshot_fingerprint="a" * 64,
-        artifact_relative_path="synthetic-qualification.json", root_status="OK", historical=True,
-        trace_name="synthetic qualification", request_preview="synthetic request",
+        client_request_id=None,
+        experiment_id=experiment_id,
+        name="synthetic qualification",
+        native_session_id="synthetic-qualification",
+        root_inputs={"synthetic": True},
+        root_outputs={"complete": True},
+        root_attributes={"synthetic": True},
+        root_tags={},
+        metadata={},
+        start_time_ns=START,
+        end_time_ns=END,
+        child_specs=specs,
+        expected_operation_key="synthetic-qualification",
+        artifact_snapshot_fingerprint="a" * 64,
+        artifact_relative_path="synthetic-qualification.json",
+        root_status="OK",
+        historical=True,
+        trace_name="synthetic qualification",
+        request_preview="synthetic request",
         response_preview="synthetic response",
     )
 
@@ -65,17 +84,30 @@ def measured_shape_request(experiment_id: str, calls: int = 1000) -> TraceCreate
         for index in range(calls):
             model = f"model-{index}"
             yield TraceChildRequest(
-                source_key=model, name="synthetic model", span_type="LLM", parent_source_key=None,
+                source_key=model,
+                name="synthetic model",
+                span_type="LLM",
+                parent_source_key=None,
                 inputs={"messages": [{"role": "user", "content": f"synthetic step {index}"}]},
                 outputs={"role": "assistant", "content": f"synthetic call {index}"},
-                attributes={"synthetic.previous": f"model-{index - 1}" if index else None}, tags={},
-                start_time_ns=START + index + 200, end_time_ns=END - 1, status="OK",
+                attributes={"synthetic.previous": f"model-{index - 1}" if index else None},
+                tags={},
+                start_time_ns=START + index + 200,
+                end_time_ns=END - 1,
+                status="OK",
             )
             yield TraceChildRequest(
-                source_key=f"tool-{index}", name="synthetic tool", span_type="TOOL", parent_source_key=model,
-                inputs={"query": f"synthetic query {index}"}, outputs={"result": index},
-                attributes={"synthetic.call": index}, tags={},
-                start_time_ns=START + index + 300, end_time_ns=END - 1, status="OK",
+                source_key=f"tool-{index}",
+                name="synthetic tool",
+                span_type="TOOL",
+                parent_source_key=model,
+                inputs={"query": f"synthetic query {index}"},
+                outputs={"result": index},
+                attributes={"synthetic.call": index},
+                tags={},
+                start_time_ns=START + index + 300,
+                end_time_ns=END - 1,
+                status="OK",
             )
 
     return replace(base, child_specs=specs)

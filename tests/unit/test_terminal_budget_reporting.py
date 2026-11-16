@@ -44,9 +44,7 @@ def test_budget_reason_counters_and_sticky_exhaustion(reason):
 
 @pytest.mark.parametrize("guard", ["sqlite", "file"])
 @pytest.mark.parametrize("mutated", [False, True])
-def test_primary_failure_survives_expiration_in_error_storage(
-    config, import_dependencies, monkeypatch, guard, mutated
-):
+def test_primary_failure_survives_expiration_in_error_storage(config, import_dependencies, monkeypatch, guard, mutated):
     primary = CapabilityError("synthetic_target_failure", "the target read could not be completed")
 
     def fail_pipeline(*args, **kwargs):
@@ -101,9 +99,7 @@ def test_primary_failure_survives_expiration_in_error_storage(
 
 @pytest.mark.parametrize("output", ["human", "json"])
 @pytest.mark.parametrize("mutated", [False, True])
-def test_cli_deadline_after_work_before_lazy_output(
-    config, import_dependencies, monkeypatch, capsys, output, mutated
-):
+def test_cli_deadline_after_work_before_lazy_output(config, import_dependencies, monkeypatch, capsys, output, mutated):
     original = cli.run_import
 
     def finish_then_expire(config, dependencies):

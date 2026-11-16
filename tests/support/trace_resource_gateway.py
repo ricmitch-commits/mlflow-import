@@ -19,9 +19,7 @@ class LocalTraceGateway(MlflowGateway):
     """Exercise the production gateway, with no HTTP or tracing exporter."""
 
     def __init__(self, client, *, dry_run=False):
-        super().__init__(
-            client, trace_api=client.trace_api, dry_run=dry_run, version_transport=fake_version_transport
-        )
+        super().__init__(client, trace_api=client.trace_api, dry_run=dry_run, version_transport=fake_version_transport)
 
     def create_trace(self, request):
         created = super().create_trace(request)

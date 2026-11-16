@@ -1832,6 +1832,8 @@ def test_six_turn_timing_comes_from_source_timestamps(six_turn_session) -> None:
     assert specs[2].start_time_ns == 1_772_000_050_000_000_000
     assert all("opencode.timing_estimated" in specs[index].root_tags for index in (0, 1, 2))
     assert all("opencode.timing_estimated" not in specs[index].metadata for index in (3, 4, 5))
+
+
 def test_plugin_previews_include_synthetic_text_and_truncate_utf16():
     from types import SimpleNamespace
 
@@ -1839,9 +1841,14 @@ def test_plugin_previews_include_synthetic_text_and_truncate_utf16():
 
     def record(identity, role, decoded, parent=None):
         return SimpleNamespace(
-            source_id=identity, parent_source_id=parent, source_type=role,
+            source_id=identity,
+            parent_source_id=parent,
+            source_type=role,
             source_table="message" if parent is None else "part",
-            derived_child_ordinal=None, decoded_value=decoded, timestamp=None, completion_timestamp=None,
+            derived_child_ordinal=None,
+            decoded_value=decoded,
+            timestamp=None,
+            completion_timestamp=None,
         )
 
     records = [
@@ -1863,12 +1870,21 @@ def test_invalid_semantic_timestamps_preserve_normalized_fallbacks(invalid):
     from types import SimpleNamespace
 
     records = [
-        SourceRecord("message", "user", "u", decoded_value={"time": {"created": invalid}},
-                     timestamp=normalize_timestamp(1000, "ms")),
-        SourceRecord("message", "assistant", "a",
-                     decoded_value={"time": {"created": invalid, "completed": invalid}},
-                     timestamp=normalize_timestamp(2000, "ms"),
-                     completion_timestamp=normalize_timestamp(2020, "ms")),
+        SourceRecord(
+            "message",
+            "user",
+            "u",
+            decoded_value={"time": {"created": invalid}},
+            timestamp=normalize_timestamp(1000, "ms"),
+        ),
+        SourceRecord(
+            "message",
+            "assistant",
+            "a",
+            decoded_value={"time": {"created": invalid, "completed": invalid}},
+            timestamp=normalize_timestamp(2000, "ms"),
+            completion_timestamp=normalize_timestamp(2020, "ms"),
+        ),
     ]
     _, _, start, end = mapping._opencode_projection(SimpleNamespace(iter_records=lambda: iter(records)))
     assert (start, end) == (1_000_000_000, 2_020_000_000)

@@ -31,7 +31,8 @@ def test_only_explicit_empty_native_preview_verifies_as_absent(
     )
     request = (
         replace(request, request_preview=source_preview)
-        if field == "request_preview" else replace(request, response_preview=source_preview)
+        if field == "request_preview"
+        else replace(request, response_preview=source_preview)
     )
     created = gateway.create_trace(request)
     info = fake_mlflow_client.get_trace(created.trace_id).info

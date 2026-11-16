@@ -535,7 +535,10 @@ def validate_required_metadata(spec: TraceCreateRequest) -> None:
     keys = _EXACT_METADATA_KEYS | {TRACE_SESSION_METADATA_KEY}
     if spec.historical:
         if set(spec.metadata) - {
-            "parent_session_id", "mlflow.trace.session", "mlflow.trace.tokenUsage", "mlflow.trace.cost"
+            "parent_session_id",
+            "mlflow.trace.session",
+            "mlflow.trace.tokenUsage",
+            "mlflow.trace.cost",
         }:
             raise ItemImportError(
                 "request_metadata_invalid", "historical request metadata is outside its native contract"
@@ -1396,8 +1399,11 @@ class MlflowGateway:
         self._verify_labeled_values(expected.metadata, metadata, TRACE_METADATA_VALUE_LIMIT, "metadata")
         if expected.historical:
             allowed = {
-                "parent_session_id", "mlflow.trace.session", "mlflow.trace.tokenUsage",
-                "mlflow.trace.cost", "mlflow.trace.infoFinalized",
+                "parent_session_id",
+                "mlflow.trace.session",
+                "mlflow.trace.tokenUsage",
+                "mlflow.trace.cost",
+                "mlflow.trace.infoFinalized",
             }
             if set(metadata) - allowed:
                 raise ItemImportError("trace_verification_failed", "unexpected physical request metadata")
@@ -1409,10 +1415,9 @@ class MlflowGateway:
             info = trace.info
             if info.tags.get("mlflow.traceName") != expected.trace_name:
                 raise ItemImportError("trace_verification_failed", "the native trace name differs")
-            if (
-                info.request_preview != _native_historical_preview(expected.request_preview)
-                or info.response_preview != _native_historical_preview(expected.response_preview)
-            ):
+            if info.request_preview != _native_historical_preview(
+                expected.request_preview
+            ) or info.response_preview != _native_historical_preview(expected.response_preview):
                 raise ItemImportError("trace_verification_failed", "the native text previews differ")
             if info.client_request_id != expected.client_request_id:
                 raise ItemImportError("trace_verification_failed", "the native client request identity differs")
@@ -1928,13 +1933,16 @@ class MlflowGateway:
             raise ItemImportError("trace_resource_proof_immutable", "resource proof tags are creation-only")
         validate_control_metadata(actual, info.trace_metadata)
         proposed = {
-            key: value for key, value in actual.items()
-            if not (key.startswith(prefix) or key in keys) or key in desired
+            key: value for key, value in actual.items() if not (key.startswith(prefix) or key in keys) or key in desired
         }
         proposed.update(desired)
-        validate_control_metadata(proposed, info.trace_metadata, native_fields=[
-            getattr(info, name, None) for name in ("client_request_id", "request_preview", "response_preview")
-        ])
+        validate_control_metadata(
+            proposed,
+            info.trace_metadata,
+            native_fields=[
+                getattr(info, name, None) for name in ("client_request_id", "request_preview", "response_preview")
+            ],
+        )
         changed = False
         for key in actual:
             if (key.startswith(prefix) or key in keys) and key not in desired:
@@ -2012,7 +2020,8 @@ class MlflowGateway:
             request,
             root_tags={
                 **{
-                    key: value for key, value in request.root_tags.items()
+                    key: value
+                    for key, value in request.root_tags.items()
                     if key not in mutable and key != "mlflow_import.turn_map"
                 },
                 "opencode.artifact_path": path,
@@ -2116,7 +2125,8 @@ class MlflowGateway:
                 decode_ownership(trace.info.tags, trace.info.trace_metadata)
                 if reference.get("schema_version") == "mlflow-import.replacement.v2"
                 else dict(trace.info.trace_metadata)
-            ) != reference["metadata"]
+            )
+            != reference["metadata"]
             or trace.info.experiment_id != reference["experiment_id"]
             or ("native" in reference and self._native_reference(trace.info) != reference["native"])
         ):
@@ -2144,9 +2154,7 @@ class MlflowGateway:
         from mlflow_import.content.input_context import validate_input_contexts
 
         if not validate_input_contexts(value, ownership, spans=trace.data.spans):
-            raise ItemImportError(
-                "replacement_verification_failed", "the replacement input-context index is invalid"
-            )
+            raise ItemImportError("replacement_verification_failed", "the replacement input-context index is invalid")
         if (
             not isinstance(value, dict)
             or value.get("schema_version") not in {"mlflow-import.turn-map.v1", "mlflow-import.turn-map.v2"}
@@ -2397,7 +2405,9 @@ class MlflowGateway:
                 # view so metadata cannot hide a tag changed during export flush.
                 physical_values = (
                     [mapping[key] for mapping in (trace.info.trace_metadata, tags) if key in mapping]
-                    if key.startswith("mlflow_import.attempt_") or key in {
+                    if key.startswith("mlflow_import.attempt_")
+                    or key
+                    in {
                         "mlflow_import.qualified_session_id",
                         "mlflow_import.harness",
                         "mlflow_import.source_namespace",

@@ -1373,21 +1373,23 @@ def test_fake_gateway_keeps_payload_state_for_bdd_assertions() -> None:
 
     with pytest.raises(ItemImportError):
         fake.verify_trace(created, trace_spec(root_outputs={"answer": 43}))
-@pytest.mark.parametrize("field,value", [
-    ("client_request_id", "fabricated"),
-    ("request_preview", "wrong preview"),
-    ("response_preview", None),
-    ("cost", {"total_cost": 0.0}),
-    ("trace_name", "unexpected"),
-    ("native_session", "wrong-session"),
-    ("parent_session", "unexpected-parent"),
-    ("arbitrary_metadata", "unexpected"),
-    ("token_usage", {"input_tokens": 120, "output_tokens": 80, "total_tokens": 212,
-                     "cache_read_input_tokens": 40}),
-])
-def test_historical_native_verification_checks_values_and_nulls(
-    fake_mlflow_client, six_turn_session, field, value
-):
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("client_request_id", "fabricated"),
+        ("request_preview", "wrong preview"),
+        ("response_preview", None),
+        ("cost", {"total_cost": 0.0}),
+        ("trace_name", "unexpected"),
+        ("native_session", "wrong-session"),
+        ("parent_session", "unexpected-parent"),
+        ("arbitrary_metadata", "unexpected"),
+        ("token_usage", {"input_tokens": 120, "output_tokens": 80, "total_tokens": 212, "cache_read_input_tokens": 40}),
+    ],
+)
+def test_historical_native_verification_checks_values_and_nulls(fake_mlflow_client, six_turn_session, field, value):
     from mlflow_import.mlflow.mapping import map_turn_to_trace
 
     gateway = _checked_gateway(fake_mlflow_client)
@@ -1414,10 +1416,14 @@ def test_ownership_search_unions_nonempty_legacy_and_tag_pages(fake_mlflow_clien
     gateway = _checked_gateway(fake_mlflow_client, search_page_size=1)
     experiment = fake_mlflow_client.add_experiment("mixed-ownership")
     legacy = gateway.create_trace(trace_spec(experiment_id=experiment.experiment_id))
-    tagged = gateway.create_trace(trace_spec(
-        experiment_id=experiment.experiment_id, owned=False,
-        root_tags={"mlflow_import.importer": "mlflow-import"},
-    ))
+    tagged = gateway.create_trace(
+        trace_spec(
+            experiment_id=experiment.experiment_id,
+            owned=False,
+            root_tags={"mlflow_import.importer": "mlflow-import"},
+        )
+    )
     assert {item.trace_id for item in gateway.iter_owned_traces(experiment.experiment_id)} == {
-        legacy.trace_id, tagged.trace_id,
+        legacy.trace_id,
+        tagged.trace_id,
     }

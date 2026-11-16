@@ -1145,7 +1145,8 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
 
         request_preview = (
             json.dumps(root_values.root_input, ensure_ascii=False)[:1000]
-            if root_values.root_input is not None else None
+            if root_values.root_input is not None
+            else None
         )
         response_preview = json.dumps(root_output, ensure_ascii=False)[:1000] if root_output is not None else None
     creation_tags = dict(metadata) if activity is not None else {}
@@ -1171,9 +1172,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
             )
         ),
         native_session_id=native_session_id,
-        root_inputs=(
-            _native_root_input(root_input) if context.source_schema == "legacy" else root_input
-        ),
+        root_inputs=(_native_root_input(root_input) if context.source_schema == "legacy" else root_input),
         root_outputs=(_native_root_output(root_output) if context.source_schema == "legacy" else root_output),
         root_attributes=MappingProxyType(root_attributes),
         # The artifact's exact relative path rides a trace TAG at root
@@ -1208,6 +1207,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
 
 def _opencode_reasoning(activity: Activity) -> int:
     """Apply the same parent-authoritative, missing-field rollup as native I/O."""
+
     def observed(key: str) -> int:
         call = activity.calls[key]
         value = call.usage_observation.get("reasoning")
@@ -1258,7 +1258,8 @@ def _opencode_projection(turn: ReplayTurn) -> tuple[str | None, str | None, int 
                 parts = [content]
             elif isinstance(content, (list, tuple)):
                 parts = [
-                    str(part["text"]) for part in content
+                    str(part["text"])
+                    for part in content
                     if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
                 ]
             else:
@@ -1331,9 +1332,7 @@ def _claude_request_text(content: object | None) -> str | None:
         return "\n".join(
             cast(str, part["text"])
             for part in content
-            if isinstance(part, Mapping)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
+            if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
         )
     return None
 
@@ -1552,7 +1551,8 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
     conversation = ConversationDelta(qualified_session(turn.session_header), turn.summary.turn_key)
     prompt_sources = [
         source_reference(child, SourceIdentity.of(child).key, "content")
-        for child in records[1:] if child.parent_source_id == records[0].source_id
+        for child in records[1:]
+        if child.parent_source_id == records[0].source_id
     ] or [source_reference(records[0], SourceIdentity.of(records[0]).key, "content")]
     if isinstance(prompt, Mapping):
         conversation.observe("", {"role": "user", "content": prompt.get("prompt", "")}, prompt_sources)
@@ -1596,11 +1596,14 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
             spec = _native_model_spec(record, children, messages)
             if descriptor["origin"] == "recorded-request-input" or inputs is None:
                 spec = replace(spec, inputs=inputs)
-            spec = replace(spec, attributes={
-                **spec.attributes,
-                INPUT_CONTEXT_ATTRIBUTE: descriptor,
-                "mlflow_import.inputs_origin": descriptor["origin"],
-            })
+            spec = replace(
+                spec,
+                attributes={
+                    **spec.attributes,
+                    INPUT_CONTEXT_ATTRIBUTE: descriptor,
+                    "mlflow_import.inputs_origin": descriptor["origin"],
+                },
+            )
             output = cast(Mapping[str, object], spec.outputs)
             choices = cast(list[dict[str, dict[str, object]]], output["choices"])
             conversation.assistant(scope, choices[0]["message"], sources)

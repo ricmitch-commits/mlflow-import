@@ -29,7 +29,8 @@ pytestmark = pytest.mark.unit
 
 def checked_gateway(client, *, real_api=False):
     gateway = MlflowGateway(
-        client, trace_api=PublicTraceApi() if real_api else client.trace_api,
+        client,
+        trace_api=PublicTraceApi() if real_api else client.trace_api,
         version_transport=fake_version_transport,
     )
     assert gateway.probe(CapabilityRequest()).is_compatible
@@ -111,15 +112,21 @@ def integer_transport_span(value):
 
     from mlflow_import.mlflow.gateway import _encode_historical_attribute
 
-    return Span.from_dict({
-        "trace_id": "tr-" + "a" * 32, "span_id": "b" * 16, "parent_span_id": None,
-        "name": "integer-transport-oracle", "start_time_unix_nano": 1, "end_time_unix_nano": 2,
-        "status": {"code": "STATUS_CODE_OK"},
-        "attributes": {
-            "mlflow.traceRequestId": _encode_historical_attribute("tr-" + "a" * 32),
-            "probe": _encode_historical_attribute(value),
-        },
-    })
+    return Span.from_dict(
+        {
+            "trace_id": "tr-" + "a" * 32,
+            "span_id": "b" * 16,
+            "parent_span_id": None,
+            "name": "integer-transport-oracle",
+            "start_time_unix_nano": 1,
+            "end_time_unix_nano": 2,
+            "status": {"code": "STATUS_CODE_OK"},
+            "attributes": {
+                "mlflow.traceRequestId": _encode_historical_attribute("tr-" + "a" * 32),
+                "probe": _encode_historical_attribute(value),
+            },
+        }
+    )
 
 
 @pytest.mark.parametrize("value", [(1 << 63) - 1, -(1 << 63)])
@@ -131,8 +138,9 @@ def test_int64_boundaries_remain_supported_by_admission_and_pinned_sdk(value):
 
 
 @pytest.mark.parametrize("value", [1 << 63, -(1 << 63) - 1])
-@pytest.mark.parametrize("placement", ["root_inputs", "root_outputs", "root_attributes", "child_inputs",
-                                       "child_outputs", "child_attributes"])
+@pytest.mark.parametrize(
+    "placement", ["root_inputs", "root_outputs", "root_attributes", "child_inputs", "child_outputs", "child_attributes"]
+)
 def test_otlp_int64_overflow_fails_before_any_gateway_mutation(fake_mlflow_client, value, placement):
     payload = {"nested": [value]}
     with pytest.raises(ValueError, match="out of range"):
@@ -189,8 +197,10 @@ def test_late_control_reservation_and_actual_decorated_overflow(fake_mlflow_clie
     assert fake_mlflow_client.mutations == before
 
 
-@pytest.mark.parametrize("consumer", ["_get_trace", "replacement_reference", "verify_replacement_reference",
-                                      "read_pricing_basis", "read_pricing_donor"])
+@pytest.mark.parametrize(
+    "consumer",
+    ["_get_trace", "replacement_reference", "verify_replacement_reference", "read_pricing_basis", "read_pricing_donor"],
+)
 def test_all_full_read_consumers_gate_unqualified_legacy_metadata_first(fake_mlflow_client, consumer):
     gateway = checked_gateway(fake_mlflow_client)
     created = gateway.create_trace(trace_spec())
@@ -198,9 +208,9 @@ def test_all_full_read_consumers_gate_unqualified_legacy_metadata_first(fake_mlf
     for key in PROOF_TAG_KEYS:
         stored.info.tags.pop(key)
     fake_mlflow_client.calls.clear()
-    argument = created.trace_id if consumer in {"_get_trace", "replacement_reference"} else {
-        "trace_id": created.trace_id
-    }
+    argument = (
+        created.trace_id if consumer in {"_get_trace", "replacement_reference"} else {"trace_id": created.trace_id}
+    )
     with pytest.raises(ItemImportError) as error:
         getattr(gateway, consumer)(argument)
     assert error.value.code == "trace_resource_profile_unverified"
@@ -270,7 +280,9 @@ def test_retirement_identity_checks_are_metadata_only(fake_mlflow_client):
         fake_mlflow_client._traces[created.trace_id].info.tags.pop(key)
     fake_mlflow_client.calls.clear()
     gateway.retire_trace(
-        request.experiment_id, created.trace_id, session_id=request.native_session_id,
+        request.experiment_id,
+        created.trace_id,
+        session_id=request.native_session_id,
         turn_key=request.metadata["opencode.turn_key"],
     )
     assert not gateway.trace_exists(created.trace_id)
@@ -280,10 +292,17 @@ def test_retirement_identity_checks_are_metadata_only(fake_mlflow_client):
 def test_late_tags_do_not_spend_span_reservation_and_proof_is_idempotent():
     request = trace_spec(root_inputs={"messages": ["bounded"]})
     base = admit_trace(request, reserve_late_control=True)
-    decorated = admit_trace(replace(request, root_tags={
-        **request.root_tags, "mlflow_import.session_artifact": "x" * 4096,
-        "mlflow_import.attempt_id": "a" * 32, "mlflow_import.import_instance_id": "b" * 32,
-    }))
+    decorated = admit_trace(
+        replace(
+            request,
+            root_tags={
+                **request.root_tags,
+                "mlflow_import.session_artifact": "x" * 4096,
+                "mlflow_import.attempt_id": "a" * 32,
+                "mlflow_import.import_instance_id": "b" * 32,
+            },
+        )
+    )
     assert decorated.serialized_span_upper_bound == base.serialized_span_upper_bound
     assert admit_trace(decorated.request).proof_tags == decorated.proof_tags
 
@@ -315,13 +334,15 @@ def test_returned_count_and_bytes_must_match_initial_proof(fake_mlflow_client):
         gateway._get_trace(created.trace_id)
 
 
-@pytest.mark.parametrize("value", [
-    '"JSON string"', '{"k":["escaped\\\\value"]}',
-    {"text": "😀\n\t\\\"" * 10000, "array": [True, None, 1, 2.5]},
-])
-def test_bound_exceeds_independent_pinned_protobuf_and_captured_json_oracles(
-    fake_mlflow_client, monkeypatch, value
-):
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"JSON string"',
+        '{"k":["escaped\\\\value"]}',
+        {"text": '😀\n\t\\"' * 10000, "array": [True, None, 1, 2.5]},
+    ],
+)
+def test_bound_exceeds_independent_pinned_protobuf_and_captured_json_oracles(fake_mlflow_client, monkeypatch, value):
     """Capture the real historical writer's public SDK transport, without I/O."""
     from google.protobuf.json_format import MessageToJson
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -346,8 +367,14 @@ def test_bound_exceeds_independent_pinned_protobuf_and_captured_json_oracles(
 
     monkeypatch.setattr("mlflow.tracing.client.TracingClient", CaptureClient)
     request = replace(
-        trace_spec(owned=False, experiment_id="1", root_inputs=value, root_outputs=value,
-                   root_attributes={"historical": value}, children=[child_spec("c", inputs=value, outputs=value)]),
+        trace_spec(
+            owned=False,
+            experiment_id="1",
+            root_inputs=value,
+            root_outputs=value,
+            root_attributes={"historical": value},
+            children=[child_spec("c", inputs=value, outputs=value)],
+        ),
         historical=True,
     )
     envelope = admit_trace(request)
@@ -357,6 +384,4 @@ def test_bound_exceeds_independent_pinned_protobuf_and_captured_json_oracles(
     assert sum(span.to_otel_proto().ByteSize() for span in captured["spans"]) < envelope.serialized_span_upper_bound
     for name in ("otlp", "otlp_json", "fullread"):
         assert len(captured[name]) < envelope.serialized_span_upper_bound
-    assert require_trace_proof(captured["info"]) == (
-        envelope.serialized_span_upper_bound, envelope.span_count
-    )
+    assert require_trace_proof(captured["info"]) == (envelope.serialized_span_upper_bound, envelope.span_count)

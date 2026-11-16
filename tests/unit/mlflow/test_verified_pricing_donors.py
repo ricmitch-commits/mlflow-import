@@ -107,9 +107,7 @@ class DonorTarget:
             token_usage=None,
             cost=None,
         )
-        self.traces[trace_id] = SimpleNamespace(
-            trace_id=trace_id, info=info, data=data
-        )
+        self.traces[trace_id] = SimpleNamespace(trace_id=trace_id, info=info, data=data)
         return self.gateway.replacement_reference(trace_id)
 
     def reset_counts(self) -> None:
@@ -135,7 +133,8 @@ def test_selection_reads_each_eligible_donor_once_including_unselected_instances
     target.reset_counts()
 
     assert _select_pricing_basis(attempts, target.gateway, "overwrite") == {
-        "turn": {"call": {"donor": "b"}}, "other": {"call": {"donor": "c"}}
+        "turn": {"call": {"donor": "b"}},
+        "other": {"call": {"donor": "c"}},
     }
     assert Counter(call.args[0] for call in target.client.get_trace.call_args_list) == Counter("azbcx")
     assert target.downloads == Counter({**{ref["map"][0]: 1 for ref in refs}, refs[0]["session"][0]: 1})
@@ -303,9 +302,7 @@ def test_fresh_pre_retirement_verification_does_not_reuse_donor_result(target: D
 
 def test_transient_donor_read_retries_then_verifies_one_map(target: DonorTarget) -> None:
     ref = target.donor("trace")
-    target.gateway._read_retry_policy = RetryPolicy(
-        max_attempts=2, initial_delay_seconds=0, max_delay_seconds=0
-    )
+    target.gateway._read_retry_policy = RetryPolicy(max_attempts=2, initial_delay_seconds=0, max_delay_seconds=0)
     target.reset_counts()
     target.client.get_trace.side_effect = [RequestsConnectionError("synthetic disconnect"), target.traces["trace"]]
     assert _select_pricing_basis([completed("", ref)], target.gateway, "overwrite") == {

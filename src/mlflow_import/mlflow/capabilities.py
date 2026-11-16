@@ -268,7 +268,9 @@ def probe_capabilities(
         if not callable(getattr(Span, "from_dict", None)) or not callable(TraceInfo):
             errors.append("the public historical trace objects are unavailable")
         for method, keywords in (
-            ("start_trace", {"trace_info"}), ("log_spans", {"location", "spans"}), ("get_trace_info", {"trace_id"})
+            ("start_trace", {"trace_info"}),
+            ("log_spans", {"location", "spans"}),
+            ("get_trace_info", {"trace_id"}),
         ):
             operation = getattr(TracingClient, method, None)
             if not callable(operation) or not keywords <= inspect.signature(operation).parameters.keys():

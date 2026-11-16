@@ -2972,9 +2972,13 @@ def _request_creation_metadata(request: TraceCreateRequest) -> dict[str, str]:
     return {
         **CandidateContract.from_create_request(request, "", 0).creation_metadata,
         **{
-            key: ownership.get(key, "") for key in (
-                "parent_session_id", "mlflow_import.qualified_session_id", "mlflow_import.harness",
-                "mlflow_import.source_namespace", "mlflow_import.import_instance_id",
+            key: ownership.get(key, "")
+            for key in (
+                "parent_session_id",
+                "mlflow_import.qualified_session_id",
+                "mlflow_import.harness",
+                "mlflow_import.source_namespace",
+                "mlflow_import.import_instance_id",
             )
         },
         "mlflow.trace.session": request.native_session_id,

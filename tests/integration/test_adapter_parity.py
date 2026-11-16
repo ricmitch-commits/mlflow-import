@@ -72,10 +72,15 @@ def test_opencode_native_literal_readback(live_server, tmp_path):
             except Exception as error:
                 failures.append((request.name, str(error)))
                 trace = live_server.client.get_trace(created.trace_id, display=False)
-                failures.append((
-                    "previews", request.request_preview, trace.info.request_preview,
-                    request.response_preview, trace.info.response_preview,
-                ))
+                failures.append(
+                    (
+                        "previews",
+                        request.request_preview,
+                        trace.info.request_preview,
+                        request.response_preview,
+                        trace.info.response_preview,
+                    )
+                )
                 failures.append(
                     (
                         "native",
@@ -428,7 +433,9 @@ def test_opencode_part_usage_cost_native_fields_and_immutable_metadata(live_serv
     assert trace.info.trace_metadata["parent_session_id"] == "parent"
     (model,) = [span for span in trace.data.spans if span.span_type == "LLM"]
     assert model.attributes["mlflow.chat.tokenUsage"] == {
-        **trace.info.token_usage, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 0
+        **trace.info.token_usage,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 0,
     }
     assert model.attributes["mlflow.llm.cost"] == {"total_cost": 0.25}
     assert model.attributes["mlflow_import.accounting"]["origin"] == "persisted"

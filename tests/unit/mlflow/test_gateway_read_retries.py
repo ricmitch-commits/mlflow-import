@@ -262,9 +262,7 @@ def test_exhausted_read_does_not_multiply_outer_retry_allowance(target: SimpleNa
     assert error.value.code == "read_retry_exhausted"
     assert error.value.__cause__ is failure
     assert "synthetic" not in error.value.safe_message
-    assert target.client.mock_calls == [call.get_trace_info("trace-1")] + [
-        call.get_trace("trace-1", display=False)
-    ] * 3
+    assert target.client.mock_calls == [call.get_trace_info("trace-1")] + [call.get_trace("trace-1", display=False)] * 3
 
 
 @pytest.mark.parametrize("code", ["PERMISSION_DENIED", "RESOURCE_DOES_NOT_EXIST", "INTERNAL_ERROR"])
@@ -286,18 +284,14 @@ def test_candidate_payload_retrieval_retries_before_semantic_validation(target: 
     with pytest.raises(ItemImportError) as error:
         target.gateway.verify_candidate_payload(SimpleNamespace(trace_id="trace-1"), trace_spec())
     assert error.value.code == "legacy_payload_requires_replacement"
-    assert target.client.mock_calls == [call.get_trace_info("trace-1")] + [
-        call.get_trace("trace-1", display=False)
-    ] * 2
+    assert target.client.mock_calls == [call.get_trace_info("trace-1")] + [call.get_trace("trace-1", display=False)] * 2
     target.factory.assert_not_called()
 
 
 def test_unverifiable_retirement_remains_fail_closed(target: SimpleNamespace) -> None:
     target.client.get_trace_info.side_effect = _transport_failure()
     with pytest.raises(ItemImportError) as error:
-        target.gateway.verify_owned_trace_for_retirement(
-            "exp-1", "trace-1", session_id="session-1", turn_key="turn-1"
-        )
+        target.gateway.verify_owned_trace_for_retirement("exp-1", "trace-1", session_id="session-1", turn_key="turn-1")
     assert error.value.code == "ownership_conflict"
     assert isinstance(error.value.__cause__, ItemImportError)
     assert error.value.__cause__.code == "read_retry_exhausted"
@@ -421,7 +415,10 @@ def test_retirement_rechecks_both_physical_staging_locations_after_flush(
     created = gateway.create_trace(request)
     trace = client.get_trace(created.trace_id)
     initial_reads = gateway.verify_owned_trace_for_retirement(
-        "exp-1", created.trace_id, session_id="ses-sample", turn_key=request.metadata["opencode.turn_key"],
+        "exp-1",
+        created.trace_id,
+        session_id="ses-sample",
+        turn_key=request.metadata["opencode.turn_key"],
         expected_metadata=scope,
     )
     assert initial_reads["mlflow_import.attempt_state"] == "staged"
@@ -437,7 +434,10 @@ def test_retirement_rechecks_both_physical_staging_locations_after_flush(
     monkeypatch.setattr(mlflow, "flush_trace_async_logging", flushed)
     with pytest.raises(ItemImportError) as error:
         gateway.retire_trace(
-            "exp-1", created.trace_id, session_id="ses-sample", turn_key=request.metadata["opencode.turn_key"],
+            "exp-1",
+            created.trace_id,
+            session_id="ses-sample",
+            turn_key=request.metadata["opencode.turn_key"],
             expected_metadata=scope,
         )
     assert error.value.code == "ownership_conflict"
@@ -466,7 +466,10 @@ def test_retirement_expected_staging_supports_single_location_and_logical_aliase
     created = gateway.create_trace(request)
     expected = {**staging, "opencode.importer": "mlflow-import", "mlflow_import.import_instance_id": ""}
     verified = gateway.verify_owned_trace_for_retirement(
-        "exp-1", created.trace_id, session_id="ses-sample", turn_key=request.metadata["opencode.turn_key"],
+        "exp-1",
+        created.trace_id,
+        session_id="ses-sample",
+        turn_key=request.metadata["opencode.turn_key"],
         expected_metadata=expected,
     )
     assert all(verified[key] == value for key, value in expected.items())
@@ -550,9 +553,7 @@ def test_repository_lookup_factory_and_sdk_reads_share_budget(target: SimpleName
         assert budget.retries_left == 0
 
     assert client.mock_calls == [call.get_experiment("exp-1")] * 2
-    assert target.factory.call_args_list == [
-        call(experiment.artifact_location, tracking_uri=client.tracking_uri)
-    ] * 2
+    assert target.factory.call_args_list == [call(experiment.artifact_location, tracking_uri=client.tracking_uri)] * 2
     assert repository.list_artifacts.call_args_list == [call("prefix")] * 2
     assert repository.download_artifacts.call_args_list == [call("map.json", str(tmp_path))] * 2
     repository.log_artifact.assert_not_called()

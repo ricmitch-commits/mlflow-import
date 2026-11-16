@@ -56,11 +56,13 @@ def build_turn_map(
         for key in aliases:
             targets.setdefault(key, []).append(span_id)
         if INPUT_CONTEXT_ATTRIBUTE in child.attributes:
-            contexts.append({
-                "source_key": child.source_key,
-                "span_id": span_id,
-                "descriptor": child.attributes[INPUT_CONTEXT_ATTRIBUTE],
-            })
+            contexts.append(
+                {
+                    "source_key": child.source_key,
+                    "span_id": span_id,
+                    "descriptor": child.attributes[INPUT_CONTEXT_ATTRIBUTE],
+                }
+            )
     first_record = next(replay.iter_records(), None)
     if first_record is not None:
         targets[SourceIdentity.of(first_record).key] = [root_span_id]

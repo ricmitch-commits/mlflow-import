@@ -24,7 +24,9 @@ pytestmark = pytest.mark.unit
 
 def record(key, role, content, *, scope="", table="jsonl_message", **extra):
     return SourceRecord(
-        table, role, key,
+        table,
+        role,
+        key,
         decoded_value={"role": role, "content": content, **extra},
         classification=role if role in {"user", "assistant"} else None,
         raw_columns={"subagent": scope} if scope else {},
@@ -51,7 +53,8 @@ def project(records, harness="claude"):
 def indexed(turn, activity, specs):
     contexts = [
         {"source_key": spec.source_key, "span_id": f"span:{i}", "descriptor": spec.attributes[INPUT_CONTEXT_ATTRIBUTE]}
-        for i, spec in enumerate(specs) if INPUT_CONTEXT_ATTRIBUTE in spec.attributes
+        for i, spec in enumerate(specs)
+        if INPUT_CONTEXT_ATTRIBUTE in spec.attributes
     ]
     return {
         "schema_version": TURN_MAP_VERSION,
@@ -60,13 +63,19 @@ def indexed(turn, activity, specs):
         "identity_map": {"span:" + entry["source_key"]: entry["span_id"] for entry in contexts},
         "accounting": activity.provenance,
         "records": [
-            {"source_key": SourceIdentity.of(r).key, "occurrence_id": r.occurrence_id,
-             "entity_id": r.entity_id or r.source_id, "scope": str(r.raw_columns.get("subagent") or "")}
+            {
+                "source_key": SourceIdentity.of(r).key,
+                "occurrence_id": r.occurrence_id,
+                "entity_id": r.entity_id or r.source_id,
+                "scope": str(r.raw_columns.get("subagent") or ""),
+            }
             for r in turn.iter_records()
         ],
         "input_contexts": contexts,
-    }, {"mlflow_import.qualified_session_id": qualified_session(turn.session_header),
-        "mlflow_import.turn_key": turn.summary.turn_key}
+    }, {
+        "mlflow_import.qualified_session_id": qualified_session(turn.session_header),
+        "mlflow_import.turn_key": turn.summary.turn_key,
+    }
 
 
 def conversation(count, *, size=64):
@@ -74,8 +83,7 @@ def conversation(count, *, size=64):
     for i in range(count):
         records.append(record(f"a{i}", "assistant", f"ANSWER-{i}:" + "a" * size, model="synthetic/model"))
         if i < count - 1:
-            records.append(record(f"r{i}", "toolResult", f"RESULT-{i}:" + "t" * size,
-                                  toolCallId=f"c{i}"))
+            records.append(record(f"r{i}", "toolResult", f"RESULT-{i}:" + "t" * size, toolCallId=f"c{i}"))
     return records
 
 
@@ -90,8 +98,9 @@ def test_payload_and_context_index_grow_linearly(count):
         assert [m["role"] for m in messages] == ["assistant", "tool"]
         assert messages[0]["content"][0]["text"] == f"ANSWER-{i - 1}:" + "a" * 64
         assert messages[1]["content"] == f"RESULT-{i - 1}:" + "t" * 64
-        assert spec.attributes[INPUT_CONTEXT_ATTRIBUTE]["previous_context_id"] == (
-            calls[i - 1].attributes[INPUT_CONTEXT_ATTRIBUTE]["context_id"]
+        assert (
+            spec.attributes[INPUT_CONTEXT_ATTRIBUTE]["previous_context_id"]
+            == (calls[i - 1].attributes[INPUT_CONTEXT_ATTRIBUTE]["context_id"])
         )
     values = canonical_json([{"input": s.inputs, "output": s.outputs} for s in calls])
     assert values.count(b"PROMPT:") == 1
@@ -179,14 +188,19 @@ def test_scope_isolation_interleaving_and_replay_stability():
 
 def test_coalesced_fragments_reference_effective_occurrences_not_provider_history():
     first = record("a", "assistant", "first fragment", model="synthetic/model")
-    second = replace(first, source_id="b", occurrence_id="effective:patch:b",
-                     decoded_value={"role": "assistant", "content": "effective second fragment"})
+    second = replace(
+        first,
+        source_id="b",
+        occurrence_id="effective:patch:b",
+        decoded_value={"role": "assistant", "content": "effective second fragment"},
+    )
     final = record("final", "assistant", "done", model="synthetic/model")
     turn, activity, specs = project([record("u", "user", "prompt"), first, second, final], "gemini")
     calls = [s for s in specs if INPUT_CONTEXT_ATTRIBUTE in s.attributes]
     assert len(calls) == 2
     assert [r["occurrence_id"] for r in calls[0].attributes[INPUT_CONTEXT_ATTRIBUTE]["invocation_sources"]] == [
-        "occurrence:a", "effective:patch:b"
+        "occurrence:a",
+        "effective:patch:b",
     ]
     assert len(calls[1].inputs["messages"]) == 1
     assert calls[1].attributes[INPUT_CONTEXT_ATTRIBUTE]["provider_request"] == "unknown"
@@ -199,11 +213,21 @@ def test_legacy_fallback_uses_same_delta_policy_and_preserves_tool_correlation()
     records = [record("u", "user", "prompt", table="message")]
     for i in range(3):
         records.append(record(f"a{i}", "assistant", "", table="message", model="synthetic/model"))
-        records.append(SourceRecord(
-            "part", "tool", f"t{i}", parent_source_id=f"a{i}", parent_source_table="message",
-            decoded_value={"type": "tool", "tool": "read", "callID": f"c{i}",
-                           "state": {"input": {"path": f"p{i}"}, "output": f"result{i}"}},
-        ))
+        records.append(
+            SourceRecord(
+                "part",
+                "tool",
+                f"t{i}",
+                parent_source_id=f"a{i}",
+                parent_source_table="message",
+                decoded_value={
+                    "type": "tool",
+                    "tool": "read",
+                    "callID": f"c{i}",
+                    "state": {"input": {"path": f"p{i}"}, "output": f"result{i}"},
+                },
+            )
+        )
     turn = replay(records, "opencode")
     turn.load_root_input = lambda _: "prompt"
     specs = list(_iter_child_specs(turn, 10 * 1024 * 1024))
@@ -224,9 +248,9 @@ def test_pending_is_consumed_by_recorded_inputs_but_preserved_by_unavailable_acc
     delta.assistant("", {"role": "assistant", "content": "last actual assistant"}, [])
     _, unavailable = delta.consume("", "third", [], available=False)
     inputs, descriptor = delta.consume("", "fourth", [])
-    assert inputs == {"messages": [
-        {"role": "assistant", "content": "last actual assistant"}, {"role": "user", "content": "old"}
-    ]}
+    assert inputs == {
+        "messages": [{"role": "assistant", "content": "last actual assistant"}, {"role": "user", "content": "old"}]
+    }
     assert descriptor["previous_context_id"] == unavailable["context_id"]
     assert delta.consume("", "fifth", [])[0] is None
 
@@ -240,14 +264,23 @@ def test_accounting_contexts_preserve_prompt_or_tool_and_previous_assistant(
 ):
     records = [record("u", "user", "full observed prompt")]
     if with_tool:
-        records.extend([
-            record("first", "assistant", "previous actual assistant", model="synthetic/model"),
-            record("result", "toolResult", {"actual": [1, 2, 3]}, toolCallId="c"),
-        ])
+        records.extend(
+            [
+                record("first", "assistant", "previous actual assistant", model="synthetic/model"),
+                record("result", "toolResult", {"actual": [1, 2, 3]}, toolCallId="c"),
+            ]
+        )
     accounting = SourceRecord(
-        "jsonl", operation, "accounting", occurrence_id="accounting-occurrence",
-        decoded_value={"type": operation, "model": "synthetic/model", "usage": {"input": 1, "output": 1},
-                       "summary": "accounting summary"},
+        "jsonl",
+        operation,
+        "accounting",
+        occurrence_id="accounting-occurrence",
+        decoded_value={
+            "type": operation,
+            "model": "synthetic/model",
+            "usage": {"input": 1, "output": 1},
+            "summary": "accounting summary",
+        },
         classification=None if harness == "pi" else "assistant",
     )
     if not decoded_type:
@@ -289,10 +322,21 @@ def test_unmodeled_accounting_envelope_cannot_replace_the_last_actual_assistant(
     assert b"accounting summary" not in canonical_json(final.inputs)
 
 
-@pytest.mark.parametrize("damage", [
-    "foreign-session", "foreign-turn", "foreign-scope", "unknown-occurrence", "cross-scope-link", "missing-context",
-    "span-binding", "bad-version", "boolean-index", "duplicate-context",
-])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "foreign-session",
+        "foreign-turn",
+        "foreign-scope",
+        "unknown-occurrence",
+        "cross-scope-link",
+        "missing-context",
+        "span-binding",
+        "bad-version",
+        "boolean-index",
+        "duplicate-context",
+    ],
+)
 def test_index_validation_rejects_unresolvable_or_misbound_provenance(damage):
     turn, activity, specs = project(conversation(2))
     index, ownership = indexed(turn, activity, specs)
@@ -324,8 +368,9 @@ def test_index_validation_rejects_unresolvable_or_misbound_provenance(damage):
 
 def test_old_turn_map_remains_eligible_for_historical_pricing_decoding_only():
     assert validate_input_contexts({"schema_version": "mlflow-import.turn-map.v1", "mapping_version": "mapping-v8"}, {})
-    assert not validate_input_contexts({"schema_version": "mlflow-import.turn-map.v1",
-                                        "mapping_version": "mapping-v9"}, {})
+    assert not validate_input_contexts(
+        {"schema_version": "mlflow-import.turn-map.v1", "mapping_version": "mapping-v9"}, {}
+    )
 
 
 @pytest.mark.parametrize("value", [None, True, [], {}, 4])
@@ -357,11 +402,14 @@ def test_unmatched_tool_result_id_reuse_is_scope_isolated():
 def index_with_actual_spans():
     turn, activity, specs = project(conversation(2))
     index, ownership = indexed(turn, activity, specs)
-    index["identity_map"] = {"trace_id": "trace", **{f"span:{s.source_key}": f"span:{i}"
-                                                    for i, s in enumerate(specs)}}
+    index["identity_map"] = {"trace_id": "trace", **{f"span:{s.source_key}": f"span:{i}" for i, s in enumerate(specs)}}
     spans = [SimpleNamespace(span_id="root", trace_id="trace", parent_id=None, attributes={})]
-    spans.extend(SimpleNamespace(span_id=f"span:{i}", trace_id="trace", parent_id="root",
-                                 attributes=copy.deepcopy(dict(spec.attributes))) for i, spec in enumerate(specs))
+    spans.extend(
+        SimpleNamespace(
+            span_id=f"span:{i}", trace_id="trace", parent_id="root", attributes=copy.deepcopy(dict(spec.attributes))
+        )
+        for i, spec in enumerate(specs)
+    )
     ownership["opencode.mapping_version"] = "mapping-v9"
     return index, ownership, spans
 
@@ -383,12 +431,28 @@ def test_different_invocations_cannot_share_a_context_source_or_span(duplicate):
     assert not validate_input_contexts(index, ownership)
 
 
-@pytest.mark.parametrize("damage", [
-    "actual-descriptor", "actual-invocation", "actual-source", "actual-missing-descriptor", "actual-extra-descriptor",
-    "map-missing-context", "map-extra-context", "identity-extra", "identity-missing", "identity-wrong-trace",
-    "actual-duplicate-span", "actual-duplicate-source", "actual-extra-span", "actual-missing-span", "missing-root",
-    "actual-foreign-trace", "actual-descriptor-boolean",
-])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "actual-descriptor",
+        "actual-invocation",
+        "actual-source",
+        "actual-missing-descriptor",
+        "actual-extra-descriptor",
+        "map-missing-context",
+        "map-extra-context",
+        "identity-extra",
+        "identity-missing",
+        "identity-wrong-trace",
+        "actual-duplicate-span",
+        "actual-duplicate-source",
+        "actual-extra-span",
+        "actual-missing-span",
+        "missing-root",
+        "actual-foreign-trace",
+        "actual-descriptor-boolean",
+    ],
+)
 def test_context_and_identity_tampering_cannot_be_hidden_by_a_checksummed_index(damage):
     index, ownership, spans = index_with_actual_spans()
     actual = spans[1]
@@ -425,8 +489,11 @@ def test_context_and_identity_tampering_cannot_be_hidden_by_a_checksummed_index(
     elif damage == "actual-duplicate-source":
         tool.attributes["mlflow_import.source_key"] = actual.attributes["mlflow_import.source_key"]
     elif damage == "actual-extra-span":
-        spans.append(SimpleNamespace(span_id="ghost", trace_id="trace", parent_id="root",
-                                     attributes={"mlflow_import.source_key": "ghost"}))
+        spans.append(
+            SimpleNamespace(
+                span_id="ghost", trace_id="trace", parent_id="root", attributes={"mlflow_import.source_key": "ghost"}
+            )
+        )
     elif damage == "actual-missing-span":
         spans.remove(tool)
     else:
@@ -434,15 +501,18 @@ def test_context_and_identity_tampering_cannot_be_hidden_by_a_checksummed_index(
     assert not validate_input_contexts(index, ownership, spans=spans)
 
 
-@pytest.mark.parametrize("schema,mapping,owner,valid", [
-    ("mlflow-import.turn-map.v1", "mapping-v8", "mapping-v8", True),
-    ("mlflow-import.turn-map.v1", "mapping-v8", "mapping-v9", False),
-    ("mlflow-import.turn-map.v1", None, "mapping-v9", False),
-    ("mlflow-import.turn-map.v1", "mapping-v9", "mapping-v9", False),
-    (TURN_MAP_VERSION, "mapping-v9", "mapping-v8", False),
-    (TURN_MAP_VERSION, "mapping-v8", "mapping-v8", False),
-    (TURN_MAP_VERSION, "mapping-v9", "mapping-v9", True),
-])
+@pytest.mark.parametrize(
+    "schema,mapping,owner,valid",
+    [
+        ("mlflow-import.turn-map.v1", "mapping-v8", "mapping-v8", True),
+        ("mlflow-import.turn-map.v1", "mapping-v8", "mapping-v9", False),
+        ("mlflow-import.turn-map.v1", None, "mapping-v9", False),
+        ("mlflow-import.turn-map.v1", "mapping-v9", "mapping-v9", False),
+        (TURN_MAP_VERSION, "mapping-v9", "mapping-v8", False),
+        (TURN_MAP_VERSION, "mapping-v8", "mapping-v8", False),
+        (TURN_MAP_VERSION, "mapping-v9", "mapping-v9", True),
+    ],
+)
 def test_map_version_cannot_downgrade_or_disagree_with_trace_ownership(schema, mapping, owner, valid):
     index, ownership, _ = index_with_actual_spans()
     index["schema_version"], index["mapping_version"] = schema, mapping

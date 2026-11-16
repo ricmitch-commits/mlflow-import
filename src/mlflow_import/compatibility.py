@@ -56,11 +56,16 @@ def decode_ownership(tags: Mapping[str, str], metadata: Mapping[str, str]) -> di
         if key.startswith(("mlflow_import.attempt_", "mlflow_import.session_artifact", "opencode.artifact_")):
             continue
         if key.startswith("mlflow_import.current.") or key in {
-            "mlflow_import.turn_index", "mlflow_import.source_revision", "mlflow_import.metadata_fingerprint"
+            "mlflow_import.turn_index",
+            "mlflow_import.source_revision",
+            "mlflow_import.metadata_fingerprint",
         }:
             continue
         if key.startswith(("mlflow_import.", "opencode.", "mlflow.source.")) or key in {
-            "parent_session_id", "mlflow.trace.session", "mlflow.trace.user", "mlflow.user"
+            "parent_session_id",
+            "mlflow.trace.session",
+            "mlflow.trace.user",
+            "mlflow.user",
         }:
             if key in metadata and metadata[key] != tag_value:
                 raise ConfigurationError("ownership_conflict", "ownership locations contain contradictory values")
@@ -93,8 +98,10 @@ def decode_ownership(tags: Mapping[str, str], metadata: Mapping[str, str]) -> di
     qualified = result.get("mlflow_import.qualified_session_id")
     if qualified is not None:
         expected = [
-            "v1", result.get("mlflow_import.harness"),
-            result.get("mlflow_import.source_namespace"), result.get("mlflow_import.session_id"),
+            "v1",
+            result.get("mlflow_import.harness"),
+            result.get("mlflow_import.source_namespace"),
+            result.get("mlflow_import.session_id"),
         ]
         try:
             valid = json.loads(qualified) == expected and all(isinstance(item, str) and item for item in expected)
@@ -211,8 +218,14 @@ def decode_result(value: Mapping[str, Any]) -> DecodedResult:
         if not result_count(summary, key):
             invalid()
     for key in (
-        "imported_turns", "updated_turns", "skipped_turns", "unchanged_turns",
-        "failed_turns", "failed_sessions", "failed_retirements", "unexamined_owned_traces",
+        "imported_turns",
+        "updated_turns",
+        "skipped_turns",
+        "unchanged_turns",
+        "failed_turns",
+        "failed_sessions",
+        "failed_retirements",
+        "unexamined_owned_traces",
     ):
         # Older v1 producers omit these additions. When supplied, they are
         # still counters, not an untyped route around normal count validation.
