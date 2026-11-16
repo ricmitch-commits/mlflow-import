@@ -72,8 +72,14 @@ def test_reference_projection_retains_raw_accounting_and_reruns(live_server, tmp
     assert info.response_preview == "answer\nlast"
     assert info.trace_metadata["mlflow.trace.session"] == session
     assert info.trace_metadata["parent_session_id"] == "bare-parent"
-    assert info.token_usage == {"input_tokens": 73202, "output_tokens": 148, "total_tokens": 73380}
-    assert info.cost is None
+    assert info.token_usage == {
+        "input_tokens": 73202,
+        "output_tokens": 148,
+        "total_tokens": 73380,
+        "cache_read_input_tokens": 76928,
+        "cache_creation_input_tokens": 0,
+    }
+    assert info.cost == {"total_cost": 0.0}
     root = next(span for span in trace.data.spans if span.parent_id is None)
     assert root.name == "opencode_conversation"
     assert root.attributes["mlflow.chat.tokenUsage"]["total_tokens"] == 150308

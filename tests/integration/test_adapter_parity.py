@@ -112,8 +112,10 @@ def test_opencode_native_literal_readback(live_server, tmp_path):
         "input_tokens": 120,
         "output_tokens": 80,
         "total_tokens": 212,
+        "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 4,
     }
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.0025}
 
 
 def source_file(tmp_path, harness):
@@ -416,8 +418,10 @@ def test_opencode_part_usage_cost_native_fields_and_immutable_metadata(live_serv
         "input_tokens": 100,
         "output_tokens": 10,
         "total_tokens": 112,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 0,
     }
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.25}
     assert trace.info.tags["mlflow.trace.user"] == "historical-user"
     assert trace.info.tags["mlflow.source.name"] == "opencode"
     assert trace.info.tags["mlflow.source.git.commit"] == "abc"
@@ -1388,7 +1392,7 @@ def test_opencode_multiple_steps_and_measured_tool_interval(live_server, tmp_pat
     assert exit_status(result) == 0, result.report
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
     assert trace.info.token_usage == {"input_tokens": 30, "output_tokens": 3, "total_tokens": 38}
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.3}
     models = [span for span in trace.data.spans if span.span_type == "LLM"]
     assert len(models) == 2
     assert sorted(model.attributes["mlflow.llm.cost"]["total_cost"] for model in models) == [0.1, 0.2]

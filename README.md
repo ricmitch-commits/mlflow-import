@@ -50,8 +50,10 @@ explicit in the profile documentation.
 
 OpenCode native trace info follows the `@mlflow/opencode` 0.4.0 reference:
 bare session/parent IDs, semantic assistant completion time, plain-text previews,
-input/output/reasoning totals, and NULL native cache/cost fields. Richer source
-accounting remains in spans and canonical artifacts. Native client request IDs
+input/output/reasoning totals, available cache counters, and available persisted
+USD costs. Unavailable cache lifetimes and cost breakdowns remain NULL rather
+than estimated. Richer source accounting remains in spans and canonical
+artifacts. Native client request IDs
 are source-only; operation keys and qualified identity live in initial ownership
 tags. See [projection parity](docs/projection-parity.md) for the exact contract.
 

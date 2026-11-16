@@ -1683,6 +1683,83 @@ def test_legacy_mapping_matches_native_conversation_trace_shape() -> None:
     assert children[1].outputs == {"result": "result"}
 
 
+def test_claude_previews_are_prompt_and_final_assistant_text(tmp_path: Path) -> None:
+    from mlflow_import.source.discovery import ARTIFACT_SCHEMA_VERSION, MAPPING_VERSION
+    from mlflow_import.source.file_snapshot import create_file_snapshot
+    from mlflow_import.source.replay import NormalizedSnapshotAdapter
+    from mlflow_import.source.turns import build_replay_turn, indexed_turn_summaries
+    from mlflow_import.sources.jsonl_common import JsonlExporter
+
+    session = "claude-preview"
+    records = [
+        {
+            "sessionId": session,
+            "type": "user",
+            "uuid": "u1",
+            "parentUuid": None,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "the prompt"},
+        },
+        {
+            "sessionId": session,
+            "type": "assistant",
+            "uuid": "a1",
+            "parentUuid": "u1",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {
+                "id": "inv-1",
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+            },
+        },
+        {
+            "sessionId": session,
+            "type": "user",
+            "uuid": "r1",
+            "parentUuid": "a1",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "ok"}],
+            },
+        },
+        {
+            "sessionId": session,
+            "type": "assistant",
+            "uuid": "a2",
+            "parentUuid": "r1",
+            "timestamp": "2026-01-01T00:00:03Z",
+            "message": {
+                "id": "inv-2",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "the answer"}],
+                "stop_reason": "end_turn",
+            },
+        },
+        {"sessionId": session, "type": "attachment", "uuid": "hook", "parentUuid": "a2", "attachment": {}},
+    ]
+    source = tmp_path / f"{session}.jsonl"
+    source.write_text("".join(json.dumps(value) + "\n" for value in records))
+
+    with create_file_snapshot(source, tmp_path, JsonlExporter(source, "claude"), lambda value, _: value) as snapshot:
+        adapter = NormalizedSnapshotAdapter(snapshot)
+        header = adapter.session_header(session)
+        assert header is not None
+        (summary,) = list(indexed_turn_summaries(snapshot, session))
+        turn = build_replay_turn(snapshot, header, summary)
+        spec = map_turn_to_trace(
+            turn,
+            _context(
+                mapping_version=MAPPING_VERSION,
+                artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
+                catalog_version=header.catalog_version,
+            ),
+        )
+
+    assert spec.request_preview == "the prompt"
+    assert spec.response_preview == "the answer"
+
+
 def test_six_turn_statuses_follow_source_outcomes(six_turn_session) -> None:
     specs = [map_turn_to_trace(turn, six_turn_session.context) for turn in six_turn_session.turns]
 

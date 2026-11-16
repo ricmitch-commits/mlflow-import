@@ -1119,13 +1119,27 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         end_ns = semantic_end if semantic_end is not None else end_ns
         usage = dict(cast(Mapping[str, object], native_usage or {}))
         projected_usage: dict[str, object] = {
-            key: usage[key] for key in ("input_tokens", "output_tokens") if key in usage
+            key: usage[key]
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation_input_tokens_above_1hr",
+            )
+            if key in usage
         }
         reasoning = _opencode_reasoning(activity)
-        if projected_usage:
-            projected_usage["total_tokens"] = sum(cast(int, value) for value in projected_usage.values()) + reasoning
+        if "input_tokens" in projected_usage or "output_tokens" in projected_usage:
+            projected_usage["total_tokens"] = (
+                cast(int, projected_usage.get("input_tokens", 0))
+                + cast(int, projected_usage.get("output_tokens", 0))
+                + reasoning
+            )
         native_usage = projected_usage
-        native_cost = None
+        native_cost = activity.cost
+    elif activity is not None and harness == "claude":
+        request_preview, response_preview = _claude_previews(turn)
     elif activity is not None:
         import json
 
@@ -1273,6 +1287,77 @@ def _opencode_projection(turn: ReplayTurn) -> tuple[str | None, str | None, int 
             if value:
                 response = value
     return prompt, response, start, end
+
+
+_CLAUDE_PREVIEW_UNITS = 1000
+
+
+def _claude_previews(turn: ReplayTurn) -> tuple[str | None, str | None]:
+    """Native Claude previews: prompt text and final assistant text.
+
+    Mirrors the reference integration's prompt/final-response previews rather
+    than serializing the structured root records. Subagent records are not part
+    of the primary transcript and never contribute.
+    """
+    summary = turn.summary
+    request = response = None
+    for record in turn.iter_records():
+        if record.raw_columns.get("subagent"):
+            continue
+        if record.source_id == summary.first_user_source_id:
+            request = _claude_request_text(_claude_message_content(record))
+        elif record.source_id == summary.root_result_source_id:
+            response = _claude_response_text(_claude_message_content(record))
+    return (
+        _claude_preview(request) if request else None,
+        _claude_preview(response) if response else None,
+    )
+
+
+def _claude_message_content(record: SourceRecord) -> object | None:
+    decoded = record.decoded_value
+    if not isinstance(decoded, Mapping):
+        return None
+    message = decoded.get("message")
+    if isinstance(message, Mapping) and "content" in message:
+        return cast(object, message["content"])
+    return cast(object, decoded.get("content"))
+
+
+def _claude_request_text(content: object | None) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n".join(
+            cast(str, part["text"])
+            for part in content
+            if isinstance(part, Mapping)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    return None
+
+
+def _claude_response_text(content: object | None) -> str | None:
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, (list, tuple)):
+        text = None
+        for part in content:
+            if (
+                isinstance(part, Mapping)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and part["text"].strip()
+            ):
+                text = cast(str, part["text"])
+        return text
+    return None
+
+
+def _claude_preview(value: str) -> str:
+    encoded = value.encode("utf-16-le", "surrogatepass")
+    return encoded[: _CLAUDE_PREVIEW_UNITS * 2].decode("utf-16-le", "replace")
 
 
 def _shared_child_specs(turn: ReplayTurn, activity: object, inline_limit: int) -> Iterator[SpanSpec | EventSpec]:

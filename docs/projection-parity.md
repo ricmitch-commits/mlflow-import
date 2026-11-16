@@ -174,7 +174,9 @@ both privacy modes, retained artifacts and local map publication).
 - Pi normalized input includes cache counts once. Its output already includes
   reasoning, so reasoning is not added again.
 - OpenCode canonical input/output remain source-defined; explicit source totals
-  win in artifacts. Native reference total is input + output + reasoning.
+  win in artifacts. Native reference total is input + output + reasoning, with
+  available cache counters and available persisted USD costs published natively;
+  unavailable cache lifetimes and cost breakdowns remain NULL.
 - Gemini records `candidatesTokenCount` as `tokens.output` and
   `thoughtsTokenCount` separately; normalized generated output includes both.
   Source totals remain authoritative. Evidence: pinned upstream

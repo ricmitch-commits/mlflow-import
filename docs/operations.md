@@ -159,8 +159,10 @@ With `mapping-v8`, the native session/parent IDs are bare source IDs. Use the
 immutable `mlflow_import.qualified_session_id` creation tag to distinguish source
 stores, and ownership/operation tags to diagnose recovery. Request metadata carries
 only optional `parent_session_id` plus MLflow-owned/promoted API fields. OpenCode
-native cache/cost columns intentionally remain NULL; use canonical accounting in
-the turn/session artifacts for richer raw observations. Absent native client IDs
+native usage carries available cache counters and available persisted USD costs
+(unavailable cache lifetimes and cost breakdowns stay NULL); canonical accounting
+in the turn/session artifacts retains the richer raw observations. Absent native
+client IDs
 are NULL. Imported trace names use the canonical per-session harness through the
 `mlflow.traceName` tag; `opencode_conversation` is the OpenCode root span name. Old
 ownership metadata is still read, with conflicting aliases rejected. A mapping
