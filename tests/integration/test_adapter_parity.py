@@ -72,10 +72,15 @@ def test_opencode_native_literal_readback(live_server, tmp_path):
             except Exception as error:
                 failures.append((request.name, str(error)))
                 trace = live_server.client.get_trace(created.trace_id, display=False)
-                failures.append((
-                    "previews", request.request_preview, trace.info.request_preview,
-                    request.response_preview, trace.info.response_preview,
-                ))
+                failures.append(
+                    (
+                        "previews",
+                        request.request_preview,
+                        trace.info.request_preview,
+                        request.response_preview,
+                        trace.info.response_preview,
+                    )
+                )
                 failures.append(
                     (
                         "native",
@@ -112,8 +117,10 @@ def test_opencode_native_literal_readback(live_server, tmp_path):
         "input_tokens": 120,
         "output_tokens": 80,
         "total_tokens": 212,
+        "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 4,
     }
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.0025}
 
 
 def source_file(tmp_path, harness):
@@ -416,15 +423,19 @@ def test_opencode_part_usage_cost_native_fields_and_immutable_metadata(live_serv
         "input_tokens": 100,
         "output_tokens": 10,
         "total_tokens": 112,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 0,
     }
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.25}
     assert trace.info.tags["mlflow.trace.user"] == "historical-user"
     assert trace.info.tags["mlflow.source.name"] == "opencode"
     assert trace.info.tags["mlflow.source.git.commit"] == "abc"
     assert trace.info.trace_metadata["parent_session_id"] == "parent"
     (model,) = [span for span in trace.data.spans if span.span_type == "LLM"]
     assert model.attributes["mlflow.chat.tokenUsage"] == {
-        **trace.info.token_usage, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 0
+        **trace.info.token_usage,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 0,
     }
     assert model.attributes["mlflow.llm.cost"] == {"total_cost": 0.25}
     assert model.attributes["mlflow_import.accounting"]["origin"] == "persisted"
@@ -1281,7 +1292,12 @@ def test_claude_followup_model_inputs_include_correlated_tool_result(live_server
         span for span in trace.data.spans if span.attributes.get("mlflow_import.invocation_id") == ":final-inv"
     )
     assert {"role": "tool", "tool_call_id": "c", "content": "literal tool result"} in model.inputs["messages"]
-    assert model.inputs["messages"][0]["content"] == "hello"
+    assert [message["role"] for message in model.inputs["messages"]] == ["assistant", "tool"]
+    assert model.inputs["messages"][0]["tool_calls"][0]["id"] == "c"
+    context = model.attributes["mlflow_import.input_context"]
+    assert context["policy"] == "conversation-delta-v1"
+    assert context["previous_context_id"]
+    assert context["provider_request"] == "unknown"
     assert trace.info.tags["mlflow_import.turn_fingerprint"]
     assert trace.info.tags["mlflow_import.metadata_fingerprint"]
 
@@ -1383,7 +1399,7 @@ def test_opencode_multiple_steps_and_measured_tool_interval(live_server, tmp_pat
     assert exit_status(result) == 0, result.report
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
     assert trace.info.token_usage == {"input_tokens": 30, "output_tokens": 3, "total_tokens": 38}
-    assert trace.info.cost is None
+    assert trace.info.cost == {"total_cost": 0.3}
     models = [span for span in trace.data.spans if span.span_type == "LLM"]
     assert len(models) == 2
     assert sorted(model.attributes["mlflow.llm.cost"]["total_cost"] for model in models) == [0.1, 0.2]
@@ -1516,13 +1532,22 @@ def test_recorded_zero_cost_is_not_missing_or_an_invented_breakdown(live_server,
 
 def test_fresh_import_refuses_a_map_outside_its_recoverable_profile(live_server, tmp_path, monkeypatch):
     from mlflow_import.content import accounting
+    from mlflow_import.mlflow.gateway import MlflowGateway
 
     path, _ = source_file(tmp_path, "claude")
     monkeypatch.setattr(accounting, "MAX_PRICING_MAP_BYTES", 128)
+    trace_creates = []
+
+    def unexpected_create(*args, **kwargs):
+        trace_creates.append(True)
+        pytest.fail("an oversized map reached trace creation instead of failing preflight")
+
+    monkeypatch.setattr(MlflowGateway, "create_trace", unexpected_create)
+    name = unique_experiment_name("map-limit")
     config = parse_config(
         [
             "--experiment-name",
-            unique_experiment_name("map-limit"),
+            name,
             "--source",
             str(path),
             "--tracking-uri",
@@ -1531,8 +1556,9 @@ def test_fresh_import_refuses_a_map_outside_its_recoverable_profile(live_server,
     )
     result = run_import(config, build_dependencies(config))
     assert exit_status(result) == 1, result.report
+    assert result.error is not None
+    assert result.error.code == "turn_map_too_large"
     assert result.report["summary"]["imported_turns"] == 0
-    # Rollback may retire this attempt's new staged trace; there is no
-    # completed copy and no previously verified source trace to remove.
-    assert not live_server.client.search_traces(locations=[result.report["experiment"]["id"]], include_spans=False)
-    assert "turn_map_too_large" in repr(result.report)
+    assert result.report["experiment"]["id"] is None
+    assert live_server.client.get_experiment_by_name(name) is None
+    assert trace_creates == []

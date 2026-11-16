@@ -155,6 +155,7 @@ def test_import_config_fields_match_the_contract() -> None:
         "dry_run",
         "output",
         "log_level",
+        "timeout_seconds",
     ]
 
 

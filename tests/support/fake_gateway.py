@@ -38,6 +38,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from mlflow_import.content.artifacts import ArtifactProvenance
@@ -358,8 +359,10 @@ class FakeTraceApi:
         info.cost = spec.native_cost
         if spec.trace_name is not None:
             info.tags["mlflow.traceName"] = spec.trace_name
-        info.request_preview = spec.request_preview
-        info.response_preview = spec.response_preview
+        # Independently model the pinned historical transport's explicit
+        # absence representation, rather than persisting source-level NULLs.
+        info.request_preview = "" if spec.request_preview is None else spec.request_preview
+        info.response_preview = "" if spec.response_preview is None else spec.response_preview
 
     def start_span_no_context(
         self,
@@ -614,6 +617,20 @@ class FakeMlflowClient:
                 trace.info.trace_metadata[key] = _truncate(value, TRACE_METADATA_VALUE_LIMIT)
         return span
 
+    def get_trace_info(self, trace_id: str) -> FakeTraceInfo:
+        self.calls.append(("get_trace_info", {"trace_id": trace_id}))
+        trace = self._traces.get(trace_id)
+        if trace is None:
+            raise FakeMlflowException(f"trace {trace_id} not found")
+        info = copy.deepcopy(trace.info)
+        if self.after_get_trace_hook is not None:
+            # The race seam models the next retrieval boundary, including a
+            # metadata-only identity check before retirement.
+            hook = self.after_get_trace_hook
+            self.after_get_trace_hook = None
+            hook(trace_id)
+        return info
+
     def get_trace(self, trace_id: str, display: bool = True, flush: bool = False) -> FakeTrace:
         self.calls.append(("get_trace", {"trace_id": trace_id, "display": display, "flush": flush}))
         trace = self._traces.get(trace_id)
@@ -782,6 +799,26 @@ def _matches_filter(trace: FakeTrace, filter_string: str | None) -> bool:
 # ---------------------------------------------------------------------------
 # Sample request builders
 # ---------------------------------------------------------------------------
+
+
+def resource_qualified_payload() -> tuple[dict[str, str], Any]:
+    """A writer-created bounded span payload for metadata/transport-only fixtures.
+
+    Legacy fixtures must obtain their resource proof through the creation API,
+    rather than stamping arbitrary unqualified remote payloads.
+    """
+    from mlflow_import.mlflow.trace_envelope import PROOF_TAG_KEYS
+
+    client = FakeMlflowClient()
+    gateway = MlflowGateway(client, trace_api=client.trace_api, version_transport=fake_version_transport)
+    gateway.probe(CapabilityRequest())
+    created = gateway.create_trace(trace_spec(owned=False))
+    stored = client._traces[created.trace_id]
+    data = SimpleNamespace(
+        spans=stored.data.spans,
+        to_dict=lambda: {"spans": [vars(span) for span in stored.data.spans]},
+    )
+    return {key: stored.info.tags[key] for key in PROOF_TAG_KEYS}, data
 
 
 def child_spec(
@@ -1088,8 +1125,10 @@ class FakeMlflowGateway:
 
     def create_trace(self, spec: TraceCreateRequest) -> CreatedTrace:
         from mlflow_import.mlflow.gateway import validate_required_metadata, validate_source_timing
+        from mlflow_import.mlflow.trace_envelope import admit_trace
 
         self._require_mutation_allowed()
+        spec = admit_trace(spec).request
         validate_required_metadata(spec)
         validate_source_timing(spec)
         self._next_trace += 1

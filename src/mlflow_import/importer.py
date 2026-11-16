@@ -115,7 +115,7 @@ from mlflow_import.mlflow.reconciliation import (
 )
 from mlflow_import.privacy import safe_client_diagnostics
 from mlflow_import.reporting import REASON_DRY_RUN, ReportBuilder, TurnResult
-from mlflow_import.retry import RetryPolicy, retry_budget
+from mlflow_import.retry import _BUDGET, RetryPolicy, remember_failure, retry_budget
 from mlflow_import.source.candidates import candidate_session_ids
 from mlflow_import.source.connection import open_live_connection
 from mlflow_import.source.discovery import (
@@ -607,11 +607,12 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
     from mlflow_import.compatibility import IdentityIndex, identity_index
 
     budget = None
+    work_budget = None
     result = None
     try:
         with resources.temporary_storage(retain_result=True) as budget:
             with (
-                retry_budget(),
+                retry_budget(deadline_seconds=config.timeout_seconds) as work_budget,
                 safe_client_diagnostics(),
                 disk_collections() as store,
                 identity_index(IdentityIndex()),
@@ -632,8 +633,10 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
     except resources.TemporaryStorageError as error:
         # A full result store cannot be used to report its own exhaustion. This
         # fixed-size emergency envelope allocates no more temporary storage.
-        return _storage_failure_result(config, error, budget)
+        return _storage_failure_result(config, (work_budget.primary_error if work_budget else None) or error, budget)
     except ConfigurationError as error:
+        if result is None and work_budget is not None and work_budget.primary_error is not None:
+            return _storage_failure_result(config, work_budget.primary_error, budget)
         if error.code != "temporary_storage_cleanup_failed" or result is None:
             raise
         summary = cast(dict[str, Any], result.report["summary"])
@@ -644,15 +647,19 @@ def run_import(config: ImportConfig, dependencies: ImportDependencies) -> Import
             summary["failed_items"] += 1
             failed += 1
         return replace(result, _store=store, failed_items=failed)
+    except ImporterError as error:
+        return _storage_failure_result(config, (work_budget.primary_error if work_budget else None) or error, budget)
 
 
 def _storage_failure_result(config: ImportConfig, error: ImporterError, budget: Any) -> ImportResult:
     phase2 = bool(budget and budget.phase2)
     # Do not retain failed statement/source frames (and their decoded records)
     # through an exception traceback on the returned lazy API result.
+    original = error
     error = ImporterError(error.code, error.safe_message, exit_status=1 if phase2 else 2)
+    error.diagnostics = dict(original.diagnostics)
     summary: dict[str, Any] = {
-        key: 0
+        key: None
         for key in (
             "selected_sessions",
             "selected_turns",
@@ -672,10 +679,15 @@ def _storage_failure_result(config: ImportConfig, error: ImporterError, budget: 
         )
     }
     summary.update(
-        failed_items=int(phase2), resource_failures=int(phase2), incomplete=True, recovery_pending=phase2, warnings=[]
+        failed_items=None,
+        reporting_failures=1,
+        incomplete=True,
+        counts_complete=False,
+        recovery_pending=phase2,
+        warnings=[],
     )
     if config.dry_run:
-        summary["planned"] = {"imported": 0, "updated": 0, "retired": 0}
+        summary["planned"] = {"imported": None, "updated": None, "retired": None}
     return ImportResult(
         config.dry_run,
         {
@@ -685,20 +697,20 @@ def _storage_failure_result(config: ImportConfig, error: ImporterError, budget: 
             "source": {
                 "schema_generation": None,
                 "fingerprint": None,
-                "sessions_scanned": 0,
-                "sessions_selected": 0,
-                "logical_turn_count": 0,
-                "record_count": 0,
+                "sessions_scanned": None,
+                "sessions_selected": None,
+                "logical_turn_count": None,
+                "record_count": None,
             },
             "redaction": {
                 "mode": "redacted" if config.redact else "verbatim",
                 "detector_counts": {},
-                "affected_field_count": 0,
-                "affected_record_count": 0,
+                "affected_field_count": None,
+                "affected_record_count": None,
             },
             "summary": summary,
             "sessions": [],
-            "errors": [{"code": error.code, "message": error.safe_message}],
+            "errors": [{"code": error.code, "message": error.safe_message, "diagnostics": error.diagnostics}],
             "resources": {
                 "temporary_limit_bytes": budget.max_bytes if budget else 0,
                 "temporary_peak_bytes": budget.peak_bytes if budget else 0,
@@ -835,6 +847,12 @@ def _run_defaults(config: ImportConfig, dependencies: ImportDependencies) -> Imp
                     append_report(_run_import(preview, dependencies, frozen, counting, readers[root_index]), root_index)
                 if not config.dry_run and first_error is None and failed_items == 0:
                     reports.clear()
+                    # Authorize this invocation once, under the writer lock,
+                    # after every read-only preview and before any mutation.
+                    normal_capability = gateway.probe(
+                        CapabilityRequest(needs_retirement=True, needs_named_artifacts=True), dry_run=False
+                    )
+                    require_capabilities(normal_capability)
                     active_dependencies = replace(
                         dependencies,
                         gateway_factory=lambda dry_run: gateway,
@@ -847,7 +865,12 @@ def _run_defaults(config: ImportConfig, dependencies: ImportDependencies) -> Imp
                     ):
                         selected, frozen, counting = frozen_sources[root_index]
                         result = _run_import(
-                            selected, active_dependencies, frozen, counting, readers[root_index].for_session(session_id)
+                            selected,
+                            active_dependencies,
+                            frozen,
+                            counting,
+                            readers[root_index].for_session(session_id),
+                            normal_capability=normal_capability,
                         )
                         if root_index in reported_roots:
                             redaction = cast(dict[str, Any], result.report["redaction"])
@@ -883,6 +906,9 @@ def _run_defaults(config: ImportConfig, dependencies: ImportDependencies) -> Imp
             if isinstance(failure, ImporterError)
             else ConfigurationError("source_discovery_failed", "default source discovery could not be completed")
         )
+        error = remember_failure(first_error or error)
+        if work := _BUDGET.get():
+            work.phase = "error_reporting"
         builder = ReportBuilder(dry_run=config.dry_run, experiment_name=config.experiment_name, redaction_mode=mode)
         builder.add_error(error.code, error.safe_message)
         if cleanup_failed:
@@ -950,6 +976,8 @@ def _run_import(
     frozen: SourceSnapshot | None = None,
     counting_override: _CountingRedaction | None = None,
     reader_override: DiscoveryPlanReader | None = None,
+    *,
+    normal_capability: CapabilityReport | None = None,
 ) -> ImportResult:
     """Run the two-pass import pipeline and return its versioned result.
 
@@ -990,6 +1018,7 @@ def _run_import(
             raise
         except Exception:
             temp_failure = ConfigurationError(_TEMP_DIRECTORY_FAILED, _TEMP_DIRECTORY_FAILED_MESSAGE)
+            remember_failure(temp_failure)
             builder.add_error(temp_failure.code, temp_failure.safe_message)
             result = ImportResult(
                 dry_run=config.dry_run,
@@ -999,8 +1028,21 @@ def _run_import(
             )
         else:
             assert run_root is not None
-            result = _run_pipeline(config, dependencies, builder, counting, filters, run_root, frozen, reader_override)
+            result = _run_pipeline(
+                config,
+                dependencies,
+                builder,
+                counting,
+                filters,
+                run_root,
+                frozen,
+                reader_override,
+                normal_capability=normal_capability,
+            )
     except ImporterError as error:
+        remember_failure(error)
+        if work := _BUDGET.get():
+            work.phase = "error_reporting"
         _record_snapshot_cleanup_failure(builder, error)
         builder.add_error(error.code, error.safe_message)
         result = ImportResult(
@@ -1013,6 +1055,7 @@ def _run_import(
         # An unexpected failure is sanitized: no value, path, or content
         # from the underlying exception reaches the report.
         unexpected_failure = ImporterError(_IMPORT_FAILED, _IMPORT_FAILED_MESSAGE)
+        remember_failure(unexpected_failure)
         builder.add_error(unexpected_failure.code, unexpected_failure.safe_message)
         result = ImportResult(
             dry_run=config.dry_run,
@@ -1036,6 +1079,8 @@ def _run_pipeline(
     run_root: Path,
     frozen: SourceSnapshot | None = None,
     reader_override: DiscoveryPlanReader | None = None,
+    *,
+    normal_capability: CapabilityReport | None = None,
 ) -> ImportResult:
     """Phases 1-7: source, snapshot, discovery, and the global preflight."""
     redaction_mode = RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM
@@ -1141,9 +1186,14 @@ def _run_pipeline(
         # create, and every imported turn uploads its artifact.
         gateway = dependencies.gateway_factory(config.dry_run)
         capability_started = _debug_phase_started(config, "capability preflight")
-        capability = gateway.probe(
-            CapabilityRequest(needs_retirement=True, needs_named_artifacts=True), dry_run=config.dry_run
-        )
+        # Only the default-source orchestrator passes a normal authorization,
+        # scoped to its current invocation, gateway and held writer lock.
+        # A preview report must never authorize normal writes.
+        capability = normal_capability
+        if config.dry_run or capability is None or capability.dry_run:
+            capability = gateway.probe(
+                CapabilityRequest(needs_retirement=True, needs_named_artifacts=True), dry_run=config.dry_run
+            )
         require_capabilities(capability)
         _debug_phase_completed(config, "capability preflight", capability_started)
 
@@ -1194,6 +1244,8 @@ def _run_pipeline(
 
 def _debug_phase_started(config: ImportConfig, phase: str) -> float | None:
     """Emit a safe DEBUG phase-start event and return its monotonic start time."""
+    if work := _BUDGET.get():
+        work.phase = phase
     if config.log_level != "DEBUG":
         return None
     _write_debug(f"mlflow-import: phase {phase} started")
@@ -1259,13 +1311,20 @@ def _run_dry(
     fresh import predictions.
     """
     planning_started = _debug_phase_started(config, "planning and owned-trace lookup")
-    experiment = gateway.resolve_experiment(config.experiment_name, create=True)
+    experiment = _resolve_existing_experiment(gateway, config.experiment_name)
+    replay = dependencies.replay_builder(snapshot)
+    pricing_basis_for = (
+        _prepare_pricing_bases(config, gateway, experiment, snapshot, reader, snapshot.snapshot_path.parent)
+        if isinstance(gateway, MlflowGateway)
+        else None
+    )
+    _preflight_trace_envelopes(config, dependencies, snapshot, reader, replay, experiment, pricing_basis_for)
+    if experiment is None:
+        experiment = gateway.resolve_experiment(config.experiment_name, create=True)
     _record_experiment(builder, experiment)
     plan = plan_reconciliation(
         reader.iter_session_scans(), reader.iter_turns(), _owned_candidates(gateway, experiment, snapshot, reader)
     )
-    if isinstance(gateway, MlflowGateway):
-        _prepare_pricing_bases(config, gateway, experiment, snapshot, reader, snapshot.snapshot_path.parent)
     builder.set_unexamined_owned_traces(len(plan.unexamined_owned_traces))
     _debug_phase_completed(config, "planning and owned-trace lookup", planning_started, turns=len(plan.results))
 
@@ -1384,6 +1443,8 @@ def _run_normal(
     _verify_replayed_fingerprints(reader.iter_turns(), replay)
     _debug_phase_completed(config, "replay fingerprint validation", replay_started, turns=len(plan.results))
 
+    _preflight_trace_envelopes(config, dependencies, snapshot, reader, replay, experiment, pricing_basis_for)
+
     # Prepare every local write dependency before the deferred experiment
     # creation. A local staging failure is a pre-write failure and must not
     # leave a newly-created experiment behind.
@@ -1446,6 +1507,49 @@ def _run_normal(
         retired_ids[trace_id] = True
     builder.set_retired_traces(len(retired_ids))
     return ImportResult(dry_run=False, report=builder.build(), failed_items=failed_items)
+
+
+def _preflight_trace_envelopes(
+    config: ImportConfig,
+    dependencies: ImportDependencies,
+    snapshot: SourceSnapshot,
+    reader: DiscoveryPlanReader,
+    replay: ReplayBuilder,
+    experiment: ExperimentRef | None,
+    pricing_basis_for: Callable[[str], Mapping[str, dict[str, Any]]] | None,
+) -> None:
+    """Admit every selected turn before experiment, staging or recovery writes.
+
+    The unresolved experiment identity is used only for this disposable pure
+    mapping. No request, placeholder fingerprint, or proof is persisted.
+    Creation re-admits actual late-decorated requests at the gateway boundary.
+    """
+    from mlflow_import.content.accounting import pricing_bases
+    from mlflow_import.content.turn_map import validate_turn_map_admission
+    from mlflow_import.mlflow.capabilities import PINNED_MAX_INLINE_PAYLOAD_BYTES
+    from mlflow_import.mlflow.trace_envelope import admit_trace
+    from mlflow_import.retry import check_budget
+
+    contexts = _MappingContexts(
+        adapter=dependencies.replay_adapter_factory(snapshot),
+        scans=reader.iter_session_scans(),
+        snapshot=snapshot,
+        experiment_id=(experiment.experiment_id or "") if experiment is not None else "",
+        inline_limit_bytes=PINNED_MAX_INLINE_PAYLOAD_BYTES,
+        redaction_mode=RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM,
+    )
+    token = pricing_bases.set({})
+    try:
+        for entry in reader.iter_turns():
+            check_budget()
+            pricing_bases.set(pricing_basis_for(entry.session_id) if pricing_basis_for is not None else {})
+            frozen_replay = replay(entry)
+            context = contexts.context_for(entry.session_id)
+            request = dependencies.mapper(frozen_replay, context)
+            admitted = admit_trace(request, reserve_late_control=True)
+            validate_turn_map_admission(frozen_replay, admitted.request, context.redaction_mode)
+    finally:
+        pricing_bases.reset(token)
 
 
 def _prepare_pricing_bases(
@@ -1579,6 +1683,9 @@ def _owned_candidates(
                 if not candidate.ownership_complete:
                     gateway.remember_foreign(qualified_session(header), scan.session_id, trace)
                     continue
+                from mlflow_import.mlflow.trace_envelope import require_trace_proof
+
+                require_trace_proof(trace)
                 candidates.append(candidate)
         return candidates
     return DiskList(
@@ -1896,6 +2003,8 @@ def _report_failed_items(report: Mapping[str, object]) -> int:
 
 def _finalize_result(result: ImportResult, builder: ReportBuilder) -> ImportResult:
     """Build the final report after every cleanup boundary has completed."""
+    if work := _BUDGET.get():
+        work.phase = "reporting"
     report = builder.build()
     return ImportResult(
         dry_run=result.dry_run,

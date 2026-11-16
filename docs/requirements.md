@@ -362,9 +362,11 @@ the promoted API keys `mlflow.trace.session`, `mlflow.trace.tokenUsage` and
 `mlflow.trace.cost` remain permitted. Verify native NULLs as well as values.
 OpenCode's native reference projection uses initiating-user creation through final
 assistant semantic completion (or creation), input + output + reasoning total,
-and NULL cache/cost columns. Preserve explicit source totals and costs in canonical
-accounting without substituting them into these reference-native fields. Other
-harnesses retain their qualified native cache/cost mappings.
+available cache counters, and available persisted USD costs. Unavailable cache
+lifetimes and cost breakdowns remain NULL rather than fabricated. Preserve
+explicit source totals and richer raw observations in canonical accounting; do
+not substitute invented values into these native fields. Other harnesses retain
+their qualified native cache/cost mappings.
 
 ### 8.1 Experiment
 

@@ -124,10 +124,10 @@ __all__ = [
 DISCOVERY_PLAN_SCHEMA_VERSION = "mlflow-import-discovery-plan-v1"
 """Schema version of the discovery plan; the reader rejects any other value."""
 
-ARTIFACT_SCHEMA_VERSION = "artifact-v3"
+ARTIFACT_SCHEMA_VERSION = "artifact-v4"
 """Artifact schema version recorded as a render-contract input in the plan."""
 
-MAPPING_VERSION = "mapping-v8"
+MAPPING_VERSION = "mapping-v9"
 """Turn-to-trace mapping version recorded as a render-contract input in the plan."""
 
 PLANNED_ACTION_IMPORT = "import"

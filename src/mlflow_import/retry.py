@@ -55,19 +55,72 @@ class RetryBudget:
     retries_left: int
     deadline: float
     operations_left: int = 1_000_000
+    phase: str = "work"
+    terminal: bool = False
+    exhausted: ImporterError | None = None
+    primary_error: ImporterError | None = None
 
     def check(self, *, retry: bool = False, operation: bool = False) -> None:
-        if time.monotonic() >= self.deadline or (retry and self.retries_left <= 0):
-            raise ItemImportError("retry_budget_exhausted", "the shared retry or operation deadline was exhausted")
+        if self.exhausted is not None:
+            raise self.exhausted
+        reason = None
+        if time.monotonic() >= self.deadline:
+            reason = "deadline"
+        elif retry and self.retries_left <= 0:
+            reason = "retries"
+        elif operation and self.operations_left <= 0:
+            reason = "operations"
+        if reason is not None:
+            messages = {
+                "deadline": "the shared invocation deadline was exhausted",
+                "retries": "the shared retry allowance was exhausted",
+                "operations": "the shared work-operation allowance was exhausted",
+            }
+            error = ItemImportError(
+                "operation_budget_exhausted" if reason == "operations" else "retry_budget_exhausted", messages[reason]
+            )
+            error.diagnostics = {
+                "reason": reason,
+                "phase": self.phase,
+                "retries_left": self.retries_left,
+                "operations_left": self.operations_left,
+            }
+            self.exhausted = error
+            raise error
         if retry:
             self.retries_left -= 1
         if operation:
-            if self.operations_left <= 0:
-                raise ItemImportError("operation_budget_exhausted", "the shared work-operation allowance was exhausted")
             self.operations_left -= 1
 
 
 _BUDGET: ContextVar[RetryBudget | None] = ContextVar("mlflow_import_retry_budget", default=None)
+
+
+def remember_failure(error: ImporterError) -> ImporterError:
+    """Retain only safe, constant-size first-failure state before reporting I/O."""
+    budget = _BUDGET.get()
+    if budget is None:
+        return error
+    if budget.primary_error is None:
+        safe = ImporterError(error.code, error.safe_message, error.exit_status)
+        safe.diagnostics = dict(error.diagnostics)
+        budget.primary_error = safe
+    return budget.primary_error
+
+
+@contextmanager
+def terminal_reporting() -> Iterator[RetryBudget]:
+    """Finite local-output allowance; never renew the invocation's remote retries.
+
+    Only terminal rendering belongs here. Source discovery and import execution
+    must remain under the original budget. retry_call is prohibited in this scope.
+    """
+    budget = RetryBudget(0, time.monotonic() + 30.0, 1_000_000, phase="rendering", terminal=True)
+    token = _BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _BUDGET.reset(token)
 
 
 def check_budget() -> None:
@@ -203,6 +256,8 @@ def retry_call(
     while True:
         budget = _BUDGET.get()
         if budget is not None:
+            if budget.terminal:
+                raise ItemImportError("terminal_work_forbidden", "remote work is forbidden during terminal reporting")
             budget.check(operation=True)
         attempt += 1
         try:

@@ -46,6 +46,8 @@ import pytest
 from mlflow import MlflowClient
 from mlflow.artifacts import get_artifact_repository
 
+from mlflow_import.compatibility import decode_ownership
+from mlflow_import.content.input_context import INPUT_CONTEXT_ATTRIBUTE, validate_input_contexts
 from mlflow_import.mlflow.gateway import (
     RETRIEVED_SPAN_STATUS,
     TRACE_SESSION_METADATA_KEY,
@@ -410,9 +412,7 @@ def test_root_status_outcome_and_timing_metadata(imported: ImportedSession, expe
         # Source-derived timing, never the local wall clock.
         assert root.start_time_ns == request.start_time_ns
         assert root.end_time_ns == request.end_time_ns
-        assert trace.info.tags.get("opencode.timing_estimated") == request.root_tags.get(
-            "opencode.timing_estimated"
-        )
+        assert trace.info.tags.get("opencode.timing_estimated") == request.root_tags.get("opencode.timing_estimated")
 
 
 def test_token_and_cost_metadata(imported: ImportedSession, expected: ExpectedMapping) -> None:
@@ -500,10 +500,15 @@ def test_deterministic_artifact_path_and_exact_bytes(imported: ImportedSession, 
 
         document = json.loads(stored_bytes)
         assert document["identity_map"]["trace_id"] == trace_id
-        assert document["schema_version"] == "mlflow-import.turn-map.v1"
+        assert document["schema_version"] == "mlflow-import.turn-map.v2"
         assert document["turn_key"] == turn.summary.turn_key
         assert document["records"], "the map must retain source occurrence references"
         assert document["identity_map"] == _identity_map_from_trace(trace)
+        ownership = decode_ownership(trace.info.tags, trace.info.trace_metadata)
+        assert validate_input_contexts(document, ownership, spans=trace.data.spans)
+        assert {entry["span_id"] for entry in document["input_contexts"]} == {
+            span.span_id for span in trace.data.spans if INPUT_CONTEXT_ATTRIBUTE in span.attributes
+        }
         session_path = trace.info.tags["mlflow_import.session_artifact"]
         with TemporaryDirectory(prefix="mlflow-import-session-contract-") as dst:
             session_bytes = Path(repository.download_artifacts(session_path, dst)).read_bytes()

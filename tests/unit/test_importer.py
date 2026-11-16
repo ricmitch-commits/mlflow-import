@@ -27,7 +27,7 @@ from mlflow_import.content.fingerprint import build_effective_turn, source_finge
 from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
 from mlflow_import.errors import SourceCompatibilityError
 from mlflow_import.importer import exit_status, replay_turn, run_import
-from mlflow_import.mlflow.capabilities import CapabilityRequest
+from mlflow_import.mlflow.capabilities import CapabilityReport, CapabilityRequest
 from mlflow_import.mlflow.reconciliation import OwnedTraceCandidate
 from mlflow_import.reporting import render_human, render_json
 from mlflow_import.source.discovery import DiscoveryPlanReader, DiscoveryTurnEntry, discover_sessions
@@ -41,6 +41,7 @@ from mlflow_import.source.snapshot import (
     SourceSnapshot,
     create_normalized_snapshot,
 )
+from mlflow_import.sources import Adapter
 from tests.support.fake_gateway import FakeMlflowGateway
 from tests.support.fake_source import ScriptedExporter
 from tests.support.fake_turn import fake_record
@@ -153,6 +154,128 @@ def test_experiment_status_is_reported_per_mode(import_dependencies, config):
 
     again = run_import(config, import_dependencies)
     assert again.report["experiment"]["status"] == "resolved"
+
+
+class _DefaultSourceGateway(FakeMlflowGateway):
+    """Fail a chosen normal probe while allowing every read-only preview."""
+
+    def __init__(self, lock: FakeLockFactory) -> None:
+        super().__init__()
+        self.lock = lock
+        self.probe_modes: list[bool] = []
+        self.fail_normal_probe: int | None = None
+
+    def probe(self, request: CapabilityRequest, dry_run: bool | None = None) -> CapabilityReport:
+        assert dry_run is not None
+        self.probe_modes.append(dry_run)
+        if not dry_run:
+            assert len(self.lock.acquisitions) == len(self.lock.releases) + 1
+            self.compatible = self.probe_modes.count(False) != self.fail_normal_probe
+        else:
+            self.compatible = True
+        return super().probe(request, dry_run=dry_run)
+
+
+@pytest.fixture
+def default_source_import(config, restrictive_tmp_path: Path, monkeypatch):
+    roots = []
+    for root_index in range(2):
+        sessions = [(f"root-{root_index}-session-{index}", DEFAULT_SESSION_CREATED_MS + index) for index in range(2)]
+        roots.append(
+            build_current_source_db(
+                restrictive_tmp_path,
+                name=f"default-{root_index}.db",
+                sessions=sessions,
+                messages=[
+                    (f"{session}-{role}", session, role, seq, payload)
+                    for session, _ in sessions
+                    for role, seq, payload in (("user", 1, UNIT_PROMPT_JSON), ("assistant", 2, UNIT_REPLY_JSON))
+                ],
+            )
+        )
+    monkeypatch.setattr("mlflow_import.sources.ADAPTERS", {"opencode": Adapter("opencode", True)})
+    monkeypatch.setattr(Adapter, "default_locations", lambda self: tuple(roots))
+    object.__setattr__(config, "_discover_defaults", True)
+    lock = FakeLockFactory()
+    gateway = _DefaultSourceGateway(lock)
+    preview_gateway = _DefaultSourceGateway(lock)
+    preview_gateway.dry_run = True
+    preview_gateway.probe_modes = gateway.probe_modes
+    dependencies = replace(
+        build_import_fakes(restrictive_tmp_path=restrictive_tmp_path, gateway=gateway, lock_factory=lock),
+        gateway_factory=lambda dry_run: preview_gateway if dry_run else gateway,
+    )
+    return config, dependencies
+
+
+def test_default_sources_authorize_all_sessions_once_after_previews(default_source_import):
+    config, dependencies = default_source_import
+    gateway = dependencies.gateway
+    # A repeated normal probe would fail after the first session's writes.
+    gateway.fail_normal_probe = 2
+
+    result = run_import(config, dependencies)
+
+    assert exit_status(result) == 0
+    assert gateway.probe_modes == [True, True, False]
+    assert result.report["summary"]["turns_imported"] == 4
+    assert len(result.report["sessions"]) == 4
+    assert len(gateway.trace_ids()) == 4
+    assert len(dependencies.lock_factory.acquisitions) == len(dependencies.lock_factory.releases) == 1
+    assert_result_document(result.report)
+
+
+def test_default_sources_initial_normal_probe_failure_discards_previews(default_source_import):
+    config, dependencies = default_source_import
+    gateway = dependencies.gateway
+    gateway.fail_normal_probe = 1
+
+    result = run_import(config, dependencies)
+
+    assert exit_status(result) == 2
+    assert result.error.code == "mlflow_capability_unsupported"
+    assert gateway.probe_modes == [True, True, False]
+    assert gateway.mutations == []
+    assert gateway.trace_ids() == []
+    assert result.report["dry_run"] is False
+    assert result.report["summary"]["turns_imported"] == 0
+    assert result.report["summary"]["imported_turns"] == 0
+    assert "planned" not in result.report["summary"]
+    assert list(result.report["sessions"]) == []
+    assert_result_document(result.report)
+
+
+def test_default_sources_dry_run_never_probes_normal_mode(default_source_import):
+    config, dependencies = default_source_import
+    config = replace(config, dry_run=True)
+    object.__setattr__(config, "_discover_defaults", True)
+    gateway = dependencies.gateway
+    gateway.fail_normal_probe = 1
+
+    result = run_import(config, dependencies)
+
+    assert exit_status(result) == 0
+    assert gateway.probe_modes == [True, True]
+    assert gateway.mutations == []
+    assert dependencies.lock_factory.acquisitions == []
+    assert result.report["summary"]["planned"]["imported"] == 4
+
+
+def test_default_sources_reused_gateway_requires_fresh_normal_probe(default_source_import):
+    config, dependencies = default_source_import
+    gateway = dependencies.gateway
+    first = run_import(config, dependencies)
+    assert exit_status(first) == 0
+    mutations = list(gateway.mutations)
+    gateway.fail_normal_probe = 2
+
+    second = run_import(config, dependencies)
+
+    assert exit_status(second) == 2
+    assert second.error.code == "mlflow_capability_unsupported"
+    assert gateway.probe_modes == [True, True, False, True, True, False]
+    assert gateway.mutations == mutations
+    assert second.report["summary"]["turns_imported"] == 0
 
 
 # ---------------------------------------------------------------------------

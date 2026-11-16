@@ -317,10 +317,16 @@ def test_missing_id_structural_identity_is_stable_when_only_secret_changes(tmp_p
         assert exit_status(result) == 0
         turn = result.report["sessions"][0]["turns"][0]
         trace = dependencies.gateway.stored_trace(turn["trace_id"])
+        # Each physical creation has its own immutable map generation. Compare
+        # the logical artifact identity while checking the generation shape.
+        logical_path, separator, generation = trace.tags["opencode.artifact_path"].rpartition("-create-")
+        assert separator and generation.endswith(".json")
+        creation_id = generation.removesuffix(".json")
+        assert len(creation_id) == 32 and all(character in "0123456789abcdef" for character in creation_id)
         return (
             turn["turn_key"],
             trace.tags["mlflow_import.source_fingerprint"],
-            trace.tags["opencode.artifact_path"],
+            logical_path + ".json",
         )
 
     baseline = source("missing-id-structural-baseline.db", "password-alpha")
@@ -901,7 +907,7 @@ def test_corrected_mapping_contract_replaces_old_version_once(tmp_path):
     assert exit_status(second) == 0
     assert second.report["sessions"][0]["turns"][0]["action"] == "updated"
     trace = dependencies.gateway.stored_trace(second.report["sessions"][0]["turns"][0]["trace_id"])
-    assert trace.tags["opencode.mapping_version"] == "mapping-v8"
+    assert trace.tags["opencode.mapping_version"] == "mapping-v9"
     marker = len(dependencies.gateway.mutations)
     third = run_import(config, dependencies)
     assert exit_status(third) == 0

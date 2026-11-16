@@ -1119,19 +1119,34 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         end_ns = semantic_end if semantic_end is not None else end_ns
         usage = dict(cast(Mapping[str, object], native_usage or {}))
         projected_usage: dict[str, object] = {
-            key: usage[key] for key in ("input_tokens", "output_tokens") if key in usage
+            key: usage[key]
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation_input_tokens_above_1hr",
+            )
+            if key in usage
         }
         reasoning = _opencode_reasoning(activity)
-        if projected_usage:
-            projected_usage["total_tokens"] = sum(cast(int, value) for value in projected_usage.values()) + reasoning
+        if "input_tokens" in projected_usage or "output_tokens" in projected_usage:
+            projected_usage["total_tokens"] = (
+                cast(int, projected_usage.get("input_tokens", 0))
+                + cast(int, projected_usage.get("output_tokens", 0))
+                + reasoning
+            )
         native_usage = projected_usage
-        native_cost = None
+        native_cost = activity.cost
+    elif activity is not None and harness == "claude":
+        request_preview, response_preview = _claude_previews(turn)
     elif activity is not None:
         import json
 
         request_preview = (
             json.dumps(root_values.root_input, ensure_ascii=False)[:1000]
-            if root_values.root_input is not None else None
+            if root_values.root_input is not None
+            else None
         )
         response_preview = json.dumps(root_output, ensure_ascii=False)[:1000] if root_output is not None else None
     creation_tags = dict(metadata) if activity is not None else {}
@@ -1157,9 +1172,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
             )
         ),
         native_session_id=native_session_id,
-        root_inputs=(
-            _native_root_input(root_input) if context.source_schema == "legacy" else root_input
-        ),
+        root_inputs=(_native_root_input(root_input) if context.source_schema == "legacy" else root_input),
         root_outputs=(_native_root_output(root_output) if context.source_schema == "legacy" else root_output),
         root_attributes=MappingProxyType(root_attributes),
         # The artifact's exact relative path rides a trace TAG at root
@@ -1194,6 +1207,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
 
 def _opencode_reasoning(activity: Activity) -> int:
     """Apply the same parent-authoritative, missing-field rollup as native I/O."""
+
     def observed(key: str) -> int:
         call = activity.calls[key]
         value = call.usage_observation.get("reasoning")
@@ -1244,7 +1258,8 @@ def _opencode_projection(turn: ReplayTurn) -> tuple[str | None, str | None, int 
                 parts = [content]
             elif isinstance(content, (list, tuple)):
                 parts = [
-                    str(part["text"]) for part in content
+                    str(part["text"])
+                    for part in content
                     if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
                 ]
             else:
@@ -1273,6 +1288,75 @@ def _opencode_projection(turn: ReplayTurn) -> tuple[str | None, str | None, int 
             if value:
                 response = value
     return prompt, response, start, end
+
+
+_CLAUDE_PREVIEW_UNITS = 1000
+
+
+def _claude_previews(turn: ReplayTurn) -> tuple[str | None, str | None]:
+    """Native Claude previews: prompt text and final assistant text.
+
+    Mirrors the reference integration's prompt/final-response previews rather
+    than serializing the structured root records. Subagent records are not part
+    of the primary transcript and never contribute.
+    """
+    summary = turn.summary
+    request = response = None
+    for record in turn.iter_records():
+        if record.raw_columns.get("subagent"):
+            continue
+        if record.source_id == summary.first_user_source_id:
+            request = _claude_request_text(_claude_message_content(record))
+        elif record.source_id == summary.root_result_source_id:
+            response = _claude_response_text(_claude_message_content(record))
+    return (
+        _claude_preview(request) if request else None,
+        _claude_preview(response) if response else None,
+    )
+
+
+def _claude_message_content(record: SourceRecord) -> object | None:
+    decoded = record.decoded_value
+    if not isinstance(decoded, Mapping):
+        return None
+    message = decoded.get("message")
+    if isinstance(message, Mapping) and "content" in message:
+        return cast(object, message["content"])
+    return cast(object, decoded.get("content"))
+
+
+def _claude_request_text(content: object | None) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n".join(
+            cast(str, part["text"])
+            for part in content
+            if isinstance(part, Mapping) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        )
+    return None
+
+
+def _claude_response_text(content: object | None) -> str | None:
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, (list, tuple)):
+        text = None
+        for part in content:
+            if (
+                isinstance(part, Mapping)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and part["text"].strip()
+            ):
+                text = cast(str, part["text"])
+        return text
+    return None
+
+
+def _claude_preview(value: str) -> str:
+    encoded = value.encode("utf-16-le", "surrogatepass")
+    return encoded[: _CLAUDE_PREVIEW_UNITS * 2].decode("utf-16-le", "replace")
 
 
 def _shared_child_specs(turn: ReplayTurn, activity: object, inline_limit: int) -> Iterator[SpanSpec | EventSpec]:
@@ -1456,9 +1540,22 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
         return
 
     prompt = _native_root_input(turn.load_root_input(inline_limit))
-    history: list[dict[str, object]] = []
+    from mlflow_import.content.input_context import (
+        INPUT_CONTEXT_ATTRIBUTE,
+        ConversationDelta,
+        recorded_input,
+        source_reference,
+    )
+    from mlflow_import.identity import qualified_session
+
+    conversation = ConversationDelta(qualified_session(turn.session_header), turn.summary.turn_key)
+    prompt_sources = [
+        source_reference(child, SourceIdentity.of(child).key, "content")
+        for child in records[1:]
+        if child.parent_source_id == records[0].source_id
+    ] or [source_reference(records[0], SourceIdentity.of(records[0]).key, "content")]
     if isinstance(prompt, Mapping):
-        history.append({"role": "user", "content": prompt.get("prompt", "")})
+        conversation.observe("", {"role": "user", "content": prompt.get("prompt", "")}, prompt_sources)
 
     first = True
     index = 0
@@ -1470,6 +1567,13 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
             continue
 
         decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        scope = str(record.raw_columns.get("subagent") or "")
+        if _is_message_container(record) and record.classification == "user":
+            conversation.observe(
+                scope,
+                {"role": "user", "content": decoded.get("content")},
+                [source_reference(record, SourceIdentity.of(record).key, "content")],
+            )
         if _is_message_container(record) and extract_model_identity(decoded) is not None:
             children = []
             next_index = index + 1
@@ -1479,7 +1583,30 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
                     break
                 children.append(child)
                 next_index += 1
-            spec = _native_model_spec(record, children, history)
+            source_key = SourceIdentity.of(record).key
+            sources = [source_reference(record, source_key, "assistant")]
+            sources.extend(source_reference(child, SourceIdentity.of(child).key, "content") for child in children)
+            inputs, descriptor = conversation.consume(
+                scope,
+                record.invocation_id or source_key,
+                sources,
+                recorded=recorded_input([record], [source_key]),
+            )
+            messages = inputs.get("messages", []) if isinstance(inputs, Mapping) else []
+            spec = _native_model_spec(record, children, messages)
+            if descriptor["origin"] == "recorded-request-input" or inputs is None:
+                spec = replace(spec, inputs=inputs)
+            spec = replace(
+                spec,
+                attributes={
+                    **spec.attributes,
+                    INPUT_CONTEXT_ATTRIBUTE: descriptor,
+                    "mlflow_import.inputs_origin": descriptor["origin"],
+                },
+            )
+            output = cast(Mapping[str, object], spec.outputs)
+            choices = cast(list[dict[str, dict[str, object]]], output["choices"])
+            conversation.assistant(scope, choices[0]["message"], sources)
             emitted.add(spec.source_key)
             yield _bound_child(spec, inline_limit)
             for child in children:
@@ -1492,12 +1619,14 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
                         state = child_value.get("state")
                         if isinstance(state, Mapping):
                             call_id = child_value.get("callID") or child_value.get("call_id")
-                            history.append(
+                            conversation.observe(
+                                scope,
                                 {
                                     "role": "tool",
                                     "tool_call_id": call_id,
                                     "content": state.get("output"),
-                                }
+                                },
+                                [source_reference(child, SourceIdentity.of(child).key, "state.output")],
                             )
             index = next_index
             continue

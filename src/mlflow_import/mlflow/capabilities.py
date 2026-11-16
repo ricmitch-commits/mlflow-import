@@ -19,7 +19,7 @@ creates a probe experiment, trace, or artifact, never uploads, and never
 deletes: the mutation-based proofs belong only to Task 0's disposable
 compatibility-test environment, so the facts that cannot be re-proven
 without mutation (``LiveSpan.end``, the named-artifact composition's
-server-side behavior, retirement semantics, and the 1 MiB inline round-trip
+server-side behavior, retirement semantics, and the 8 MiB inline round-trip
 floor) are taken from the recorded profile and apply only while both the
 installed client and attested server match the pinned profile version. A
 numeric version match alone can never make an unsupported pair pass: the
@@ -82,11 +82,12 @@ PINNED_MLFLOW_VERSION = "3.17.2"
 VERSION_ATTESTATION_TIMEOUT_SECONDS = 5.0
 MAX_VERSION_RESPONSE_BYTES = 64 * 1024
 
-#: The inline payload floor the pinned profile verified to round-trip
-#: byte-exact through span inputs/outputs (larger payloads must become named
-#: trace artifacts). Reported as the target's payload limit when the
-#: recorded profile applies.
-PINNED_MAX_INLINE_PAYLOAD_BYTES = 4_194_304
+#: Per-value canonical-byte envelope qualified through historical ingest and
+#: complete root/child inputs, outputs, and attributes on localhost 3.17.2.
+#: Complete roots/structured activities above it fail; other oversized child
+#: values retain the existing artifact-reference policy. This is not an
+#: aggregate HTTP-request or arbitrary remote-proxy allowance.
+PINNED_MAX_INLINE_PAYLOAD_BYTES = 8_388_608
 
 #: The pinned public operations the writer depends on — identical to the
 #: profile's ``REQUIRED_METHODS`` (pinned by the gateway contract test).
@@ -149,6 +150,12 @@ class _VersionAttestationFailure(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class _TraceMetadataNotFound(Exception):
+    """An empty exact-ID metadata search is an authoritative protocol absence."""
+
+    error_code = "RESOURCE_DOES_NOT_EXIST"
 
 
 #: Reserved names for the read-only reachability/protocol probes. The
@@ -260,7 +267,11 @@ def probe_capabilities(
 
         if not callable(getattr(Span, "from_dict", None)) or not callable(TraceInfo):
             errors.append("the public historical trace objects are unavailable")
-        for method, keywords in (("start_trace", {"trace_info"}), ("log_spans", {"location", "spans"})):
+        for method, keywords in (
+            ("start_trace", {"trace_info"}),
+            ("log_spans", {"location", "spans"}),
+            ("get_trace_info", {"trace_id"}),
+        ):
             operation = getattr(TracingClient, method, None)
             if not callable(operation) or not keywords <= inspect.signature(operation).parameters.keys():
                 errors.append("the public historical trace ingestion API is unavailable")
@@ -299,7 +310,7 @@ def probe_capabilities(
     except Exception as exc:  # noqa: BLE001 - a failed probe is a report input, never a crash
         errors.append(f"server reachability probe failed: {type(exc).__name__}")
     try:
-        client.get_trace(PROBE_TRACE_ID, display=False)
+        get_trace_info_metadata(client, PROBE_TRACE_ID)
         errors.append("retrieving an unknown trace id did not raise a protocol error")
     except Exception as exc:  # noqa: BLE001 - a failed probe is a report input, never a crash
         if getattr(exc, "error_code", None) is None:
@@ -337,6 +348,34 @@ def probe_capabilities(
         dry_run=dry_run,
         safe_error="; ".join(errors) if errors else None,
     )
+
+
+def get_trace_info_metadata(client: Any, trace_id: str, experiment_id: str | None = None) -> Any:
+    """Public metadata-only retrieval; never fall back to full ``get_trace``.
+
+    The pinned MlflowClient lacks get_trace_info; its public TracingClient
+    companion provides it. Injected client-only adapters may implement that
+    operation or exact-ID metadata search.
+    """
+    operation = getattr(client, "get_trace_info", None)
+    if callable(operation):
+        return operation(trace_id)
+    if type(client) is MlflowClient:
+        from mlflow.tracing.client import TracingClient
+
+        return TracingClient(tracking_uri=client.tracking_uri).get_trace_info(trace_id)
+    escaped = trace_id.replace("\\", "\\\\").replace("'", "\\'")
+    page = client.search_traces(
+        locations=[experiment_id] if experiment_id is not None else [],
+        filter_string=f"request_id = '{escaped}'",
+        max_results=2,
+        include_spans=False,
+    )
+    if len(page) == 1 and page[0].info.trace_id == trace_id:
+        return page[0].info
+    if not page:
+        raise _TraceMetadataNotFound("trace not found")
+    raise CapabilityError("trace_metadata_unsupported", "the target cannot resolve exact trace metadata")
 
 
 def version_endpoint(tracking_uri: str) -> str:

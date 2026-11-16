@@ -20,7 +20,13 @@ from mlflow_import.content.accounting import (
     pricing_bases,
     sum_fields,
 )
-from mlflow_import.identity import harness_name
+from mlflow_import.content.input_context import (
+    INPUT_CONTEXT_ATTRIBUTE,
+    ConversationDelta,
+    recorded_input,
+    source_reference,
+)
+from mlflow_import.identity import harness_name, qualified_session
 from mlflow_import.source.model import SourceRecord
 from mlflow_import.source.model_identity import extract_model_identity
 from mlflow_import.source.replay import ReplayTurn
@@ -420,8 +426,20 @@ def chat_message(call: Invocation, children: Mapping[str, list[SourceRecord]]) -
 def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
     """Emit AGENT/LLM/TOOL specs with complete structured content and provenance."""
     from mlflow_import.mlflow.mapping import SourceIdentity, SpanSpec, _common_attributes
+    from mlflow_import.mlflow.trace_envelope import MAX_TRACE_SPANS, SpanBudget
 
-    specs: list[Any] = []
+    budget = SpanBudget(max_spans=MAX_TRACE_SPANS - 1)
+
+    class SpecGraph(list[Any]):
+        def append(self, item: Any) -> None:
+            from dataclasses import fields
+
+            # EventSpec's span_type is a property, not an init field. Account
+            # its equivalent request shape without changing the public spec type.
+            budget.account_spec(SpanSpec(**{field.name: getattr(item, field.name) for field in fields(SpanSpec)}))
+            super().append(item)
+
+    specs: list[Any] = SpecGraph()
     children_by_parent: dict[str, list[SourceRecord]] = {}
     for record in activity.records:
         if record.parent_source_id is not None and (
@@ -454,6 +472,7 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
     ) -> Any:
         start, end, timing = times(records)
         attrs["mlflow_import.timing"] = timing
+        attrs["mlflow_import.source_key"] = key
         return SpanSpec(key, name, kind, parent, inputs, attrs, {}, start, outputs, status, max(start, end))
 
     call_by_record = {
@@ -462,14 +481,17 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         if call.parent_key is None
         for record in call.records
     }
-    histories: dict[str, list[dict[str, Any]]] = {}
+    context = ConversationDelta(qualified_session(turn.session_header), turn.summary.turn_key)
     call_inputs: dict[str, object] = {}
+    call_contexts: dict[str, dict[str, Any]] = {}
     scope_records: dict[str, list[SourceRecord]] = {}
     for record in activity.records:
         scope = str(record.raw_columns.get("subagent") or "")
         scope_records.setdefault(scope, []).append(record)
-        history = histories.setdefault(scope, [])
         decoded = object_map(record.decoded_value)
+        accounting_only = record.source_type in {"usage", "compaction", "branch_summary"} or enum_text(
+            decoded.get("type")
+        ) in {"usage", "compaction", "branch_summary"}
         parts = content_parts(record, tuple(children_by_parent.get(record.source_id or "", [])))
         root_part = (
             decoded
@@ -477,28 +499,123 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
             or decoded.get("role") == "toolResult"
             else None
         )
-        results = [part for part in parts if enum_text(part.get("type")) in {"tool_result", "function_call_output"}]
+        # A derived part is already represented by its container's content.
+        derived = record.source_table == "part" or record.derived_child_ordinal is not None
+        if derived and record.parent_source_id in children_by_parent:
+            continue
+        results = [
+            (ordinal, part)
+            for ordinal, part in enumerate(parts)
+            if enum_text(part.get("type")) in {"tool_result", "function_call_output"} or part.get("functionResponse")
+        ]
         if root_part is not None:
-            results.append(root_part)
+            results.append((-1, root_part))
         container = (
             record.source_table in {"message", "session_message", "jsonl_message"}
             and record.derived_child_ordinal is None
         )
-        if container and not results and (record.classification == "user" or decoded.get("role") == "user"):
+        key = SourceIdentity.of(record).key
+
+        def references(component: str, record: SourceRecord = record, key: str = key) -> list[dict[str, Any]]:
+            children = children_by_parent.get(record.source_id or "", [])
+            if (
+                component == "content"
+                and children
+                and not isinstance(object_map(record.decoded_value).get("content"), str)
+            ):
+                return [source_reference(child, SourceIdentity.of(child).key, "content") for child in children]
+            if component.startswith("tool:") and children:
+                ordinal = int(component.split(":")[1])
+                if ordinal < len(children):
+                    child = children[ordinal]
+                    return [source_reference(child, SourceIdentity.of(child).key, "state.output")]
+            return [source_reference(record, key, component)]
+
+        if container and not accounting_only and (record.classification == "user" or decoded.get("role") == "user"):
             content = decoded.get("content")
-            history.append({"role": "user", "content": content if isinstance(content, str) else parts})
-        call = call_by_record.get(SourceIdentity.of(record).key)
+            result_ordinals = {i for i, _ in results}
+            user_parts = [part for ordinal, part in enumerate(parts) if ordinal not in result_ordinals]
+            if isinstance(content, str) or user_parts:
+                context.observe(
+                    scope,
+                    {"role": "user", "content": content if isinstance(content, str) else user_parts},
+                    references("content"),
+                )
+        call = call_by_record.get(key)
         if call is not None and call.key not in call_inputs:
-            call_inputs[call.key] = {"messages": list(history)} if history else None
-            if enum_text(decoded.get("type")) not in {"usage", "compaction", "branch_summary"}:
-                history.append(chat_message(call, children_by_parent))
-        for part in results:
-            history.append(
+            source_keys = [SourceIdentity.of(item).key for item in call.records]
+            sources = [
+                source_reference(item, item_key, "assistant")
+                for item, item_key in zip(call.records, source_keys, strict=True)
+            ]
+            sources.extend(
+                source_reference(child, SourceIdentity.of(child).key, "content")
+                for item in call.records
+                for child in children_by_parent.get(item.source_id or "", [])
+            )
+            call_inputs[call.key], call_contexts[call.key] = context.consume(
+                scope,
+                call.key,
+                sources,
+                recorded=recorded_input(call.records, source_keys),
+                available=not accounting_only,
+            )
+            if not accounting_only:
+                context.assistant(scope, chat_message(call, children_by_parent), sources)
+        elif call is None and container and record.classification == "assistant" and not accounting_only:
+            context.assistant(
+                scope, chat_message(Invocation(key, records=[record]), children_by_parent), references("assistant")
+            )
+        if call is None and decoded.get("type") == "function_call":
+            arguments = decoded.get("arguments")
+            context.observe(
+                scope,
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": decoded.get("call_id"),
+                            "type": "function",
+                            "function": {
+                                "name": decoded.get("name"),
+                                "arguments": arguments
+                                if isinstance(arguments, str)
+                                else json.dumps(arguments, sort_keys=True),
+                            },
+                        }
+                    ],
+                },
+                references("function_call"),
+            )
+        for ordinal, part in results:
+            response = object_map(part.get("functionResponse"))
+            context.observe(
+                scope,
                 {
                     "role": "tool",
-                    "tool_call_id": part.get("tool_use_id", part.get("call_id", part.get("toolCallId"))),
-                    "content": part.get("output", part.get("content")),
-                }
+                    "tool_call_id": part.get(
+                        "tool_use_id", part.get("call_id", part.get("toolCallId", response.get("id")))
+                    ),
+                    "content": part.get("output", part.get("content", response.get("response"))),
+                },
+                references("tool-result" if ordinal < 0 else f"content:{ordinal}:tool-result"),
+            )
+        # OpenCode and Gemini can retain a tool's actual result on its call part.
+        for ordinal, part in enumerate([*parts, *(decoded.get("toolCalls") or [])]):
+            if not isinstance(part, Mapping):
+                continue
+            state = object_map(part.get("state"))
+            if "output" not in state and "result" not in part:
+                continue
+            context.observe(
+                scope,
+                {
+                    "role": "tool",
+                    "tool_call_id": part.get("id", part.get("callID", part.get("call_id"))),
+                    "content": state.get("output", part.get("result")),
+                },
+                references(f"tool:{ordinal}:result"),
             )
     # Scope containers express recorded subagent identity, never invented primary turns.
     for record in activity.records:
@@ -511,6 +628,7 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
                     key,
                     scope,
                     "AGENT",
+                    None,
                     next(
                         (
                             object_map(r.decoded_value).get("content")
@@ -529,7 +647,6 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
                         ),
                         None,
                     ),
-                    None,
                     {"mlflow_import.agent_scope": scope, "mlflow_import.execution_parentage": "unknown"},
                     scope_records[scope],
                     observed_status(
@@ -556,7 +673,15 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         attrs["mlflow_import.invocation_id"] = call.key
         attrs["mlflow_import.source_keys"] = [SourceIdentity.of(record).key for record in call.records]
         attrs["mlflow_import.accounting"] = call.cost
-        attrs["mlflow_import.inputs_origin"] = "derived-effective-turn-context"
+        if call.key not in call_contexts:
+            _, call_contexts[call.key] = context.consume(
+                str(first.raw_columns.get("subagent") or ""),
+                call.key,
+                [source_reference(record, SourceIdentity.of(record).key, "assistant") for record in call.records],
+                available=False,
+            )
+        attrs[INPUT_CONTEXT_ATTRIBUTE] = call_contexts[call.key]
+        attrs["mlflow_import.inputs_origin"] = call_contexts[call.key]["origin"]
         from mlflow_import.source.outcomes import decoded_source_outcome
 
         attrs["mlflow_import.finish_state"] = decoded_source_outcome(call.records[-1].decoded_value) or "unknown"
@@ -591,18 +716,14 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
                 if call.model or call.usage or first.invocation_id is not None or call.cost.get("origin") == "persisted"
                 else "AGENT",
                 parent,
-                call_inputs.get(call.key)
-                if not operation
-                and call.parent_key is None
-                and (call.model or call.usage or first.invocation_id is not None)
-                else None,
+                call_inputs.get(call.key) if call.parent_key is None else None,
                 output,
                 attrs,
                 call.records,
                 observed_status(object_map(call.records[-1].decoded_value)),
             )
         )
-    tools: dict[str, dict[str, Any]] = {}
+    tools: dict[tuple[str, str], dict[str, Any]] = {}
     for record in activity.records:
         decoded = object_map(record.decoded_value)
         has_derived = (record.source_id or "") in children_by_parent
@@ -634,7 +755,7 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
             if not isinstance(call_id, str):
                 call_id = "unavailable:" + SourceIdentity.of(record).key + ":" + str(ordinal)
             scope = str(record.raw_columns.get("subagent") or "")
-            qualified = scope + ":" + call_id
+            qualified = scope, call_id
             tool = tools.setdefault(qualified, {"records": [], "id": call_id, "scope": scope})
             tool["records"].append(record)
             tool["error"] = (
@@ -696,7 +817,10 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
         attrs["mlflow_import.execution_parentage"] = "recorded" if tool.get("parent") else "unknown"
         attrs["mlflow_import.source_keys"] = [SourceIdentity.of(record).key for record in tool["records"]]
         parent = tool.get("parent") or agents.get(tool["scope"])
-        tool_key = tool.get("source_key", "tool-result:" + tool["id"])
+        result_identity = (
+            json.dumps([tool["scope"], tool["id"]], separators=(",", ":")) if tool["scope"] else tool["id"]
+        )
+        tool_key = tool.get("source_key", "tool-result:" + result_identity)
         attrs["mlflow_import.source_key"] = tool_key
         specs.append(
             spec(
@@ -727,6 +851,7 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
                 attributes={**specs[-1].attributes, "mlflow_import.timing": "measured"},
             )
     represented = {item.source_key for item in specs}
+    represented.update(key for item in specs for key in item.attributes.get("mlflow_import.source_keys", []))
     represented.update(SourceIdentity.of(record).key for call in activity.calls.values() for record in call.records)
     from dataclasses import replace
 

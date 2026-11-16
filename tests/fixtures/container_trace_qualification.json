@@ -1,0 +1,117 @@
+{
+  "schema": "synthetic-container-qualification.v1",
+  "date": "2026-11-16",
+  "result": "7 passed in 104.05 seconds",
+  "command": "MLFLOW_IMPORT_CONTAINER_QUALIFICATION=1 MLFLOW_DISABLE_AGENT_HINT=1 .venv/bin/pytest tests/integration/test_container_trace_qualification.py -x -s --tb=short",
+  "environment": {
+    "engine": "Podman 6.0.2 via docker CLI, linux/arm64",
+    "mlflow_client": "3.17.2",
+    "mlflow_server": "3.17.2",
+    "postgres_image": "docker.io/library/postgres:16-alpine",
+    "ephemeral_driver": "psycopg2-binary==2.9.11",
+    "http_workers": 1,
+    "server_memory_limit_bytes": 8589934592,
+    "database_memory_limit_bytes": 1073741824,
+    "host_port_binding": "127.0.0.1, engine-allocated port",
+    "storage": "uniquely named disposable volumes; private temporary build/artifact staging directory"
+  },
+  "provisional_profile": {
+    "serialized_span_bound_bytes": 67108864,
+    "total_spans_including_root": 4096,
+    "capacity_reduction_indicated_by_this_run": false
+  },
+  "accepted": [
+    {
+      "shape": "measured_2105_children",
+      "total_spans": 2106,
+      "serialized_span_bound_bytes": 15207039,
+      "otlp_request_body_bytes": 704742,
+      "full_response_body_bytes": 1713161,
+      "elapsed_seconds": 7.648,
+      "client_sample_peak_rss_bytes": 222855168,
+      "server_sample_peak_sum_rss_bytes": 2427166720,
+      "database_sample_peak_sum_rss_bytes": 170618880
+    },
+    {
+      "shape": "few_large",
+      "total_spans": 9,
+      "serialized_span_bound_bytes": 67014958,
+      "otlp_request_body_bytes": 66849707,
+      "full_response_body_bytes": 66856203,
+      "elapsed_seconds": 27.627,
+      "client_sample_peak_rss_bytes": 1570521088,
+      "server_sample_peak_sum_rss_bytes": 3704164352,
+      "database_sample_peak_sum_rss_bytes": 206798848
+    },
+    {
+      "shape": "many_small",
+      "total_spans": 4096,
+      "serialized_span_bound_bytes": 31511528,
+      "otlp_request_body_bytes": 1387120,
+      "full_response_body_bytes": 3664224,
+      "elapsed_seconds": 13.917,
+      "client_sample_peak_rss_bytes": 1246445568,
+      "server_sample_peak_sum_rss_bytes": 2611818496,
+      "database_sample_peak_sum_rss_bytes": 208961536
+    },
+    {
+      "shape": "combined_near_bound",
+      "total_spans": 4096,
+      "serialized_span_bound_bytes": 66920993,
+      "otlp_request_body_bytes": 36772017,
+      "full_response_body_bytes": 39024549,
+      "elapsed_seconds": 27.960,
+      "client_sample_peak_rss_bytes": 1093238784,
+      "server_sample_peak_sum_rss_bytes": 3015544832,
+      "database_sample_peak_sum_rss_bytes": 205123584
+    },
+    {
+      "shape": "redacted_strict_types",
+      "total_spans": 9,
+      "serialized_span_bound_bytes": 86573,
+      "otlp_request_body_bytes": 4550,
+      "full_response_body_bytes": 13897,
+      "elapsed_seconds": 1.835,
+      "client_sample_peak_rss_bytes": 1078951936,
+      "server_sample_peak_sum_rss_bytes": 2598903808,
+      "database_sample_peak_sum_rss_bytes": 205123584
+    }
+  ],
+  "rejected": [
+    {"shape": "4097_total_spans", "transport_calls_after_setup": 0},
+    {"shape": "10_children_with_7_MiB_inputs", "transport_calls_after_setup": 0}
+  ],
+  "whole_run_high_water_marks": {
+    "client_process_lifetime_peak_rss_bytes": 1571864576,
+    "server_kernel_cgroup_peak_bytes": 3170648064,
+    "database_kernel_cgroup_peak_bytes": 338739200,
+    "oom_events": 0,
+    "oom_kills": 0,
+    "container_restarts": 0
+  },
+  "checks_per_accepted_case": {
+    "otlp_posts": 1,
+    "full_payload_responses": 8,
+    "gateway_creation_and_verification": true,
+    "independent_nested_JSON_type_value_and_parent_checks": true,
+    "reused_candidate_payload_verification": true,
+    "immutable_artifact_publication_and_checksums": true,
+    "fresh_gateway_replacement_reference_verification": true,
+    "pricing_donor_and_basis_reads": true,
+    "tampered_payload_digest_rejection": true
+  },
+  "measurement_notes": [
+    "OTLP bytes are the actual prepared HTTP request body; full-read bytes are the complete HTTP response body, with identity content encoding asserted.",
+    "Kernel cgroup peaks are cumulative for the module-scoped containers. RSS samples sum processes and can double-count shared pages; they are not cgroup working-set measurements.",
+    "The client's process lifetime RSS high-water includes preceding cases. Per-case client RSS is sampled.",
+    "All payloads are generated synthetic public gateway DTOs. The 2105-child shape is 105 fixed activity children plus 1000 model/tool pairs carrying compact deltas; its 100-to-1000-call bound growth is checked against an 11x ceiling.",
+    "The real deterministic redactor masks synthetic credentials before the redacted case is admitted and sent. Nested scalar types and marker absence are checked after full retrieval.",
+    "Owned containers, named volumes, network, derived image tag, and temporary directory were removed by the fixture's finally path. Base dependency images are retained."
+  ],
+  "not_qualified": [
+    "Real mapper/projector conversation-delta semantics or performance: requests in this task are hand-built.",
+    "Normal import or CLI orchestration, including full attempt-journal crash recovery.",
+    "Server or database restart/failure injection: recovery here means fresh-gateway verification of persisted replacement references.",
+    "User cluster, user tracking target, real source data, concurrent request load, or long-duration soak behavior."
+  ]
+}

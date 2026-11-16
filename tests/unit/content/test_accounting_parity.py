@@ -146,12 +146,19 @@ def test_native_metadata_is_historical_and_included_in_immutable_hash():
     assert empty["items"]["usage"]["status"] == "unavailable"
 
 
-@pytest.mark.parametrize("field,size,accepted", [
-    ("session", 250, True), ("session", 251, False),
-    ("parent", 250, True), ("parent", 251, False),
-    ("git", 4096, True), ("git", 4097, False),
-    ("request", 50, True), ("request", 51, False),
-])
+@pytest.mark.parametrize(
+    "field,size,accepted",
+    [
+        ("session", 250, True),
+        ("session", 251, False),
+        ("parent", 250, True),
+        ("parent", 251, False),
+        ("git", 4096, True),
+        ("git", 4097, False),
+        ("request", 50, True),
+        ("request", 51, False),
+    ],
+)
 def test_historical_fact_limits_follow_the_actual_destination(field, size, accepted):
     from mlflow_import.errors import SourceCompatibilityError
 

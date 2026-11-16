@@ -61,10 +61,13 @@ def test_live_child_failure_ends_and_rolls_back_known_partial_trace(live_server,
             # including its SDK metadata behavior, rather than historical ingestion.
             from mlflow_import.compatibility import request_ownership
 
-            return super().create_trace(replace(
-                request, historical=False,
-                metadata={key: value for key, value in request_ownership(request).items() if len(value) <= 250},
-            ))
+            return super().create_trace(
+                replace(
+                    request,
+                    historical=False,
+                    metadata={key: value for key, value in request_ownership(request).items() if len(value) <= 250},
+                )
+            )
 
         def retire_trace(self, experiment_id, trace_id, **kwargs):
             trace = live_server.client.get_trace(trace_id, display=False, flush=True)

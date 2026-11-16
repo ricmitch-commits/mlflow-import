@@ -14,6 +14,7 @@ source preflight boundary.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ OUTPUT_CHOICES = ("human", "json")
 LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 DEFAULT_OUTPUT = "human"
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_TIMEOUT_SECONDS = 600.0
 
 _TIMESTAMP_MESSAGE = "value must be an ISO-8601 timestamp with an explicit timezone offset or Z"
 _THRESHOLD_MESSAGE = "--min-user-turns must be a non-negative integer"
@@ -64,6 +66,10 @@ class ImportConfig:
     dry_run: bool = False
     output: str = DEFAULT_OUTPUT
     log_level: str = DEFAULT_LOG_LEVEL
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "timeout_seconds", _validate_timeout_seconds(self.timeout_seconds))
 
     @property
     def harness(self) -> str | None:
@@ -159,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate, filter, and plan without mutating anything in MLflow",
     )
     import_command.add_argument(
+        "--timeout-seconds",
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="finite positive invocation wall-clock budget in seconds (default: 600)",
+    )
+    import_command.add_argument(
         "--output",
         choices=OUTPUT_CHOICES,
         default=DEFAULT_OUTPUT,
@@ -198,9 +209,30 @@ def parse_config(argv: Sequence[str]) -> ImportConfig:
     return config_from_arguments(parse_arguments(argv))
 
 
+def invocation_timeout_seconds(arguments: argparse.Namespace) -> float:
+    """Validate the invocation deadline before source discovery or resource scopes.
+
+    Keep raw option conversion outside argparse so failures never echo input.
+    Namespaces from older callers that omit the option retain the default.
+    """
+    return _validate_timeout_seconds(getattr(arguments, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+
+
+def _validate_timeout_seconds(value: str | float) -> float:
+    """Normalize the shared CLI and public configuration timeout boundary."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ConfigurationError("invalid_timeout", "--timeout-seconds must be a finite positive number") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ConfigurationError("invalid_timeout", "--timeout-seconds must be a finite positive number")
+    return timeout
+
+
 def config_from_arguments(args: argparse.Namespace) -> ImportConfig:
     """Validate already-parsed arguments under the caller's resource scope."""
 
+    timeout_seconds = invocation_timeout_seconds(args)
     experiment_name = args.experiment_name
     if not experiment_name.strip():
         raise ConfigurationError("invalid_experiment_name", "--experiment-name must be a non-empty name")
@@ -254,6 +286,7 @@ def config_from_arguments(args: argparse.Namespace) -> ImportConfig:
         dry_run=args.dry_run,
         output=args.output,
         log_level=args.log_level,
+        timeout_seconds=timeout_seconds,
     )
     object.__setattr__(config, "_from_time_ns", _bound_nanoseconds(config.from_time, args.from_time))
     object.__setattr__(config, "_to_time_ns", _bound_nanoseconds(config.to_time, args.to_time))

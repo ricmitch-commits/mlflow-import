@@ -21,11 +21,24 @@ from argparse import Namespace
 from collections.abc import Sequence
 
 from mlflow_import import resources
-from mlflow_import.config import PROG, build_parser, config_from_arguments, parse_arguments
-from mlflow_import.errors import ImporterError
-from mlflow_import.importer import ImportDependencies, build_dependencies, exit_status, run_import
+from mlflow_import.config import (
+    PROG,
+    build_parser,
+    config_from_arguments,
+    invocation_timeout_seconds,
+    parse_arguments,
+)
+from mlflow_import.errors import ImporterError, ItemImportError
+from mlflow_import.importer import (
+    ImportDependencies,
+    ImportResult,
+    _storage_failure_result,
+    build_dependencies,
+    exit_status,
+    run_import,
+)
 from mlflow_import.reporting import iter_human, iter_json
-from mlflow_import.retry import retry_budget
+from mlflow_import.retry import _BUDGET, check_budget, retry_budget, terminal_reporting
 
 __all__ = ["PROG", "build_parser", "main"]
 
@@ -51,7 +64,8 @@ def main(argv: Sequence[str] | None = None, dependencies: ImportDependencies | N
         return error.code if isinstance(error.code, int) else 2
     status = 2
     try:
-        with resources.temporary_storage(), retry_budget():
+        timeout = invocation_timeout_seconds(arguments)
+        with resources.temporary_storage(), retry_budget(deadline_seconds=timeout):
             status = _main(arguments, dependencies)
         return status
     except ImporterError as error:
@@ -73,19 +87,39 @@ def _main(arguments: Namespace, dependencies: ImportDependencies | None) -> int:
     try:
         result = run_import(config, effective_dependencies)
     except ImporterError as error:
-        return _report_failure(error)
+        if error.code not in {"retry_budget_exhausted", "operation_budget_exhausted"}:
+            return _report_failure(error)
+        result = _storage_failure_result(config, error, resources.current_storage())
     if started is not None:
         elapsed = time.perf_counter() - started
         _write_debug(f"mlflow-import: import pipeline complete elapsed_s={elapsed:.3f}")
     status = exit_status(result)
     try:
-        if config.output == "human":
-            for line in iter_human(result):
-                print(line)
-        else:
-            for chunk in iter_json(result):
-                sys.stdout.write(chunk)
-            sys.stdout.write("\n")
+        try:
+            # Check the work-to-output handoff once; lazy output has its own
+            # finite local allowance and cannot renew invocation network retries.
+            if budget := _BUDGET.get():
+                budget.check()
+            output = _stage_output(result, config.output)
+        except (ImporterError, OSError, RuntimeError, sqlite3.Error) as failure:
+            primary = result.error
+            if primary is None and (budget := _BUDGET.get()) is not None:
+                primary = budget.primary_error
+            if primary is None:
+                primary = (
+                    failure
+                    if isinstance(failure, ImporterError)
+                    else ItemImportError("result_render_failed", "the result could not be rendered")
+                )
+            emergency = _storage_failure_result(config, primary, resources.current_storage())
+            # Fixed-size in-memory envelope needs neither SQLite nor file I/O,
+            # including when the staging store itself exhausted its quota.
+            output = "".join(iter_json(emergency)) if config.output == "json" else "\n".join(iter_human(emergency))
+            output += "\n"
+            status = exit_status(emergency)
+        # Publish only a fully rendered document. Never append a replacement
+        # after a lazy encoder has already written a partial JSON document.
+        sys.stdout.write(output)
     finally:
         try:
             result.close()
@@ -95,6 +129,35 @@ def _main(arguments: Namespace, dependencies: ImportDependencies | None) -> int:
             )
             status = max(status, 1)
     return status
+
+
+def _stage_output(result: ImportResult, output_format: str) -> str:
+    """Stage quota-accounted output with finite time/work/byte allowances.
+
+    The final string is capped at 8 MiB, independent of source size. Larger or
+    slower reports fall back to the constant-size incomplete envelope before
+    stdout is touched. No decoded source records are retained here.
+    """
+    with terminal_reporting():
+        handle, path = resources.open_temp_file(prefix="mlflow-import-output-", mode="w+", encoding="utf-8")
+        try:
+            with handle:
+                chunks = iter_json(result) if output_format == "json" else (line + "\n" for line in iter_human(result))
+                size = 0
+                for chunk in chunks:
+                    check_budget()
+                    size += len(chunk.encode("utf-8"))
+                    if size > 8 * 1024 * 1024 - 1:
+                        raise ItemImportError("result_output_exhausted", "the terminal output allowance was exhausted")
+                    handle.write(chunk)
+                if output_format == "json":
+                    handle.write("\n")
+                handle.seek(0)
+                output = str(handle.read())
+                check_budget()
+                return output
+        finally:
+            resources.remove_file(path)
 
 
 def _report_failure(error: ImporterError) -> int:

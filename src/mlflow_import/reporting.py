@@ -485,6 +485,13 @@ def iter_human(result: ImportResult) -> Iterator[str]:
     source = _section(report, "source")
     redaction = _section(report, "redaction")
     summary = _section(report, "summary")
+    if summary.get("counts_complete") is False:
+        yield "mlflow-import import failed"
+        yield "report: incomplete; counts unavailable"
+        yield "recovery: pending" if summary.get("recovery_pending") else "recovery: no target mutation recorded"
+        for error in _event_entries(report, "errors"):
+            yield f"error ({error.get('code')}): {error.get('message')}"
+        return
     has_errors = result.error is not None or next(_event_entries(report, "errors"), None) is not None
     if has_errors:
         yield "mlflow-import import failed"

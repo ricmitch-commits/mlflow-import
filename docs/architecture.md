@@ -168,8 +168,10 @@ Initial creation tags hold immutable ownership, source/user/Git facts, versions 
 `mapping-v8` separates native analytics from canonical `accounting-v2`. OpenCode
 roots are `opencode_conversation`, with `opencode` native trace name, source-only client
 request identity, plugin text previews, semantic message timing, input/output plus
-reasoning native total, and NULL native cache/cost fields. Raw explicit totals,
-cache and persisted costs remain in spans/artifacts. Other harnesses preserve
+reasoning native total, available native cache counters, and available persisted
+USD costs. Raw explicit totals, cache and persisted costs remain in spans/artifacts;
+unavailable cache lifetimes and cost breakdowns stay NULL rather than estimated.
+Other harnesses preserve
 their native accounting. Explicit nullable analytics in public `TraceInfo` prevent
 the server from restoring span-derived cache/cost columns. Versioned replacement
 references protect normalized immutable ownership plus native session/parent and

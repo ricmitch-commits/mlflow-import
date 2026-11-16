@@ -90,7 +90,7 @@ def test_probe_never_creates_probe_experiments_or_traces(fake_mlflow_client: Fak
     probe_capabilities(fake_mlflow_client, _compatible_request(), dry_run=True)
 
     called = {call[0] for call in fake_mlflow_client.calls}
-    assert called <= {"get_experiment_by_name", "get_trace"}
+    assert called <= {"get_experiment_by_name", "get_trace_info"}
 
 
 def test_normal_write_always_requires_retirement(fake_mlflow_client: FakeMlflowClient) -> None:
@@ -181,7 +181,7 @@ def test_unknown_trace_must_raise_a_protocol_error(fake_mlflow_client: FakeMlflo
     def no_error(trace_id: str, display: bool = True, flush: bool = False) -> object:
         return object()
 
-    fake_mlflow_client.get_trace = no_error  # type: ignore[method-assign]
+    fake_mlflow_client.get_trace_info = no_error  # type: ignore[method-assign]
 
     report = probe_capabilities(fake_mlflow_client, _compatible_request(), dry_run=True)
 
@@ -194,7 +194,7 @@ def test_transport_error_on_trace_read_fails_the_probe(fake_mlflow_client: FakeM
     def transport_error(trace_id: str, display: bool = True, flush: bool = False) -> object:
         raise RuntimeError("socket hang up")
 
-    fake_mlflow_client.get_trace = transport_error  # type: ignore[method-assign]
+    fake_mlflow_client.get_trace_info = transport_error  # type: ignore[method-assign]
 
     report = probe_capabilities(fake_mlflow_client, _compatible_request(), dry_run=True)
 

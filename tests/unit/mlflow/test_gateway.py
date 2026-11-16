@@ -490,14 +490,13 @@ def test_create_trace_sets_native_session_metadata(fake_mlflow_client: FakeMlflo
     assert trace.info.trace_metadata[TRACE_SESSION_METADATA_KEY] == "ses-native-42"
 
 
-def test_create_trace_consumes_children_one_at_a_time(fake_mlflow_client: FakeMlflowClient) -> None:
+def test_create_trace_consumes_producer_once_before_any_span_mutation(fake_mlflow_client: FakeMlflowClient) -> None:
     gateway = _checked_gateway(fake_mlflow_client)
     ended_before_next_fetch: list[bool] = []
 
     def lazy_children() -> Iterator[TraceChildRequest]:
         for index in range(3):
-            # Every previously yielded child must already be ended before the
-            # next one is fetched: the gateway never buffers the child list.
+            # Resource admission consumes the producer before any root starts.
             ended = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "end_span"]
             started = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "start_span_no_context"]
             ended_before_next_fetch.append(not started or len(ended) == len(started) - 1)
@@ -508,8 +507,9 @@ def test_create_trace_consumes_children_one_at_a_time(fake_mlflow_client: FakeMl
     created = gateway.create_trace(spec)
 
     assert created.span_ids_by_source.keys() == {"child-0", "child-1", "child-2"}
-    # One read-only timing preflight pass, then one streamed create pass.
-    assert ended_before_next_fetch == [True] * 6
+    # The admitted bounded DTOs are reused for timing and creation. A changing
+    # child factory cannot supply an unchecked payload on a second pass.
+    assert ended_before_next_fetch == [True] * 3
     # Root is ended last, after every child.
     end_calls = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "end_span"]
     assert end_calls[-1][1]["span_id"] == created.root_span_id
@@ -1373,21 +1373,23 @@ def test_fake_gateway_keeps_payload_state_for_bdd_assertions() -> None:
 
     with pytest.raises(ItemImportError):
         fake.verify_trace(created, trace_spec(root_outputs={"answer": 43}))
-@pytest.mark.parametrize("field,value", [
-    ("client_request_id", "fabricated"),
-    ("request_preview", "wrong preview"),
-    ("response_preview", None),
-    ("cost", {"total_cost": 0.0}),
-    ("trace_name", "unexpected"),
-    ("native_session", "wrong-session"),
-    ("parent_session", "unexpected-parent"),
-    ("arbitrary_metadata", "unexpected"),
-    ("token_usage", {"input_tokens": 120, "output_tokens": 80, "total_tokens": 212,
-                     "cache_read_input_tokens": 40}),
-])
-def test_historical_native_verification_checks_values_and_nulls(
-    fake_mlflow_client, six_turn_session, field, value
-):
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("client_request_id", "fabricated"),
+        ("request_preview", "wrong preview"),
+        ("response_preview", None),
+        ("cost", {"total_cost": 0.0}),
+        ("trace_name", "unexpected"),
+        ("native_session", "wrong-session"),
+        ("parent_session", "unexpected-parent"),
+        ("arbitrary_metadata", "unexpected"),
+        ("token_usage", {"input_tokens": 120, "output_tokens": 80, "total_tokens": 212, "cache_read_input_tokens": 40}),
+    ],
+)
+def test_historical_native_verification_checks_values_and_nulls(fake_mlflow_client, six_turn_session, field, value):
     from mlflow_import.mlflow.mapping import map_turn_to_trace
 
     gateway = _checked_gateway(fake_mlflow_client)
@@ -1414,10 +1416,14 @@ def test_ownership_search_unions_nonempty_legacy_and_tag_pages(fake_mlflow_clien
     gateway = _checked_gateway(fake_mlflow_client, search_page_size=1)
     experiment = fake_mlflow_client.add_experiment("mixed-ownership")
     legacy = gateway.create_trace(trace_spec(experiment_id=experiment.experiment_id))
-    tagged = gateway.create_trace(trace_spec(
-        experiment_id=experiment.experiment_id, owned=False,
-        root_tags={"mlflow_import.importer": "mlflow-import"},
-    ))
+    tagged = gateway.create_trace(
+        trace_spec(
+            experiment_id=experiment.experiment_id,
+            owned=False,
+            root_tags={"mlflow_import.importer": "mlflow-import"},
+        )
+    )
     assert {item.trace_id for item in gateway.iter_owned_traces(experiment.experiment_id)} == {
-        legacy.trace_id, tagged.trace_id,
+        legacy.trace_id,
+        tagged.trace_id,
     }
