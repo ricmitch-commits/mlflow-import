@@ -69,10 +69,11 @@ __all__ = [
 #: plan's unpublished ``3.17.2.dev0``; see the controller ruling of 2026-10-21).
 PINNED_MLFLOW_VERSION = "3.17.2"
 
-#: Largest inline payload (bytes) the profile verifies to round-trip byte-exact
-#: through span inputs/outputs. Larger session payloads must be written as
-#: named trace artifacts instead of inline span data.
-MAX_INLINE_PAYLOAD_BYTES = 4_194_304
+#: Per-value canonical-byte envelope, also qualified through historical root/
+#: child inputs, outputs, and attributes by test_inline_payload_profile.py.
+#: Complete oversized roots/structured activities fail instead of substituting
+#: artifacts. Named-artifact and aggregate request limits remain separate.
+MAX_INLINE_PAYLOAD_BYTES = 8_388_608
 
 #: Fixed read block (bytes) used when hashing, staging, and re-reading artifact
 #: payloads so no whole file is ever held in memory.
@@ -146,6 +147,7 @@ INITIAL_API_TABLE: Mapping[str, str] = {
         " end_time_ns: int | None = None) -> None"
     ),
     "get_trace": ("MlflowClient.get_trace(trace_id: str, display: bool = True, flush: bool = False) -> Trace"),
+    "get_trace_info": "TracingClient.get_trace_info(trace_id: str) -> TraceInfo (metadata only)",
     "search_traces": (
         "MlflowClient.search_traces(experiment_ids: list[str] | None = None, filter_string: str | None ="
         " None, max_results: int = 100, order_by=None, page_token: str | None = None, run_id=None,"

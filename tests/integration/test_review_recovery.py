@@ -6,9 +6,9 @@ from dataclasses import replace
 import mlflow
 import pytest
 
-from mlflow_import.compatibility import identity_projection
+from mlflow_import.compatibility import decode_ownership, identity_projection, importer_marker
 from mlflow_import.config import ImportConfig
-from mlflow_import.errors import ItemImportError
+from mlflow_import.errors import ConfigurationError, ItemImportError
 from mlflow_import.importer import build_dependencies, exit_status, run_import
 from mlflow_import.mlflow.attempts import AttemptJournal
 from tests.integration.server import unique_experiment_name
@@ -125,17 +125,25 @@ def test_changed_to_zero_recovers_before_policy_shortcut(live_server, tmp_path, 
 
 @pytest.mark.parametrize("marker_location", ["metadata", "tags"])
 @pytest.mark.parametrize("contradiction", [False, True])
-def test_historical_marker_migrates_with_full_identity_qualification(
-    live_server, tmp_path, marker_location, contradiction
+def test_historical_marker_is_recognized_but_unqualified_migration_is_blocked(
+    live_server, tmp_path, monkeypatch, marker_location, contradiction
 ):
+    import hashlib
     import json
+    from functools import wraps
     from pathlib import Path
+    from urllib.parse import unquote, urlsplit
 
+    from mlflow import MlflowClient
     from mlflow.tracing.client import TracingClient
 
     from mlflow_import.mlflow.capabilities import CapabilityRequest
+    from mlflow_import.mlflow.gateway import MlflowGateway
+    from mlflow_import.mlflow.reconciliation import OwnedTraceCandidate
+    from mlflow_import.mlflow.trace_envelope import PROOF_TAG_KEYS
     from tests.support.import_fakes import build_current_source_db
 
+    assert live_server.process is not None, "legacy migration regression requires an owned disposable server"
     fixture = json.loads((Path(__file__).parents[1] / "fixtures/payloads/historical-36ed44f.json").read_text())
     metadata = fixture["trace"]["metadata"]
     native = metadata["opencode.session_id"]
@@ -152,7 +160,8 @@ def test_historical_marker_migrates_with_full_identity_qualification(
     experiment = live_server.client.create_experiment(config.experiment_name)
     span = mlflow.start_span_no_context(name="historical-synthetic", experiment_id=experiment)
     span.end()
-    info = live_server.client.get_trace(span.trace_id, display=False).info
+    tracing = TracingClient(tracking_uri=live_server.uri)
+    info = tracing.get_trace_info(span.trace_id)
     artifact_path = (
         f"opencode-mlflow/v1/sessions/{native}/turns/{metadata['opencode.turn_key']}/{'b' * 64}-{'d' * 64}.json"
     )
@@ -161,21 +170,78 @@ def test_historical_marker_migrates_with_full_identity_qualification(
         tags["opencode.importer"] = metadata.pop("opencode.importer")
     if contradiction:
         tags["opencode.session_id"] = "contradictory-session"
-    TracingClient(tracking_uri=live_server.uri).start_trace(replace(info, trace_metadata=metadata, tags=tags))
+    tracing.start_trace(replace(info, trace_metadata=metadata, tags=tags))
     local = tmp_path / "historical-artifact.json"
     local.write_text(json.dumps(fixture["artifact"]))
     gateway = dependencies.gateway_factory(False)
     gateway.probe(CapabilityRequest(needs_retirement=True, needs_named_artifacts=True), dry_run=False)
     verification = gateway.upload_named_json(span.trace_id, artifact_path, local)
     gateway.record_artifact_verification(span.trace_id, verification.sha256, verification.size)
-    result = run_import(config, dependencies)
+    before = tracing.get_trace_info(span.trace_id)
+    assert PROOF_TAG_KEYS.isdisjoint(before.tags), "the historical fixture must remain genuinely unqualified"
+    assert importer_marker(before.tags, before.trace_metadata) == "mlflow-import"
     if contradiction:
-        assert exit_status(result) != 0
-        assert live_server.client.get_trace(span.trace_id, display=False).trace_id == span.trace_id
-        assert result.report["summary"]["retired_traces"] == 0
-        return
-    assert exit_status(result) == 0, result.report
+        with pytest.raises(ConfigurationError) as conflict:
+            decode_ownership(before.tags, before.trace_metadata)
+        assert conflict.value.code == "ownership_conflict"
+    else:
+        ownership = decode_ownership(before.tags, before.trace_metadata)
+        assert ownership["mlflow_import.importer"] == "mlflow-import"
+        assert ownership["mlflow_import.original_importer"] == "opencode-mlflow"
+        assert ownership["mlflow_import.session_id"] == native
+        assert ownership["opencode.mapping_version"] == "mapping-v4"
+        owned = next(item for item in gateway.iter_owned_traces(experiment) if item.trace_id == span.trace_id)
+        assert OwnedTraceCandidate.from_owned_trace(owned, experiment).ownership_complete
+
+    artifact_uri = urlsplit(live_server.client.get_experiment(experiment).artifact_location)
+    assert artifact_uri.scheme == "file"
+    artifact_root = Path(unquote(artifact_uri.path))
+
+    def artifact_snapshot():
+        return {
+            str(path.relative_to(artifact_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in artifact_root.rglob("*") if path.is_file()
+        }
+
+    artifacts_before = artifact_snapshot()
+    assert artifacts_before, "the legacy artifact must exist before the blocked import"
+    forbidden_calls = []
+
+    def forbid(name, original):
+        @wraps(original)
+        def forbidden(*args, **kwargs):
+            forbidden_calls.append(name)
+            raise AssertionError("unqualified historical migration reached " + name)
+        return forbidden
+
+    with monkeypatch.context() as patch:
+        # Recognition uses only metadata. Neither contradictory ownership nor
+        # absent resource proof authorizes speculative payload reads, restamping,
+        # automatic replacement, or journal/artifact/retirement mutation.
+        for owner in (MlflowClient, TracingClient):
+            patch.setattr(owner, "get_trace", forbid(owner.__name__ + ".get_trace", owner.get_trace))
+        for name in ("create_experiment", "set_trace_tag", "delete_trace_tag", "delete_traces"):
+            patch.setattr(MlflowClient, name, forbid("MlflowClient." + name, getattr(MlflowClient, name)))
+        for name in ("start_trace", "log_spans"):
+            patch.setattr(TracingClient, name, forbid("TracingClient." + name, getattr(TracingClient, name)))
+        for name in (
+            "create_trace", "upload_named_json", "publish_experiment_file", "record_artifact_verification",
+            "reconcile_tags", "retire_trace", "retire_conflict",
+        ):
+            patch.setattr(MlflowGateway, name, forbid("MlflowGateway." + name, getattr(MlflowGateway, name)))
+        patch.setattr(AttemptJournal, "publish", forbid("AttemptJournal.publish", AttemptJournal.publish))
+        result = run_import(config, dependencies)
+
+    assert exit_status(result) == (2 if contradiction else 1), result.report
+    assert result.error is not None
+    assert result.error.code == ("identity_conflict" if contradiction else "trace_resource_profile_unverified")
+    assert forbidden_calls == []
+    assert result.report["summary"]["retired_traces"] == 0
+    assert result.report["summary"]["turns_imported"] == 0
+    assert result.report["summary"]["turns_updated"] == 0
+    after = tracing.get_trace_info(span.trace_id)
+    assert after.to_dict() == before.to_dict()
+    assert PROOF_TAG_KEYS.isdisjoint(after.tags)
+    assert artifact_snapshot() == artifacts_before
     traces = live_server.client.search_traces(locations=[experiment], include_spans=False)
-    assert len(traces) == 1 and traces[0].trace_id != span.trace_id
-    assert traces[0].info.tags["mlflow_import.importer"] == "mlflow-import"
-    assert result.report["summary"]["retired_traces"] == 1
+    assert [trace.trace_id for trace in traces] == [span.trace_id]

@@ -78,7 +78,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, SimpleNamespace
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 import mlflow
 from mlflow import MlflowClient
@@ -91,9 +91,17 @@ from mlflow_import.mlflow.capabilities import (
     CapabilityReport,
     CapabilityRequest,
     VersionTransport,
+    get_trace_info_metadata,
     probe_capabilities,
 )
-from mlflow_import.retry import check_budget
+from mlflow_import.mlflow.trace_envelope import (
+    PROOF_TAG_KEYS,
+    admit_trace,
+    assert_returned_trace,
+    require_trace_proof,
+    validate_control_metadata,
+)
+from mlflow_import.retry import RetryPolicy, check_budget, is_transient_error, retry_budget, retry_call
 from mlflow_import.storage import DiskList, DiskMap
 
 if TYPE_CHECKING:
@@ -368,9 +376,10 @@ class _ExpectedChildContract:
 class TraceCreateRequest:
     """One complete trace to create: the root span plus lazy child specs.
 
-    ``child_specs`` returns a fresh lazy iterator of child requests; the
-    gateway consumes it one child at a time and never collects the full
-    child list. ``metadata`` and ``root_tags`` are supplied at root-span
+    ``child_specs`` produces child requests; admission consumes it once and
+    retains detached DTOs only within the aggregate byte/count envelope.
+    Creation uses that accepted snapshot, never a second producer pass.
+    ``metadata`` and ``root_tags`` are supplied at root-span
     creation (with the native session metadata key added from
     ``native_session_id``), so all ownership/operation fields survive a
     process crash before trace completion. The artifact fields record the
@@ -469,6 +478,36 @@ class ArtifactVerification:
     sha256: str
     size: int
     snapshot_fingerprint: str | None = None
+
+
+def _native_historical_preview(value: str | None) -> str:
+    """Represent source absence explicitly so MLflow cannot autofill from spans.
+
+    Sending None again at finalization cannot clear a generated preview in
+    3.17.2. Keep the source request unchanged and compare the physical value
+    strictly against this same transport projection during candidate reuse.
+    """
+    return "" if value is None else value
+
+
+def _encode_historical_attribute(value: object) -> str:
+    """Preserve source strings through the pinned 3.17.2 OTLP sanitizer.
+
+    The server's sanitize_attributes strips one JSON layer when a decoded
+    string itself parses as str/dict/list. Compensate for exactly that rule
+    at the transport boundary; nested strings and scalar-looking strings
+    must retain their ordinary encoding.
+    """
+    encoded = json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, (str, dict, list)):
+                return json.dumps(encoded, ensure_ascii=False)
+    return encoded
 
 
 def validate_source_timing(spec: TraceCreateRequest) -> None:
@@ -570,6 +609,46 @@ def _span_status_value(status: object) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_ReadResult = TypeVar("_ReadResult")
+
+
+def _retry_read(operation: Callable[[], _ReadResult], policy: RetryPolicy) -> _ReadResult:
+    """Retry one idempotent read, sharing the invocation's allowance/deadline.
+
+    Exhaustion is permanent to outer retry loops: retrying a verification or
+    upload wrapper must not multiply this boundary's attempt allowance. Raw
+    permanent SDK errors retain their existing absence/authorization semantics.
+    """
+    with retry_budget():
+        try:
+            return retry_call(operation, policy)
+        except Exception as error:
+            if not is_transient_error(error):
+                raise
+            raise ItemImportError("read_retry_exhausted", "the target read exhausted its retry allowance") from error
+
+
+class _ReadRetryRepository:
+    """Retry only SDK artifact reads; all other repository operations delegate.
+
+    Bounded HTTP transfers in resources already retry individual reads/pages
+    and use the same shared budget, so those paths need no additional wrapper.
+    """
+
+    def __init__(self, repository: Any, policy: RetryPolicy) -> None:
+        self._repository = repository
+        self._policy = policy
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    def list_artifacts(self, *args: Any, **kwargs: Any) -> Any:
+        return _retry_read(lambda: self._repository.list_artifacts(*args, **kwargs), self._policy)
+
+    def download_artifacts(self, *args: Any, **kwargs: Any) -> Any:
+        return _retry_read(lambda: self._repository.download_artifacts(*args, **kwargs), self._policy)
+
+
 def _safe_relative_path(relative_path: str) -> PurePosixPath:
     """Validate a caller-chosen artifact relative path (no absolute, no traversal)."""
     rel = PurePosixPath(relative_path)
@@ -600,8 +679,10 @@ class TraceArtifactSink:
         self,
         client: MlflowClient,
         repository_factory: Callable[..., Any] | None = None,
+        read_retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._client = client
+        self._read_retry_policy = read_retry_policy if read_retry_policy is not None else RetryPolicy()
         self._repository_factory: Callable[..., Any] = (
             repository_factory if repository_factory is not None else get_artifact_repository
         )
@@ -668,14 +749,22 @@ class TraceArtifactSink:
 
     def _trace_artifact_repository(self, trace_id: str) -> Any:
         """Resolve the trace's public artifact repository from its location tag."""
-        trace = self._client.get_trace(trace_id, display=False)
-        uri = trace.info.tags.get(TRACE_ARTIFACT_LOCATION_TAG)
+        info = _retry_read(lambda: get_trace_info_metadata(self._client, trace_id), self._read_retry_policy)
+        if info.trace_id != trace_id:
+            raise ItemImportError("trace_metadata_identity_mismatch", "the metadata response has a different trace id")
+        uri = info.tags.get(TRACE_ARTIFACT_LOCATION_TAG)
         if not uri:
             raise ItemImportError(
                 "artifact_location_missing",
                 "the trace carries no artifact location tag, so named artifacts cannot be stored for it",
             )
-        return self._repository_factory(uri, tracking_uri=self._client.tracking_uri)
+        return self._repository(uri)
+
+    def _repository(self, uri: str) -> Any:
+        repository = _retry_read(
+            lambda: self._repository_factory(uri, tracking_uri=self._client.tracking_uri), self._read_retry_policy
+        )
+        return _ReadRetryRepository(repository, self._read_retry_policy)
 
 
 def _retirement_metadata_value(
@@ -732,10 +821,12 @@ class MlflowGateway:
         dry_run: bool = False,
         search_page_size: int = 100,
         version_transport: VersionTransport | None = None,
+        read_retry_policy: RetryPolicy | None = None,
     ) -> None:
         self._client = client
+        self._read_retry_policy = read_retry_policy if read_retry_policy is not None else RetryPolicy()
         self._trace_api = trace_api if trace_api is not None else PublicTraceApi()
-        self._sink = TraceArtifactSink(client, artifact_repository_factory)
+        self._sink = TraceArtifactSink(client, artifact_repository_factory, self._read_retry_policy)
         self._dry_run = dry_run
         self._search_page_size = search_page_size
         self._version_transport = version_transport
@@ -810,7 +901,7 @@ class MlflowGateway:
         the complete global capability check; dry-run represents the
         planned creation without mutating.
         """
-        found = self._client.get_experiment_by_name(name)
+        found = self._read(lambda: self._client.get_experiment_by_name(name))
         if found is not None:
             if getattr(found, "lifecycle_stage", "active") != "active":
                 raise ConfigurationError("experiment_deleted", "the requested experiment is deleted")
@@ -833,7 +924,7 @@ class MlflowGateway:
             # creation so an unqualified default can never be inherited.
             from uuid import uuid4
 
-            default = self._client.get_experiment("0")
+            default = self._read(lambda: self._client.get_experiment("0"))
             self._validate_artifact_location(default.artifact_location)
             artifact_location = default.artifact_location.rstrip("/") + "/mlflow-import-experiments/" + uuid4().hex
             self._validate_artifact_location(artifact_location)
@@ -851,7 +942,7 @@ class MlflowGateway:
         except Exception:
             # A concurrent creation or a lost response is resolved by exact
             # name before another non-idempotent create can be considered.
-            found = self._client.get_experiment_by_name(name)
+            found = self._read(lambda: self._client.get_experiment_by_name(name))
             if found is None:
                 raise
             if getattr(found, "lifecycle_stage", "active") != "active":
@@ -866,7 +957,7 @@ class MlflowGateway:
         if resources.current_storage() is None:
             return
         resources.validate_artifact_uri(location)
-        repository = self._sink._repository_factory(location, tracking_uri=self.tracking_uri)
+        repository = self._sink._repository(location)
         resources.validate_artifact_repository(repository)
         if resources.is_remote_artifact_repository(repository):
             # Consume the bounded read-only listing now, including empty roots.
@@ -876,13 +967,13 @@ class MlflowGateway:
     # -- trace lifecycle ---------------------------------------------------------
 
     def create_trace(self, spec: TraceCreateRequest) -> CreatedTrace:
-        """Create one trace: a root span plus lazily consumed child spans.
+        """Admit and create one trace from a bounded detached request snapshot.
 
         The root is started through ``mlflow.start_span_no_context`` with
         the request's root payload, tags, and metadata (plus the native
-        session metadata key). The lazy child-spec iterator is consumed ONE
-        child at a time — the full child list and no source payload is ever
-        collected — each child's ``parent_source_key`` is resolved against
+        session metadata key). Before any root/metadata mutation, admission
+        consumes the producer once and materializes only accepted bounded
+        DTOs. Each child's ``parent_source_key`` is resolved against
         a bounded ``source_key -> LiveSpan`` parent map (one handle per
         child source key in this trace; holds only span handles; created
         per call and released on return), and every span is completed
@@ -899,6 +990,7 @@ class MlflowGateway:
         NoOp sentinel fails loudly instead of silently losing the trace.
         """
         self._require_mutation_allowed()
+        spec = admit_trace(spec).request
         validate_required_metadata(spec)
         validate_source_timing(spec)
         if spec.historical and type(self._trace_api) is PublicTraceApi:
@@ -1085,7 +1177,7 @@ class MlflowGateway:
                     "status": {
                         "code": {"ERROR": "STATUS_CODE_ERROR", "OK": "STATUS_CODE_OK"}.get(state, "STATUS_CODE_UNSET")
                     },
-                    "attributes": {key: json.dumps(value, ensure_ascii=False) for key, value in attrs.items()},
+                    "attributes": {key: _encode_historical_attribute(value) for key, value in attrs.items()},
                 }
             )
 
@@ -1135,8 +1227,8 @@ class MlflowGateway:
                     **spec.root_tags,
                     **({"mlflow.traceName": spec.trace_name} if spec.trace_name is not None else {}),
                 },
-                request_preview=spec.request_preview,
-                response_preview=spec.response_preview,
+                request_preview=_native_historical_preview(spec.request_preview),
+                response_preview=_native_historical_preview(spec.response_preview),
             )
             check_budget()
             client.start_trace(native_info)
@@ -1145,7 +1237,7 @@ class MlflowGateway:
             # The pinned server derives min/max from all spans when a trace
             # has no usage/cost observations. A source event can precede the
             # initiating user; finalize the authoritative turn timing through
-            # the same public API, preserving its generated previews.
+            # the same public API, preserving the explicit source previews.
             check_budget()
             client.start_trace(native_info)
         except Exception as error:
@@ -1177,7 +1269,7 @@ class MlflowGateway:
         trace = self._candidate_payload
         self._candidate_payload = None
         if trace is None or trace.trace_id != created.trace_id:
-            trace = self._client.get_trace(created.trace_id, display=False)
+            trace = self._get_trace(created.trace_id)
         if trace.trace_id != created.trace_id:
             raise ItemImportError(
                 "trace_verification_failed",
@@ -1317,7 +1409,10 @@ class MlflowGateway:
             info = trace.info
             if info.tags.get("mlflow.traceName") != expected.trace_name:
                 raise ItemImportError("trace_verification_failed", "the native trace name differs")
-            if info.request_preview != expected.request_preview or info.response_preview != expected.response_preview:
+            if (
+                info.request_preview != _native_historical_preview(expected.request_preview)
+                or info.response_preview != _native_historical_preview(expected.response_preview)
+            ):
                 raise ItemImportError("trace_verification_failed", "the native text previews differ")
             if info.client_request_id != expected.client_request_id:
                 raise ItemImportError("trace_verification_failed", "the native client request identity differs")
@@ -1359,7 +1454,9 @@ class MlflowGateway:
     def _iter_owned_search(self, experiment_id: str, filter_string: str | None) -> Iterator[OwnedTrace]:
         try:
             page = self._search_page(experiment_id, filter_string, page_token=None)
-        except Exception:  # noqa: BLE001 - a rejected filter falls back to local filtering
+        except Exception as error:  # noqa: BLE001 - only a rejected filter permits local fallback
+            if getattr(error, "error_code", None) not in {"INVALID_PARAMETER_VALUE", "INVALID_PARAMETER"}:
+                raise
             filter_string = None
             page = self._search_page(experiment_id, None, page_token=None)
         if filter_string is not None and len(page) == 0:
@@ -1474,15 +1571,20 @@ class MlflowGateway:
             raise ItemImportError("attempt_scope_conflict", "the retirement is outside the selected recovery instance")
         if not self.trace_exists(retirement["trace_id"]):
             return
-        trace = self._client.get_trace(retirement["trace_id"], display=False)
-        tags = trace.info.tags
+        try:
+            info = self.trace_info(retirement["trace_id"], experiment_id)
+        except AttributeError as error:
+            raise ItemImportError(
+                "attempt_scope_conflict", "the retirement metadata could not be independently resolved"
+            ) from error
+        tags = info.tags
         from mlflow_import.compatibility import decode_ownership
 
-        metadata = decode_ownership(tags, trace.info.trace_metadata)
+        metadata = decode_ownership(tags, info.trace_metadata)
         if (
-            trace.info.experiment_id != experiment_id
-            or identity_projection(trace.info.trace_metadata, tags) != proof
-            or not resolves_conflict(trace.info.trace_metadata, tags, ready["qualified_id"], ready["session_id"])
+            info.experiment_id != experiment_id
+            or identity_projection(info.trace_metadata, tags) != proof
+            or not resolves_conflict(info.trace_metadata, tags, ready["qualified_id"], ready["session_id"])
             or (
                 ready["policy"] != "overwrite"
                 and (
@@ -1499,7 +1601,7 @@ class MlflowGateway:
 
         self._require_mutation_allowed()
         trace_id = str(retirement["trace_id"])
-        trace = self._client.get_trace(trace_id, display=False)
+        trace = SimpleNamespace(info=self.trace_info(trace_id, experiment_id))
         if (
             trace.info.experiment_id != experiment_id
             or identity_digest(trace.info.trace_metadata, trace.info.tags) != retirement["identity_sha256"]
@@ -1587,6 +1689,7 @@ class MlflowGateway:
         trace = SimpleNamespace(
             trace_id=candidate.trace_id, info=self.trace_info(candidate.trace_id, expected.experiment_id)
         )
+        require_trace_proof(trace.info)
         if trace.trace_id != candidate.trace_id:
             raise ItemImportError(
                 "trace_verification_failed",
@@ -1713,7 +1816,9 @@ class MlflowGateway:
                 recorded_sha256,
                 recorded_size,
             )
-        except ItemImportError:
+        except ItemImportError as error:
+            if error.code != "artifact_verification_failed":
+                raise
             # A stored artifact that diverges from its recorded digest is a
             # completed non-match (tampered or replaced content).
             return CandidateVerification(trace_id=candidate.trace_id, matches=False, reason="artifact_mismatch")
@@ -1736,7 +1841,7 @@ class MlflowGateway:
         conflict, never permission to delete by id.
         """
         try:
-            trace = self._client.get_trace(trace_id, display=False)
+            trace = SimpleNamespace(info=self.trace_info(trace_id, experiment_id), trace_id=trace_id)
         except Exception as error:  # noqa: BLE001 - an unverifiable target is unsafe to delete
             raise ItemImportError(
                 "ownership_conflict",
@@ -1817,7 +1922,19 @@ class MlflowGateway:
     ) -> bool:
         """Diff managed tags, delete removed fields, and verify the exact result."""
         self._require_mutation_allowed()
-        actual = self.trace_info(trace_id).tags
+        info = self.trace_info(trace_id)
+        actual = info.tags
+        if PROOF_TAG_KEYS.intersection(desired) or any(key.startswith(prefix) or key in keys for key in PROOF_TAG_KEYS):
+            raise ItemImportError("trace_resource_proof_immutable", "resource proof tags are creation-only")
+        validate_control_metadata(actual, info.trace_metadata)
+        proposed = {
+            key: value for key, value in actual.items()
+            if not (key.startswith(prefix) or key in keys) or key in desired
+        }
+        proposed.update(desired)
+        validate_control_metadata(proposed, info.trace_metadata, native_fields=[
+            getattr(info, name, None) for name in ("client_request_id", "request_preview", "response_preview")
+        ])
         changed = False
         for key in actual:
             if (key.startswith(prefix) or key in keys) and key not in desired:
@@ -1862,10 +1979,13 @@ class MlflowGateway:
         """Verify full reused span/native values, never trust fingerprint tags alone."""
         from mlflow_import.compatibility import decode_ownership
 
-        trace = self._client.get_trace(candidate.trace_id, display=False)
+        trace = self._get_trace(candidate.trace_id)
         path = trace.info.tags.get("opencode.artifact_path", "")
         if not path.startswith("mlflow-import/v2/"):
             raise ItemImportError("legacy_payload_requires_replacement", "the legacy payload requires migration")
+        has_turn_map = "mlflow_import.turn_map" in trace.info.tags
+        if has_turn_map and trace.info.tags["mlflow_import.turn_map"] != path:
+            raise ItemImportError("trace_verification_failed", "the recorded turn map pointers disagree")
         repository = self.experiment_repository(request.experiment_id)
         with resources.temporary_directory(prefix="mlflow-import-map-") as root:
             downloaded = resources.copy_artifact(repository, path, root, 8 * 1024 * 1024)
@@ -1891,8 +2011,14 @@ class MlflowGateway:
         expected = replace(
             request,
             root_tags={
-                **{key: value for key, value in request.root_tags.items() if key not in mutable},
+                **{
+                    key: value for key, value in request.root_tags.items()
+                    if key not in mutable and key != "mlflow_import.turn_map"
+                },
                 "opencode.artifact_path": path,
+                # Old V2 candidates may lack the alias. A present alias was
+                # checked above; adopt its recorded location, not a new create's.
+                **({"mlflow_import.turn_map": path} if has_turn_map else {}),
                 "opencode.turn_index": ownership["opencode.turn_index"],
             },
         )
@@ -1905,21 +2031,18 @@ class MlflowGateway:
     def trace_info(self, trace_id: str, experiment_id: str | None = None) -> Any:
         """Fetch native info/tags without downloading the one-turn span payload."""
         experiment_id = experiment_id or self._trace_experiments.get(trace_id)
-        if experiment_id is not None:
-            escaped = trace_id.replace("'", "\\'")
-            page = self._search_page(experiment_id, f"request_id = '{escaped}'", None)
-            if len(page) == 1 and page[0].trace_id == trace_id:
-                return page[0].info
-        trace = self._client.get_trace(trace_id, display=False)
-        self._trace_experiments[trace_id] = trace.info.experiment_id
-        return trace.info
+        info = self._read(lambda: get_trace_info_metadata(self._client, trace_id, experiment_id))
+        if info.trace_id != trace_id:
+            raise ItemImportError("trace_metadata_identity_mismatch", "the metadata response has a different trace id")
+        self._trace_experiments[trace_id] = info.experiment_id
+        return info
 
     def experiment_repository(self, experiment_id: str) -> Any:
         """The pinned, run-free experiment artifact repository binding."""
-        experiment = self._client.get_experiment(experiment_id)
+        experiment = self._read(lambda: self._client.get_experiment(experiment_id))
         if resources.current_storage() is not None:
             resources.validate_artifact_uri(experiment.artifact_location)
-        repository = self._sink._repository_factory(experiment.artifact_location, tracking_uri=self.tracking_uri)
+        repository = self._sink._repository(experiment.artifact_location)
         if resources.current_storage() is not None:
             resources.validate_artifact_repository(repository)
         return repository
@@ -1939,7 +2062,7 @@ class MlflowGateway:
     def trace_exists(self, trace_id: str) -> bool:
         """Only a protocol not-found response proves absence."""
         try:
-            self._client.get_trace(trace_id, display=False)
+            self.trace_info(trace_id)
         except Exception as error:
             if getattr(error, "error_code", None) == "RESOURCE_DOES_NOT_EXIST":
                 return False
@@ -1951,7 +2074,7 @@ class MlflowGateway:
         from mlflow_import.compatibility import decode_ownership
         from mlflow_import.content.canonical import canonical_json
 
-        trace = self._client.get_trace(trace_id, display=False)
+        trace = self._get_trace(trace_id)
         tags = trace.info.tags
         return {
             "schema_version": "mlflow-import.replacement.v2",
@@ -1973,12 +2096,22 @@ class MlflowGateway:
         }
 
     def verify_replacement_reference(self, reference: Mapping[str, object]) -> None:
+        self._verified_replacement_map(reference, self._get_trace(str(reference["trace_id"])))
+
+    def _verified_replacement_map(self, reference: Mapping[str, Any], trace: Any) -> dict[str, Any]:
+        """Verify a fresh trace and return the exact map bytes whose digest passed.
+
+        Map reads deliberately bypass the artifact cache: pricing must never parse
+        different bytes from those verified, including after a prior staging check.
+        Session artifacts retain the existing invocation-scoped cache semantics.
+        """
         from mlflow_import.compatibility import decode_ownership
+        from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
         from mlflow_import.content.canonical import canonical_json
 
-        trace = self._client.get_trace(str(reference["trace_id"]), display=False)
         if (
-            hashlib.sha256(canonical_json(trace.data.to_dict())).hexdigest() != reference["payload_sha256"]
+            trace.trace_id != reference["trace_id"]
+            or hashlib.sha256(canonical_json(trace.data.to_dict())).hexdigest() != reference["payload_sha256"]
             or (
                 decode_ownership(trace.info.tags, trace.info.trace_metadata)
                 if reference.get("schema_version") == "mlflow-import.replacement.v2"
@@ -1988,14 +2121,8 @@ class MlflowGateway:
             or ("native" in reference and self._native_reference(trace.info) != reference["native"])
         ):
             raise ItemImportError("replacement_verification_failed", "a ready replacement no longer matches")
-        for name in ("map", "session"):
-            path, checksum, size = cast(list[Any], reference[name])
-            # Reverification before retirement must not trust a cache from an
-            # earlier staging check in this invocation.
-            self.verify_experiment_file(trace.info.experiment_id, path, checksum, size)
-        path, _, size = cast(list[Any], reference["map"])
-        from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
-
+        path, checksum, size = reference["map"]
+        _safe_relative_path(path)
         if size > MAX_PRICING_MAP_BYTES:
             raise ItemImportError(
                 "replacement_verification_failed", "the replacement map exceeds the supported envelope"
@@ -2008,11 +2135,22 @@ class MlflowGateway:
                 raise ItemImportError(
                     "replacement_verification_failed", "the replacement map exceeds the supported envelope"
                 )
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != checksum:
+                raise ItemImportError("artifact_verification_failed", "the experiment artifact checksum differs")
             value = json.loads(payload)
+        path, checksum, size = reference["session"]
+        self.verify_experiment_file(trace.info.experiment_id, path, checksum, size)
         ownership = decode_ownership(trace.info.tags, trace.info.trace_metadata)
+        from mlflow_import.content.input_context import validate_input_contexts
+
+        if not validate_input_contexts(value, ownership, spans=trace.data.spans):
+            raise ItemImportError(
+                "replacement_verification_failed", "the replacement input-context index is invalid"
+            )
         if (
             not isinstance(value, dict)
-            or value.get("schema_version") != "mlflow-import.turn-map.v1"
+            or value.get("schema_version") not in {"mlflow-import.turn-map.v1", "mlflow-import.turn-map.v2"}
+            or not isinstance(value.get("identity_map"), dict)
             or value.get("identity_map", {}).get("trace_id") != reference["trace_id"]
             or value.get("turn_key") != ownership.get("mlflow_import.turn_key")
             or value.get("turn_fingerprint") != ownership.get("opencode.render_fingerprint")
@@ -2020,6 +2158,7 @@ class MlflowGateway:
             raise ItemImportError(
                 "replacement_verification_failed", "the replacement map has a different source identity"
             )
+        return value
 
     @staticmethod
     def _native_reference(info: Any) -> dict[str, object]:
@@ -2039,20 +2178,25 @@ class MlflowGateway:
 
     def read_pricing_basis(self, reference: Mapping[str, Any]) -> dict[str, Any]:
         """Read only checksummed importer turn-map provenance from a verified donor."""
-        self.verify_replacement_reference(reference)
-        if not self.pricing_donor_eligible(reference):
-            return {}
-        path, _, size = reference["map"]
-        from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
+        value = self._verified_replacement_map(reference, self._get_trace(str(reference["trace_id"])))
+        return self._pricing_basis_from_map(reference, value)
 
-        if size > MAX_PRICING_MAP_BYTES:
-            raise ItemImportError("turn_map_too_large", "the pricing donor map exceeds the qualified envelope")
-        with resources.temporary_directory(prefix="mlflow-import-basis-") as root:
-            local = resources.copy_artifact(self.experiment_repository(reference["experiment_id"]), path, root, size)
-            with resources.open_reader(local) as handle:
-                value = json.load(handle)
+    def read_pricing_donor(self, reference: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Read one verified donor; only a missing trace makes it unavailable."""
+        try:
+            trace = self._get_trace(str(reference["trace_id"]))
+        except Exception as error:
+            if getattr(error, "error_code", None) == "RESOURCE_DOES_NOT_EXIST":
+                return None
+            raise
+        value = self._verified_replacement_map(reference, trace)
+        return self._pricing_basis_from_map(reference, value)
+
+    def _pricing_basis_from_map(self, reference: Mapping[str, Any], value: Mapping[str, Any]) -> dict[str, Any]:
         from mlflow_import.content.accounting import applied_bases
 
+        if not self.pricing_donor_eligible(reference):
+            return {}
         return applied_bases(value.get("accounting", {}))
 
     @staticmethod
@@ -2172,7 +2316,7 @@ class MlflowGateway:
             # the gateway boundary.
             with self._pinned_tracking_uri():
                 mlflow.flush_trace_async_logging()
-            final_trace = self._client.get_trace(trace_id, display=False)
+            final_trace = SimpleNamespace(info=self.trace_info(trace_id, experiment_id), trace_id=trace_id)
             self._validate_retirement_target(
                 final_trace,
                 experiment_id,
@@ -2248,8 +2392,25 @@ class MlflowGateway:
                 raise ItemImportError("ownership_conflict", "the trace source identity changed before retirement")
         if expected_metadata is not None:
             for key, expected in expected_metadata.items():
+                # Attempt tags are deliberately excluded from decode_ownership.
+                # Check physical staging/scope evidence as well as the logical
+                # view so metadata cannot hide a tag changed during export flush.
+                physical_values = (
+                    [mapping[key] for mapping in (trace.info.trace_metadata, tags) if key in mapping]
+                    if key.startswith("mlflow_import.attempt_") or key in {
+                        "mlflow_import.qualified_session_id",
+                        "mlflow_import.harness",
+                        "mlflow_import.source_namespace",
+                        "mlflow_import.session_id",
+                        "mlflow_import.import_instance_id",
+                        "mlflow.trace.session",
+                        "mlflow.source.name",
+                        "parent_session_id",
+                    }
+                    else []
+                )
                 actual = _retirement_metadata_value(tags, metadata, key)
-                if actual != expected:
+                if actual != expected or any(value != expected for value in physical_values):
                     raise ItemImportError(
                         "ownership_conflict", "the trace candidate contract changed before retirement"
                     )
@@ -2313,15 +2474,27 @@ class MlflowGateway:
 
     # -- internals -----------------------------------------------------------
 
+    def _read(self, operation: Callable[[], _ReadResult]) -> _ReadResult:
+        return _retry_read(operation, self._read_retry_policy)
+
+    def _get_trace(self, trace_id: str) -> Any:
+        proof = require_trace_proof(self.trace_info(trace_id))
+        trace = self._read(lambda: self._client.get_trace(trace_id, display=False))
+        if require_trace_proof(trace.info) != proof:
+            raise ItemImportError("trace_resource_proof_mismatch", "the trace resource proof changed during retrieval")
+        assert_returned_trace(trace, proof)
+        return trace
+
     def _search_page(self, experiment_id: str, filter_string: str | None, page_token: str | None) -> Any:
         """One search page in the experiment (the non-deprecated ``locations`` form)."""
-        check_budget()
-        return self._client.search_traces(
-            locations=[experiment_id],
-            filter_string=filter_string,
-            max_results=self._search_page_size,
-            page_token=page_token,
-            include_spans=False,
+        return self._read(
+            lambda: self._client.search_traces(
+                locations=[experiment_id],
+                filter_string=filter_string,
+                max_results=self._search_page_size,
+                page_token=page_token,
+                include_spans=False,
+            )
         )
 
     @staticmethod

@@ -152,6 +152,34 @@ def decode_result(value: Mapping[str, Any]) -> DecodedResult:
     ):
         invalid()
     experiment, source, summary, redaction = (value[key] for key in ("experiment", "source", "summary", "redaction"))
+    events(value.get("errors"))
+    events(summary.get("warnings"))
+    # Only the current producer's terminal emergency envelope qualifies for
+    # unavailable counts. Historical/ordinary v1 counters remain integers;
+    # neither an arbitrary error nor an incomplete flag alone relaxes them.
+    emergency = summary.get("counts_complete") is False
+    if "counts_complete" in summary and type(summary["counts_complete"]) is not bool:
+        invalid()
+    if emergency:
+        if (
+            version != "mlflow-import.result.v1"
+            or summary.get("incomplete") is not True
+            or not count(summary.get("reporting_failures"))
+            or summary["reporting_failures"] == 0
+            or type(summary.get("recovery_pending")) is not bool
+            or not value["errors"]
+            or value["sessions"] != []
+            or ("sources" in value and value["sources"] != [])
+            or experiment.get("status") != "unresolved"
+            or experiment.get("id") is not None
+            or any(key not in source or source[key] is not None for key in ("schema_generation", "fingerprint"))
+            or redaction.get("detector_counts") != {}
+        ):
+            invalid()
+
+    def result_count(section: Mapping[str, Any], key: str) -> bool:
+        return key in section and (count(section[key]) or emergency and section[key] is None)
+
     if (
         not isinstance(experiment.get("name"), str)
         or experiment.get("id") is not None
@@ -165,10 +193,10 @@ def decode_result(value: Mapping[str, Any]) -> DecodedResult:
     ):
         invalid()
     for key in ("affected_field_count", "affected_record_count"):
-        if not count(redaction.get(key)):
+        if not result_count(redaction, key):
             invalid()
     for key in ("sessions_scanned", "sessions_selected", "logical_turn_count", "record_count"):
-        if not count(source.get(key)):
+        if not result_count(source, key):
             invalid()
     for key in (
         "selected_sessions",
@@ -180,10 +208,22 @@ def decode_result(value: Mapping[str, Any]) -> DecodedResult:
         "retired_traces",
         "failed_items",
     ):
-        if not count(summary.get(key)):
+        if not result_count(summary, key):
             invalid()
-    events(value.get("errors"))
-    events(summary.get("warnings"))
+    for key in (
+        "imported_turns", "updated_turns", "skipped_turns", "unchanged_turns",
+        "failed_turns", "failed_sessions", "failed_retirements", "unexamined_owned_traces",
+    ):
+        # Older v1 producers omit these additions. When supplied, they are
+        # still counters, not an untyped route around normal count validation.
+        if (emergency or key in summary) and not result_count(summary, key):
+            invalid()
+    if emergency and value["dry_run"] or "planned" in summary:
+        planned = summary.get("planned")
+        if not isinstance(planned, dict) or any(
+            not result_count(planned, key) for key in ("imported", "updated", "retired")
+        ):
+            invalid()
     actions = {"imported", "updated", "skipped", "failed", "retired"}
 
     def optional_details(item: Mapping[str, Any]) -> None:

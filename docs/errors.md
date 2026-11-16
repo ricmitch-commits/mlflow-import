@@ -21,6 +21,125 @@ remote proxy performance. The later [source-discovery correction](#source-discov
 records the corrected discovery behavior. The live import and persisted-trace
 verification below close the reported no-trace failure.
 
+## Historical JSON-looking string verification correction
+
+MLflow **3.17.2** sanitizes historical OTLP span attributes by removing a JSON
+encoding layer when a string parses as another string, object or array. This
+reinterpreted verbatim JSON-looking tool results and caused strict
+`trace_verification_failed` input/output or attribute comparisons.
+
+The historical gateway now adds exactly one transport encoding layer for those
+top-level strings, uniformly across root/child inputs, outputs and attributes.
+Structured values, nested strings and numeric/boolean/null strings retain their
+ordinary encoding. Source normalization, digests and exact verification are
+unchanged. Synthetic pinned-localhost regressions cover Unicode/quoted/multilayer
+strings, scalar/structure controls, genuinely changed payloads, native analytics,
+fractional timing, and session import/unchanged reuse with artifact identity.
+
+After updating the checkout, rerun the original import command against the same
+source and experiment. Normal reconciliation verifies existing work and retries
+failed work; do not edit source strings or bypass verification. If verification
+still fails, retain the safe error code/message for diagnosis: other payload
+differences remain errors.
+
+## Prepared-session recovery correction
+
+A subsequent SessionsAI retry reported `session_recovery_failed` and
+`import_failed`. Read-only diagnostics observed intermittent SDK-wrapped
+disconnects and timeouts on target reads that previously bypassed bounded
+retries. Those reads now share the invocation's retry allowance and deadline;
+exhausted reads retain a safe typed error instead of becoming an artifact
+integrity nonmatch. The original sanitized output does not identify which read
+failed in that invocation.
+
+The unfinished attempt also contained a verified staged replacement and an
+incomplete staged duplicate outside its frozen original-prior list. Recovery
+previously included that duplicate in the original-prior retirement batch,
+which journal validation correctly rejected. Recovery now validates the entire
+replacement scope, re-verifies its payloads and artifacts, and separately
+cleans exact same-attempt staged duplicates. Original-prior retirement still
+requires the verified durable ready state. Abandoned-attempt cleanup uses the
+same exact staging guards, including a final check of both tags and metadata.
+
+Disposable-localhost tests cover prepared recovery, fresh attempts, interrupted
+cleanup, changed source/policy, identity races, combined transient reads, and
+unchanged reruns. A local replica of the observed unfinished attempt recovered
+and completed an unchanged rerun. The normal SessionsAI import has not been
+rerun against the user's tracking server as part of this correction. Rerun the
+same command from this checkout; existing journals are consumed by recovery.
+The `session_share_omitted` schema warning is unrelated to these failures.
+
+## Invocation deadline and live-server diagnosis
+
+The reported bare `retry_budget_exhausted` CLI error could also occur while
+recording or rendering an earlier failure: result storage shared the expired
+work deadline. Terminal reporting now has a separate bounded local allowance,
+preserves the first safe error, and emits a qualified incomplete result with
+unknown counts when complete counts cannot be recovered. Deadline and retry
+allowance exhaustion have distinct safe messages. `--timeout-seconds` provides
+an explicit finite-positive invocation deadline (default 600 seconds), including
+for direct Python configurations.
+
+Read-only profiling selected 317 SessionsAI sessions / 516 turns. The initial
+full preview took 289.67 seconds, including 208.18 seconds preparing pricing
+donors. Donor selection now verifies each donor with one full-trace read and
+one checksummed map read instead of repeated verification. A subsequent full
+read-only preview completed in 151 seconds with no retries consumed. These are
+separate live observations, not a controlled network benchmark.
+
+One normal live invocation with an explicit 1800-second deadline still failed
+after 94.5 seconds during read-only planning with `read_retry_exhausted` and
+capability failures. It reported no imports, updates or retirements. Subsequent
+capability checks passed. Read-only OpenShift inspection then found the MLflow
+container had 61 restarts and a latest `OOMKilled` termination (exit 137), with
+four Uvicorn workers under a 4 GiB memory limit. This establishes server memory
+instability; the exact failed request in that invocation was not retained.
+No deployment configuration was changed as part of this diagnosis.
+
+Independent paged lookup found 306 active traces in SessionsAI (experiment 2),
+with historical request times from 2026-10-20 through 2026-11-04 UTC. A recent
+UI date filter can hide them. There were 41 completed and two unfinished durable
+attempts; full live recovery remains unverified until server stability is
+addressed. These observations do not supersede the historical `test-import`
+success described below.
+
+## Persistent 8 GiB deployment and aggregate-trace blocker
+
+With user approval, `openshift-local` commit
+`9649417bb9eeea91c155ccecb00134856356150a` changes only the Git-managed MLflow
+Deployment memory limit from 4 GiB to 8 GiB. Argo CD synchronized this revision;
+the ready pod retained one worker. A direct Deployment patch had previously
+been reverted by Argo CD self-healing.
+
+The first monitored 8 GiB recovery reached its 1800-second deadline during
+reconciliation, with 54 retries remaining and no pod restarts. Independent
+inventory then verified 416 completed active winner traces and nine unfinished
+attempts. Subsequent local corrections cover explicit empty native previews,
+per-create immutable turn-map placement, and an 8 MiB per-value profile. These
+passed 2166 unit/contract tests and the associated localhost integration cases.
+
+A subsequent 3600-second recovery stopped after 1892.6 seconds with
+`read_retry_exhausted`: 3 imported, 30 updated, 286 unchanged and 22 failed turns
+were reported for the processed prefix. The MLflow pod was OOM-killed once at
+8 GiB. PostgreSQL was also OOM-killed under its 1 GiB limit; database failures
+and HTTP 503 responses occurred before the final failed lookup. Access logs
+do not identify the exact in-flight request responsible for the memory peak.
+
+Local reconstruction of the exact failed turn keys found one turn with 2105
+child spans and 1,329,920,980 canonical child-envelope bytes, mostly accumulated
+conversation history repeated in model-call inputs. Every individual value
+fits within 8 MiB. Thus the per-value qualification does not qualify aggregate
+trace ingestion, retrieval or database memory consumption. This measurement is
+a fresh-source canonical reconstruction, not a captured OTLP wire length.
+
+Final read-only inventory verified 436 active completed winner traces, 37 staged
+traces, five legacy traces and seven unfinished attempts. Historical completed
+journals also reference retired predecessor traces; their total reference count
+must not be reported as the current active trace count. Full import completion
+has not been established. Further normal retries were stopped pending aggregate
+projection/transport and PostgreSQL capacity work; another memory increase alone
+is not a demonstrated resolution.
+
 ## Verified resolution of the reported no-trace import
 
 The original command stopped before trace creation for two independent reasons:

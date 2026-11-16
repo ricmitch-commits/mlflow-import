@@ -1281,7 +1281,12 @@ def test_claude_followup_model_inputs_include_correlated_tool_result(live_server
         span for span in trace.data.spans if span.attributes.get("mlflow_import.invocation_id") == ":final-inv"
     )
     assert {"role": "tool", "tool_call_id": "c", "content": "literal tool result"} in model.inputs["messages"]
-    assert model.inputs["messages"][0]["content"] == "hello"
+    assert [message["role"] for message in model.inputs["messages"]] == ["assistant", "tool"]
+    assert model.inputs["messages"][0]["tool_calls"][0]["id"] == "c"
+    context = model.attributes["mlflow_import.input_context"]
+    assert context["policy"] == "conversation-delta-v1"
+    assert context["previous_context_id"]
+    assert context["provider_request"] == "unknown"
     assert trace.info.tags["mlflow_import.turn_fingerprint"]
     assert trace.info.tags["mlflow_import.metadata_fingerprint"]
 
@@ -1516,13 +1521,22 @@ def test_recorded_zero_cost_is_not_missing_or_an_invented_breakdown(live_server,
 
 def test_fresh_import_refuses_a_map_outside_its_recoverable_profile(live_server, tmp_path, monkeypatch):
     from mlflow_import.content import accounting
+    from mlflow_import.mlflow.gateway import MlflowGateway
 
     path, _ = source_file(tmp_path, "claude")
     monkeypatch.setattr(accounting, "MAX_PRICING_MAP_BYTES", 128)
+    trace_creates = []
+
+    def unexpected_create(*args, **kwargs):
+        trace_creates.append(True)
+        pytest.fail("an oversized map reached trace creation instead of failing preflight")
+
+    monkeypatch.setattr(MlflowGateway, "create_trace", unexpected_create)
+    name = unique_experiment_name("map-limit")
     config = parse_config(
         [
             "--experiment-name",
-            unique_experiment_name("map-limit"),
+            name,
             "--source",
             str(path),
             "--tracking-uri",
@@ -1531,8 +1545,9 @@ def test_fresh_import_refuses_a_map_outside_its_recoverable_profile(live_server,
     )
     result = run_import(config, build_dependencies(config))
     assert exit_status(result) == 1, result.report
+    assert result.error is not None
+    assert result.error.code == "turn_map_too_large"
     assert result.report["summary"]["imported_turns"] == 0
-    # Rollback may retire this attempt's new staged trace; there is no
-    # completed copy and no previously verified source trace to remove.
-    assert not live_server.client.search_traces(locations=[result.report["experiment"]["id"]], include_spans=False)
-    assert "turn_map_too_large" in repr(result.report)
+    assert result.report["experiment"]["id"] is None
+    assert live_server.client.get_experiment_by_name(name) is None
+    assert trace_creates == []

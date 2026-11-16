@@ -2,7 +2,7 @@
 
 This support document records the qualified projection and final evidence. The authoritative
 requirements, architecture and integration baseline remain unchanged. The
-implementation is `mapping-v8`, `accounting-v2`, with coverage evidence version
+implementation is `mapping-v9`, `artifact-v4`, `accounting-v2`, with coverage evidence version
 `integration-baseline-2026-11-13-v1`.
 
 ## Qualified representations and independent readback
@@ -39,6 +39,17 @@ trace without usage observations. Explicit reference previews are preserved. Ful
 root/child values, native timing/state/session/request/name/usage/cost and exact
 immutable metadata are verified; ready-state references also retain native-field
 expectations. Ambiguous writes use the existing durable attempt recovery.
+Absent historical native request/response previews are physically represented by
+an explicit empty string. MLflow 3.17.2 otherwise autofills NULL previews from
+structured span content, and finalizing with NULL cannot clear that generated
+text. The gateway applies this qualifier at creation, finalization and strict
+reuse verification; mapped source previews remain `None` and source artifacts,
+fingerprints and digests retain their existing meaning. Nonempty previews must
+still match exactly. Older NULL or autofilled candidates fail this physical
+contract. Prepared candidates that failed before turn-map publication are
+replaced through normal reconciliation; verified empty-string winners are
+reused. Local evidence is in
+`tests/integration/test_native_preview_transport.py`.
 Historical spans preserve `UNSET` child execution outcomes; a missing/unknown
 terminal turn outcome is represented as a non-OK trace. Recorded tool-state
 execution intervals are measured; other recorded timestamp intervals are derived,
@@ -106,6 +117,57 @@ operations retain their independent accounting scope. Model chat inputs retain
 correlated tool results, and Gemini tool calls render in structured assistant
 outputs. Derived turn-context inputs are labelled as such, not claimed to be a
 complete copy of an inaccessible provider request.
+
+### Linear observed conversation context
+
+`conversation-delta-v1` replaces cumulative derived model-input histories. Within
+each recorded execution scope, the first call receives the complete observed
+prompt contributions available before that call. Each later call receives new
+user/tool contributions and the immediately preceding assistant message once.
+Pending contributions are consumed at each conversation model call; an old prompt, result or source
+identity prefix is not copied into all later inputs. A contribution therefore has
+constant total replication, independent of call count. Tool IDs and actual result
+values remain correlated. Recorded subagent scopes have independent context chains.
+Standalone Codex function calls are retained as new assistant tool-call contributions.
+This policy applies to the shared activity projector and the legacy mapping fallback.
+Nonconversation usage/compaction/branch-summary observations advance the context
+provenance chain with unavailable inputs, but preserve pending user/tool values and
+the last actual assistant for the next model call. Accounting observations do not
+consume or replace conversation contributions.
+
+Explicit recorded `input` fields, including null, empty containers and full recorded
+request histories, retain their complete source value. They are labelled
+`recorded-request-input` / `recorded-input-only`; that does not establish that an
+entire provider request was captured. Derived context is labelled
+`derived-observed-conversation` with `provider_request="unknown"`. A call without
+observed context has `inputs=None`, an empty delta and an explicit empty descriptor.
+Accounting-only steps may likewise report unavailable input rather than inventing it.
+
+Each invocation's `mlflow_import.input_context` attribute is a versioned descriptor
+linking qualified session, logical turn, recorded scope, invocation and preceding
+context. Its delta references effective occurrence/entity/source identities and
+message positions; coalesced fragments reference all contributing occurrences.
+Gemini patches/checkpoints reference their effective identities, with physical
+originals retained in the full session artifact. Context IDs depend on logical
+turn-local identities, never a session snapshot hash, artifact location or turn
+index. Updating a sibling turn does not change those IDs.
+
+New `mlflow-import.turn-map.v2` objects persist the same descriptors in a linear
+`input_contexts` index; see [result-schema.md](result-schema.md#turn-map-input-context-index).
+Full source/session artifacts and complete root values remain authoritative and
+are not compacted. The raw session schema stays `mlflow-import.session.v1` and
+accounting stays `accounting-v2`. Projection/artifact version inputs change render
+fingerprints without changing source fingerprints or logical turn keys. Historical
+v1 maps remain readable for pricing provenance; that alone grants no current
+projection reuse or in-flight attempt migration authority.
+
+Activity graph construction calls the shared pure `SpanBudget.account_spec()`
+before retaining each child, reserving a root span slot. This bounds mapped bytes
+and span count before the complete graph exists. The final transport admission
+also includes the root and wire/control overhead. Local regression evidence is in
+`tests/unit/content/test_input_context.py` (10/100/1000 calls, a 2105-child shape,
+early span/byte failures) and `test_input_context_sources.py` (six source cases,
+both privacy modes, retained artifacts and local map publication).
 
 - Claude input includes cache-read and cache-creation counts once. Extended
   creation is a subset, not an additional token count.
@@ -179,6 +241,15 @@ a changed overwrite reselects the canonical donor rather than inheriting that
 duplicate's independent basis. The current recoverable turn-map envelope is
 8 MiB; both fresh publication and donor reads enforce it explicitly, preserving
 prior traces on failure rather than claiming an unrecoverable mapping succeeded.
+Global preflight additionally calls the pure
+`content.turn_map.validate_turn_map_admission(replay, request, mode)` on the already
+admitted request snapshot. It streams the same canonical v2 builder as upload,
+including complete accounting, contexts, records, aliases and identity maps, with
+35-character trace-ID and 16-character span-ID reservations at every occurrence.
+An oversized prospective map raises `turn_map_too_large` before target mutation;
+upload retains its actual-byte check. Admission does not re-run the mapper or
+pricing projection. Late artifact-placement nonces and attempt/session pointer
+tags do not enter immutable map content.
 
 ## Coverage and limits
 

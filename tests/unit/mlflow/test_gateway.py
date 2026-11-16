@@ -490,14 +490,13 @@ def test_create_trace_sets_native_session_metadata(fake_mlflow_client: FakeMlflo
     assert trace.info.trace_metadata[TRACE_SESSION_METADATA_KEY] == "ses-native-42"
 
 
-def test_create_trace_consumes_children_one_at_a_time(fake_mlflow_client: FakeMlflowClient) -> None:
+def test_create_trace_consumes_producer_once_before_any_span_mutation(fake_mlflow_client: FakeMlflowClient) -> None:
     gateway = _checked_gateway(fake_mlflow_client)
     ended_before_next_fetch: list[bool] = []
 
     def lazy_children() -> Iterator[TraceChildRequest]:
         for index in range(3):
-            # Every previously yielded child must already be ended before the
-            # next one is fetched: the gateway never buffers the child list.
+            # Resource admission consumes the producer before any root starts.
             ended = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "end_span"]
             started = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "start_span_no_context"]
             ended_before_next_fetch.append(not started or len(ended) == len(started) - 1)
@@ -508,8 +507,9 @@ def test_create_trace_consumes_children_one_at_a_time(fake_mlflow_client: FakeMl
     created = gateway.create_trace(spec)
 
     assert created.span_ids_by_source.keys() == {"child-0", "child-1", "child-2"}
-    # One read-only timing preflight pass, then one streamed create pass.
-    assert ended_before_next_fetch == [True] * 6
+    # The admitted bounded DTOs are reused for timing and creation. A changing
+    # child factory cannot supply an unchecked payload on a second pass.
+    assert ended_before_next_fetch == [True] * 3
     # Root is ended last, after every child.
     end_calls = [call for call in fake_mlflow_client.trace_api.calls if call[0] == "end_span"]
     assert end_calls[-1][1]["span_id"] == created.root_span_id

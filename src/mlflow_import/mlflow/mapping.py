@@ -1456,9 +1456,21 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
         return
 
     prompt = _native_root_input(turn.load_root_input(inline_limit))
-    history: list[dict[str, object]] = []
+    from mlflow_import.content.input_context import (
+        INPUT_CONTEXT_ATTRIBUTE,
+        ConversationDelta,
+        recorded_input,
+        source_reference,
+    )
+    from mlflow_import.identity import qualified_session
+
+    conversation = ConversationDelta(qualified_session(turn.session_header), turn.summary.turn_key)
+    prompt_sources = [
+        source_reference(child, SourceIdentity.of(child).key, "content")
+        for child in records[1:] if child.parent_source_id == records[0].source_id
+    ] or [source_reference(records[0], SourceIdentity.of(records[0]).key, "content")]
     if isinstance(prompt, Mapping):
-        history.append({"role": "user", "content": prompt.get("prompt", "")})
+        conversation.observe("", {"role": "user", "content": prompt.get("prompt", "")}, prompt_sources)
 
     first = True
     index = 0
@@ -1470,6 +1482,13 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
             continue
 
         decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        scope = str(record.raw_columns.get("subagent") or "")
+        if _is_message_container(record) and record.classification == "user":
+            conversation.observe(
+                scope,
+                {"role": "user", "content": decoded.get("content")},
+                [source_reference(record, SourceIdentity.of(record).key, "content")],
+            )
         if _is_message_container(record) and extract_model_identity(decoded) is not None:
             children = []
             next_index = index + 1
@@ -1479,7 +1498,27 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
                     break
                 children.append(child)
                 next_index += 1
-            spec = _native_model_spec(record, children, history)
+            source_key = SourceIdentity.of(record).key
+            sources = [source_reference(record, source_key, "assistant")]
+            sources.extend(source_reference(child, SourceIdentity.of(child).key, "content") for child in children)
+            inputs, descriptor = conversation.consume(
+                scope,
+                record.invocation_id or source_key,
+                sources,
+                recorded=recorded_input([record], [source_key]),
+            )
+            messages = inputs.get("messages", []) if isinstance(inputs, Mapping) else []
+            spec = _native_model_spec(record, children, messages)
+            if descriptor["origin"] == "recorded-request-input" or inputs is None:
+                spec = replace(spec, inputs=inputs)
+            spec = replace(spec, attributes={
+                **spec.attributes,
+                INPUT_CONTEXT_ATTRIBUTE: descriptor,
+                "mlflow_import.inputs_origin": descriptor["origin"],
+            })
+            output = cast(Mapping[str, object], spec.outputs)
+            choices = cast(list[dict[str, dict[str, object]]], output["choices"])
+            conversation.assistant(scope, choices[0]["message"], sources)
             emitted.add(spec.source_key)
             yield _bound_child(spec, inline_limit)
             for child in children:
@@ -1492,12 +1531,14 @@ def _iter_child_specs(turn: ReplayTurn, inline_limit: int) -> Iterator[SpanSpec 
                         state = child_value.get("state")
                         if isinstance(state, Mapping):
                             call_id = child_value.get("callID") or child_value.get("call_id")
-                            history.append(
+                            conversation.observe(
+                                scope,
                                 {
                                     "role": "tool",
                                     "tool_call_id": call_id,
                                     "content": state.get("output"),
-                                }
+                                },
+                                [source_reference(child, SourceIdentity.of(child).key, "state.output")],
                             )
             index = next_index
             continue

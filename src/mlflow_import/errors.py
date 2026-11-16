@@ -32,6 +32,7 @@ class ImporterError(Exception):
         self.safe_message = safe_message
         self.exit_status = self.default_exit_status if exit_status is None else exit_status
         self.cleanup_warnings: tuple[str, ...] = ()
+        self.diagnostics: dict[str, str | int] = {}
 
     def __str__(self) -> str:
         # Only the safe message: the string form must never carry the code

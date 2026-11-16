@@ -49,6 +49,63 @@ The post-correction default-source production dry-run completed with exit 0:
 codes. It imported/updated no turns and retired no traces. Sanitized evidence and
 test commands are in [errors.md](errors.md#source-discovery-correction).
 
+### Gemini A2A recordings with a repeated native ID
+
+Some Gemini A2A recordings use `sessionId: "a2a-server"` in multiple files,
+including multiple recordings for the same project. Distinct `startTime`
+values and filenames do not establish that one recording supersedes another.
+These files currently fail with `ambiguous_source`; a fresh MLflow experiment
+does not resolve a source-identity collision. `--session a2a-server` still
+selects every eligible claimant, and `--on-conflict` only controls target-side
+conflicts.
+
+To proceed with other harnesses, explicitly run `--harness opencode`,
+`--harness claude`, `--harness codex` and `--harness pi` as separate invocations
+with the same experiment and directory filters. This excludes Gemini from
+those invocations; it does not import or repair its recordings. Importing all
+colliding A2A recordings requires a qualified source-identity representation
+or authoritative source correction. Do not treat sequential single-file
+imports as independent sessions when they share the same qualified identity.
+
+## Trace resource preflight
+
+Both dry-run and normal mode project and admit every selected trace before
+target mutation, including recovery. The provisional aggregate envelope is
+64 MiB of conservatively bounded serialized spans, 4096 total spans (root
+included), and 2 MiB of control metadata. Half the control envelope is reserved
+for bounded late attempt/instance/map/session decorations; the actual request
+is checked again at creation. Oversized traces fail with
+`trace_resource_envelope_exceeded`; source values are not silently truncated
+to make the aggregate fit.
+
+`trace_resource_profile_unverified` means a stored trace lacks the new writer's
+recognized creation-time resource proof. Full payload retrieval, unchanged
+reuse and pricing donation are blocked before downloading spans. Narrowing
+source selection may avoid an unrelated legacy trace; a legacy trace needing
+reuse requires a separately qualified offline migration. Do not manually add
+proof tags to an old trace. The proof relies on trusted writers and immutable
+span payloads; see [compatibility.md](compatibility.md#aggregate-trace-admission-and-metadata-first-reads).
+
+## Invocation timeout
+
+`--timeout-seconds SECONDS` sets a finite positive wall-clock budget for the whole
+invocation (default: `600` seconds). Fractional seconds are accepted. The shared
+budget includes source discovery, preflight, recovery, and writing; it does not
+restart for each session or phase. Invalid values fail with `invalid_timeout`
+before source configuration or discovery.
+
+For a larger workload, explicitly give the same SessionsAI import 30 minutes:
+
+```sh
+mlflow-import --experiment-name SessionsAI --timeout-seconds 1800
+```
+
+Add `--log-level DEBUG` for live phase/count progress on stderr. The default stays
+600 seconds and is never silently raised. The separate shared allowances remain
+64 retries and 1,000,000 operations; increasing the timeout does not increase
+either allowance. Exhaustion is a reported failure. Resolve the reported condition
+and rerun to use normal recovery.
+
 ## Remote artifact configuration
 
 The pinned client/server pair supports bounded reads through `mlflow-artifacts:/`

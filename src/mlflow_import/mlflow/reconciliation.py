@@ -83,6 +83,7 @@ candidate for deterministic winner selection and explicit operator recovery.
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 import time
@@ -1006,58 +1007,27 @@ def _upload_bundle(
     directory: Path | None,
 ) -> ArtifactVerification:
     from mlflow_import.content.activity import iter_activity_specs, project_activity
-    from mlflow_import.content.canonical import StreamingArray, iter_canonical_json
     from mlflow_import.content.fingerprint import artifact_snapshot_fingerprint
-    from mlflow_import.mlflow.mapping import SourceIdentity
+    from mlflow_import.content.turn_map import build_turn_map, iter_turn_map_json
 
     with resources.temporary_directory(prefix="mlflow-import-bundle-", dir=directory) as root:
         staging = Path(root)
         info = gateway.trace_info(created.trace_id)
         session_path, sha256, size = publish_session_object(replay, mode, gateway, info.experiment_id, staging)
         activity = project_activity(replay)
-        targets: DiskMap[str, list[str]] = DiskMap()
-        for spec in iter_activity_specs(activity, replay):
-            span_id = created.span_ids_by_source.get(spec.source_key)
-            if span_id is not None:
-                for key in cast(list[str], spec.attributes.get("mlflow_import.source_keys", [spec.source_key])):
-                    targets.setdefault(key, DiskList()).append(span_id)
-        first_record = next(iter(activity.records), None)
-        if first_record is not None:
-            targets[SourceIdentity.of(first_record).key] = [created.root_span_id]
         with temporary_artifact_file(staging) as (local, handle):
             ownership = decode_ownership(created.verified_tags, created.verified_metadata)
-            value = {
-                "schema_version": "mlflow-import.turn-map.v1",
-                "turn_key": replay.summary.turn_key,
-                "turn_fingerprint": ownership.get("opencode.render_fingerprint"),
-                "mapping_version": ownership.get("opencode.mapping_version"),
-                "importer_version": ownership.get("opencode.importer_version"),
-                "identity_map": created_artifact_identity_map(created),
-                "privacy": mode.value,
-                "accounting": activity.provenance,
-                # No mutable session-generation pointer belongs in a reusable map.
-                "records": StreamingArray(
-                    {
-                        "source_table": record.source_table,
-                        "source_id": record.source_id,
-                        "sequence": record.sequence_value,
-                        "occurrence_id": record.occurrence_id,
-                        "entity_id": record.entity_id or record.source_id,
-                        "invocation_id": record.invocation_id,
-                        "span_ids": targets.get(SourceIdentity.of(record).key, []),
-                    }
-                    for record in replay.iter_records()
-                ),
-            }
-            from mlflow_import.content.accounting import MAX_PRICING_MAP_BYTES
-
-            emitted = 0
-            for chunk in iter_canonical_json(value):
-                emitted += len(chunk)
-                if emitted > MAX_PRICING_MAP_BYTES:
-                    raise ItemImportError(
-                        "turn_map_too_large", "the canonical turn map exceeds the qualified pricing/recovery envelope"
-                    )
+            value = build_turn_map(
+                replay,
+                children=iter_activity_specs(activity, replay),
+                accounting=activity.provenance,
+                ownership=ownership,
+                trace_id=created.trace_id,
+                root_span_id=created.root_span_id,
+                span_ids_by_source=created.span_ids_by_source,
+                mode=mode,
+            )
+            for chunk in iter_turn_map_json(value):
                 handle.write(chunk)
             handle.flush()
             verification = gateway.publish_experiment_file(info.experiment_id, path, local, trace_id=created.trace_id)
@@ -1159,7 +1129,8 @@ def _select_pricing_basis(
         return cast(dict[str, dict[str, Any]], pending[0]["prepared"].get("pricing_bases", {}))
     if policy in {"duplicate", "ignore"}:
         return {}
-    donors: DiskList[tuple[str, Mapping[str, Any]]] = DiskList()
+    donors: DiskList[tuple[str, Mapping[str, Any], dict[str, Any]]] = DiskList()
+    read_donor = getattr(gateway, "read_pricing_donor", None)
     for states in attempts:
         complete = states.get("complete")
         if complete is None:
@@ -1168,27 +1139,40 @@ def _select_pricing_basis(
         eligible = getattr(gateway, "pricing_donor_eligible", lambda reference: True)
         if any(not eligible(reference) for reference in references):
             continue
-        if not references or not all(gateway.trace_exists(str(reference["trace_id"])) for reference in references):
+        if not references:
             continue
         # A completed instance is eligible only after full reference verification.
+        verified: DiskList[tuple[str, Mapping[str, Any], dict[str, Any]]] = DiskList()
         try:
             for reference in references:
-                gateway.verify_replacement_reference(reference)
+                if read_donor is not None:
+                    basis = read_donor(reference)
+                    if basis is None:
+                        break
+                else:
+                    # Preserve the older gateway/fake seam without adding these
+                    # redundant full-trace reads to the production gateway.
+                    if not gateway.trace_exists(str(reference["trace_id"])):
+                        break
+                    gateway.verify_replacement_reference(reference)
+                    basis = gateway.read_pricing_basis(reference)
+                verified.append((str(complete.get("instance_id", "")), reference, basis))
+            else:
+                donors.extend(verified)
         except ItemImportError as error:
             if error.code in {"replacement_verification_failed", "artifact_verification_failed"}:
                 continue
             raise
-        donors.extend((str(complete.get("instance_id", "")), reference) for reference in references)
     if not donors:
         return {}
-    instance = min(instance for instance, _ in donors)  # Canonical empty ID wins.
+    instance = min(instance for instance, _, _ in donors)  # Canonical empty ID wins.
     selected: DiskMap[str, dict[str, Any]] = DiskMap()
-    for _, reference in DiskList(pair for pair in donors if pair[0] == instance).sorted_by(
+    for _, reference, basis in DiskList(pair for pair in donors if pair[0] == instance).sorted_by(
         lambda pair: str(pair[1]["trace_id"])
     ):
         turn_key = reference["metadata"].get("mlflow_import.turn_key")
         if turn_key is not None and turn_key not in selected:
-            selected[turn_key] = gateway.read_pricing_basis(reference)
+            selected[turn_key] = basis
     return selected
 
 
@@ -1315,20 +1299,7 @@ def _apply_sessions_with_basis(
                 ):
                     attempt = prepared
                 else:
-                    for candidate in gateway.iter_session_traces(experiment_id, session_id, qualified_id):
-                        if (
-                            candidate.tags.get("mlflow_import.attempt_id") == prepared["attempt_id"]
-                            and candidate.tags.get("mlflow_import.attempt_state") == "staged"
-                        ):
-                            if candidate.trace_id not in prepared["prior_ids"]:
-                                gateway.retire_trace(
-                                    experiment_id,
-                                    candidate.trace_id,
-                                    session_id=session_id,
-                                    turn_key=decode_ownership(candidate.tags, candidate.metadata).get(
-                                        OWNERSHIP_TURN_KEY
-                                    ),
-                                )
+                    _abort_staged_attempt(gateway, experiment_id, prepared, plan.confirmed_retirements)
                     journal.publish("aborted", prepared)
                     pricing_bases.set(
                         _select_pricing_basis(
@@ -1551,6 +1522,9 @@ def _apply_sessions_with_basis(
             prior_ids = cast(list[str], attempt["prior_ids"])
             if len(current_prior_ids) != len(prior_ids) or any(key not in current_prior_ids for key in prior_ids):
                 raise ItemImportError("session_conflict_changed", "the pre-existing session conflict set changed")
+            staged_losers = DiskList(
+                trace_id for trace_id in retire_ids if trace_id not in current_prior_ids
+            ).sorted_by(lambda key: key)
             manifest_payload = {
                 "schema_version": "mlflow-import.session-manifest.v1",
                 "session_id": qualified_id,
@@ -1570,24 +1544,38 @@ def _apply_sessions_with_basis(
                 manifest_checksum, manifest_size = write_state_json(manifest_file, manifest_payload)
                 manifest_path = f"{session_prefix(replay, active.redaction_mode)}/manifests/{manifest_checksum}.json"
                 gateway.publish_experiment_file(experiment_id, manifest_path, manifest_file)
-            ready = journal.publish(
-                "ready_to_retire",
-                {
-                    **attempt,
-                    "replacements": replacements,
-                    "manifest": [manifest_path, manifest_checksum, manifest_size],
-                    "retirements": DiskList(
-                        {
-                            "trace_id": trace_id,
-                            "session_id": prior[trace_id].session_id,
-                            "turn_key": prior[trace_id].turn_key,
-                            "identity": gateway.conflict_identity(trace_id),
-                        }
-                        for trace_id in DiskList(retire_ids).sorted_by(lambda key: key)
+            ready_values = {
+                **attempt,
+                "replacements": replacements,
+                "manifest": [manifest_path, manifest_checksum, manifest_size],
+                "retirements": DiskList(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": prior[trace_id].session_id,
+                        "turn_key": prior[trace_id].turn_key,
+                        "identity": gateway.conflict_identity(trace_id),
+                    }
+                    for trace_id in DiskList(key for key in retire_ids if key in current_prior_ids).sorted_by(
+                        lambda key: key
                     )
-                    + DiskList(foreign if active.conflict_policy == "overwrite" else ()),
-                },
-            )
+                )
+                + DiskList(foreign if active.conflict_policy == "overwrite" else ()),
+            }
+            # Bind the entire captured replacement set to the frozen prepared
+            # scope before deleting even staging debris. Reverification alone
+            # only proves that a snapshot still matches itself.
+            journal.validate({**ready_values, "schema_version": "mlflow-import.attempt.v1", "state": "ready_to_retire"})
+            if staged_losers:
+                _cleanup_staged_losers(
+                    gateway,
+                    experiment_id,
+                    attempt,
+                    request_ownership(request),
+                    DiskList(prior[trace_id] for trace_id in staged_losers),
+                    replacements,
+                    plan.confirmed_retirements,
+                )
+            ready = journal.publish("ready_to_retire", ready_values)
             _finish_ready(journal, ready, gateway, plan.confirmed_retirements)
             plan.results.extend(
                 replace(
@@ -1618,6 +1606,99 @@ def _apply_sessions_with_basis(
         finally:
             _annotate_attempt(plan, session_id, journal, result_start)
     return plan
+
+
+def _abort_staged_attempt(
+    gateway: MlflowGateway,
+    experiment_id: str,
+    prepared: Mapping[str, Any],
+    confirmed: MutableMapping[str, str],
+) -> None:
+    """Discard only exact staged work from a validated abandoned attempt."""
+    _, harness, namespace, session_id = json.loads(prepared["qualified_id"])
+    prior_ids = DiskMap((trace_id, True) for trace_id in prepared["prior_ids"])
+    candidates = DiskList(
+        OwnedTraceCandidate.from_owned_trace(candidate, experiment_id)
+        for candidate in gateway.iter_session_traces(experiment_id, session_id, prepared["qualified_id"])
+        if candidate.trace_id not in prior_ids
+        and candidate.tags.get("mlflow_import.attempt_id") == prepared["attempt_id"]
+        and candidate.tags.get("mlflow_import.attempt_state") == "staged"
+    ).sorted_by(lambda candidate: candidate.trace_id)
+    _cleanup_staged_losers(
+        gateway,
+        experiment_id,
+        prepared,
+        {"mlflow_import.harness": harness, "mlflow_import.source_namespace": namespace},
+        candidates,
+        None,
+        confirmed,
+    )
+
+
+def _cleanup_staged_losers(
+    gateway: MlflowGateway,
+    experiment_id: str,
+    attempt: Mapping[str, object],
+    ownership: Mapping[str, str],
+    losers: Sequence[OwnedTraceCandidate],
+    replacements: Sequence[Mapping[str, object]] | None,
+    confirmed: MutableMapping[str, str],
+) -> None:
+    """Clean exact same-attempt staging debris without widening frozen priors.
+
+    This deliberately precedes ready publication: the journal authorizes only
+    original-prior retirements. A retry inventories the remaining staged traces
+    again, so interruption after confirmed cleanup needs no journal schema change.
+    Aborting prepared work passes no replacement set; successful recovery must
+    first validate its complete ready candidate against the journal schema.
+    """
+    if replacements is not None:
+        gateway._artifact_checks.clear()
+        for reference in replacements:
+            gateway.verify_replacement_reference(reference)
+    replacement_ids = DiskMap((str(reference["trace_id"]), True) for reference in replacements or ())
+    prior_ids = DiskMap((trace_id, True) for trace_id in cast(Sequence[str], attempt["prior_ids"]))
+    expected_scope = {
+        OWNERSHIP_SESSION_KEY: str(attempt["session_id"]),
+        "mlflow_import.qualified_session_id": str(attempt["qualified_id"]),
+        "mlflow_import.harness": ownership["mlflow_import.harness"],
+        "mlflow_import.source_namespace": ownership["mlflow_import.source_namespace"],
+        "mlflow_import.import_instance_id": str(attempt.get("instance_id", "")),
+        "mlflow_import.attempt_id": str(attempt["attempt_id"]),
+        "mlflow_import.attempt_state": "staged",
+    }
+    guarded: DiskList[tuple[OwnedTraceCandidate, dict[str, str]]] = DiskList()
+    for candidate in losers:
+        if candidate.trace_id in prior_ids or candidate.trace_id in replacement_ids:
+            raise ItemImportError("ownership_conflict", "staged cleanup overlaps protected traces")
+        info = gateway.trace_info(candidate.trace_id)
+        metadata = decode_ownership(info.tags, info.trace_metadata)
+        expected = {**expected_scope, OWNERSHIP_TURN_KEY: candidate.turn_key}
+        if (
+            info.experiment_id != experiment_id
+            or candidate.session_id != attempt["session_id"]
+            or _candidate_importer_marker(info.tags, metadata) != OWNERSHIP_IMPORTER_VALUE
+            or any(
+                metadata.get(key, info.tags.get(key, "")) != value
+                or any(mapping[key] != value for mapping in (metadata, info.tags) if key in mapping)
+                for key, value in expected.items()
+            )
+        ):
+            raise ItemImportError("ownership_conflict", "staged cleanup is outside the exact attempt scope")
+        guarded.append((candidate, expected))
+    for candidate, expected in guarded:
+        # retire_trace repeats full ownership and these exact staging/scope
+        # checks immediately before deletion, after draining queued exports.
+        gateway.retire_trace(
+            experiment_id,
+            candidate.trace_id,
+            session_id=candidate.session_id,
+            turn_key=candidate.turn_key,
+            expected_metadata=expected,
+        )
+        if gateway.trace_exists(candidate.trace_id):
+            raise ItemImportError("trace_retirement_failed", "an exact staged cleanup remains visible")
+        confirmed[candidate.trace_id] = candidate.session_id
 
 
 def _apply_empty_session(
@@ -1661,16 +1742,7 @@ def _apply_empty_session(
                 _finish_ready(journal, states["ready_to_retire"], gateway, plan.confirmed_retirements)
             else:
                 prepared = states["prepared"]
-                for candidate in candidates:
-                    tags = gateway.trace_info(candidate.trace_id).tags
-                    if (
-                        tags.get("mlflow_import.attempt_id") == prepared["attempt_id"]
-                        and tags.get("mlflow_import.attempt_state") == "staged"
-                    ):
-                        if candidate.trace_id not in prepared["prior_ids"]:
-                            gateway.retire_trace(
-                                experiment_id, candidate.trace_id, session_id=session_id, turn_key=candidate.turn_key
-                            )
+                _abort_staged_attempt(gateway, experiment_id, prepared, plan.confirmed_retirements)
                 journal.publish("aborted", prepared)
         if dependencies.conflict_policy != "overwrite":
             plan.results.extend(
@@ -2676,6 +2748,24 @@ def _rollback_after_replacement(
 # ---------------------------------------------------------------------------
 
 
+def _bind_physical_turn_map(request: TraceCreateRequest) -> TraceCreateRequest:
+    """Allocate one V2 map location without changing logical source identity.
+
+    Maps contain generated trace/span IDs, so distinct physical creates cannot
+    publish to the same immutable key. The copied request stays bound throughout
+    verification, upload retries and rollback; legacy artifact placement remains
+    deterministic.
+    """
+    if not request.artifact_relative_path.startswith("mlflow-import/v2/"):
+        return request
+    path = request.artifact_relative_path.removesuffix(".json") + f"-create-{uuid.uuid4().hex}.json"
+    return replace(
+        request,
+        artifact_relative_path=path,
+        root_tags={**request.root_tags, ARTIFACT_PATH_TAG: path, "mlflow_import.turn_map": path},
+    )
+
+
 def _create_with_ambiguous_recovery(
     plan: ReconciliationPlan,
     gateway: MlflowGateway,
@@ -2701,6 +2791,7 @@ def _create_with_ambiguous_recovery(
     success.
     """
     assert work.request is not None
+    logical_request = work.request
     attempts = 0
     discovered_ids: list[str] = []
 
@@ -2717,6 +2808,9 @@ def _create_with_ambiguous_recovery(
     while True:
         attempts += 1
         try:
+            # Each gateway invocation can generate different physical IDs. Derive
+            # from the logical request, never from a previous iteration's suffix.
+            work.request = _bind_physical_turn_map(logical_request)
             return gateway.create_trace(work.request), None
         except PartialTraceCreateError as error:
             cleanup = _bounded_retire(

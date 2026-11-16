@@ -172,6 +172,7 @@ mlflow-import --experiment-name NAME [options]
 | `--min-user-turns N` | Select sessions with strictly more than `N` logical user turns. Omitted = no restriction. |
 | `--redact` | Mask secrets and user identity in session/trace values, metadata, errors, and artifacts, including native MLflow user fields. Without it, permitted source content and available user metadata are uploaded verbatim; use it for shared or production tracking servers. |
 | `--dry-run` | Validate, filter, and plan without mutating anything in MLflow. |
+| `--timeout-seconds SECONDS` | Finite positive invocation wall-clock budget, including discovery, preflight, recovery, and writing (default: `600`; fractional seconds accepted). |
 | `--output human\|json` | Result format (default: `human`). |
 | `--log-level DEBUG\|INFO\|WARNING\|ERROR` | Log verbosity (default: `INFO`). `DEBUG` prints live phase/count progress to stderr; the final result remains on stdout. |
 
@@ -181,6 +182,18 @@ copies, including `mlflow.trace.user` and any populated `mlflow.user` field.
 Missing user values stay absent. The conversation role `user` and the identifiers
 needed for session/turn reconciliation remain intact. The harness-valued `source`
 is the same in either privacy mode.
+
+The timeout is shared across the entire invocation. Separate shared limits of
+64 retries and 1,000,000 operations still apply. For a larger workload, explicitly
+allow 30 minutes while keeping the same SessionsAI import command:
+
+```bash
+mlflow-import --experiment-name SessionsAI --timeout-seconds 1800
+```
+
+Add `--log-level DEBUG` for phase/count progress on stderr. The default budget
+remains 600 seconds; it is not automatically raised for larger selections. See
+[import operations](docs/operations.md) for budget and recovery details.
 
 Selection semantics worth knowing before your first run:
 
