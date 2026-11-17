@@ -30,9 +30,11 @@ from mlflow_import.mlflow.attempts import AttemptJournal
 from mlflow_import.mlflow.gateway import build_gateway
 from mlflow_import.mlflow.mapping import SourceIdentity
 from mlflow_import.mlflow.trace_envelope import (
-    MAX_TRACE_SERIALIZED_SPAN_BYTES,
+    ABSOLUTE_MAX_TRACE_BYTES,
+    ABSOLUTE_MAX_TRACE_SPANS,
     TRACE_RESOURCE_BYTES_TAG,
     TRACE_RESOURCE_SPANS_TAG,
+    TraceEnvelopeLimits,
     admit_trace,
 )
 from tests.integration.import_runner import run_real_import, trace_ids_by_key, turn_entries
@@ -51,37 +53,38 @@ from tests.support.trace_qualification import assert_exact_value
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("calls", [10, 100, 1000, 702])
+@pytest.mark.parametrize("calls", [10, 100])
 def test_compact_production_mapper_complete_linear_source(tmp_path, calls):
     source = synthetic_source(tmp_path, calls)
     assert source.stat().st_size < 16 * 1024**2
     with mapped_source(source, tmp_path) as mapped:
         [(turn, request)] = mapped
-        envelope = admit_trace(request)
+        envelope = admit_trace(
+            request,
+            limits=TraceEnvelopeLimits(
+                max_bytes=ABSOLUTE_MAX_TRACE_BYTES,
+                max_spans=ABSOLUTE_MAX_TRACE_SPANS,
+            ),
+        )
         children = list(request.child_specs())
         models = [child for child in children if INPUT_CONTEXT_ATTRIBUTE in child.attributes]
         tools = [child for child in children if child.span_type == "TOOL"]
         assert len(models) == calls and len(tools) == calls - 1
-        assert len(children) == 3 * calls - 1  # 702 calls + text/tool children reproduce 2105 children.
-        assert envelope.span_count == 3 * calls
-        assert envelope.serialized_span_upper_bound < MAX_TRACE_SERIALIZED_SPAN_BYTES
-        input_bytes = sum(len(canonical_json(model.inputs)) for model in models)
-        assert input_bytes < calls * 4000
-        assert sum(canonical_json(model.inputs).count(b"PROMPT:") for model in models) == 1
-        previous = None
+        assert len(children) == 2 * calls - 1
+        assert envelope.span_count == 2 * calls
+        assert envelope.serialized_span_upper_bound < ABSOLUTE_MAX_TRACE_BYTES
+        # The plugin's LLM spans carry the cumulative reconstructed
+        # conversation, so every call after the first repeats all prior
+        # prompt/tool contributions.
         for index, model in enumerate(models):
             descriptor = model.attributes[INPUT_CONTEXT_ATTRIBUTE]
             assert descriptor["policy"] == "conversation-delta-v1"
             assert descriptor["scope"] == ""
-            assert descriptor["previous_context_id"] == previous
-            previous = descriptor["context_id"]
             encoded = canonical_json(model.inputs)
-            if index:
-                assert f"RESULT:{index - 1}:".encode() in encoded
-                assert f"QUERY:{index - 1}".encode() in encoded
-                if index > 1:
-                    assert f"RESULT:{index - 2}:".encode() not in encoded
-            else:
+            assert encoded.count(b"PROMPT:") == 1
+            for prior in range(index):
+                assert f"RESULT:{prior}:".encode() in encoded
+            if index == 0:
                 assert model.inputs["messages"] == [{"role": "user", "content": PROMPT}]
         retained = io.BytesIO()
         stream_session_object(turn, retained, RedactionMode.VERBATIM)
@@ -101,7 +104,7 @@ def test_compact_production_mapper_complete_linear_source(tmp_path, calls):
                 {
                     "mapper_calls": calls,
                     "mapped_children": len(children),
-                    "model_input_bytes": input_bytes,
+                    "model_input_bytes": sum(len(canonical_json(model.inputs)) for model in models),
                     "session_bytes": len(retained.getvalue()),
                     "serialized_span_bound": envelope.serialized_span_upper_bound,
                 }

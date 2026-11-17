@@ -1017,9 +1017,17 @@ def _upload_bundle(
         activity = project_activity(replay)
         with temporary_artifact_file(staging) as (local, handle):
             ownership = decode_ownership(created.verified_tags, created.verified_metadata)
+            from mlflow_import.identity import harness_name
+
+            children = iter_activity_specs(activity, replay)
+            if harness_name(replay.session_header) == "opencode":
+                # The OpenCode plugin projection emits fewer children than the
+                # shared activity graph (no part/step/lifecycle spans); only
+                # bind the identities the request actually created.
+                children = (child for child in children if child.source_key in created.span_ids_by_source)
             value = build_turn_map(
                 replay,
-                children=iter_activity_specs(activity, replay),
+                children=children,
                 accounting=activity.provenance,
                 ownership=ownership,
                 trace_id=created.trace_id,

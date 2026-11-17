@@ -19,6 +19,11 @@ from mlflow_import.errors import ItemImportError
 from mlflow_import.mlflow.capabilities import PINNED_MAX_INLINE_PAYLOAD_BYTES, CapabilityRequest
 from mlflow_import.mlflow.gateway import MlflowGateway, TraceChildRequest, TraceCreateRequest
 from mlflow_import.mlflow.mapping import _shared_child_specs
+from mlflow_import.mlflow.trace_envelope import (
+    ABSOLUTE_MAX_TRACE_BYTES,
+    ABSOLUTE_MAX_TRACE_SPANS,
+    TraceEnvelopeLimits,
+)
 from tests.integration import server as server_module
 from tests.integration.mlflow_profile import MAX_INLINE_PAYLOAD_BYTES
 from tests.integration.server import live_mlflow_server, unique_experiment_name
@@ -185,7 +190,13 @@ def _qualify(server, monkeypatch, size, *, structured):
         return send(session, request, **kwargs)
 
     monkeypatch.setattr(requests.Session, "send", localhost_only)
-    gateway = MlflowGateway(server.client)
+    gateway = MlflowGateway(
+        server.client,
+        trace_limits=TraceEnvelopeLimits(
+            max_bytes=ABSOLUTE_MAX_TRACE_BYTES,
+            max_spans=ABSOLUTE_MAX_TRACE_SPANS,
+        ),
+    )
     report = gateway.probe(CapabilityRequest())
     assert report.is_compatible
     limit = report.max_inline_payload_bytes

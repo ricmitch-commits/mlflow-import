@@ -273,12 +273,25 @@ def validate_input_contexts(
         context_sources.add(source_key)
         context_spans.add(span_id)
     accounting = mapvalue.get("accounting")
-    return (
-        isinstance(accounting, Mapping)
-        and isinstance(accounting.get("invocations"), Mapping)
-        and invocations == set(accounting["invocations"])
-        and (actual_contexts is None or context_spans == actual_contexts.keys())
-    )
+    if (
+        not isinstance(accounting, Mapping)
+        or not isinstance(accounting.get("invocations"), Mapping)
+        or (actual_contexts is not None and context_spans != actual_contexts.keys())
+    ):
+        return False
+    required = set(accounting["invocations"])
+    aggregated = {
+        child
+        for observation in accounting["invocations"].values()
+        if isinstance(observation, Mapping)
+        for child in observation.get("aggregate_children", ())
+        if isinstance(child, str)
+    }
+    # A projection may represent an aggregate invocation with its parent span
+    # instead of a separate child span (the OpenCode plugin does not emit the
+    # importer's step-rollup spans). Non-aggregate invocations still require
+    # their own bound context.
+    return required - aggregated <= invocations <= required
 
 
 def _actual_span_contexts(

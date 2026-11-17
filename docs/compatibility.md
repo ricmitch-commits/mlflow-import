@@ -9,10 +9,13 @@
 ### Aggregate trace admission and metadata-first reads
 
 `mlflow.trace_envelope` admits at most **64 MiB of serialized
-span upper bound** and **4096 spans including the root**, independently of
-the existing 8 MiB per-value policy. The local PostgreSQL qualification below
-supports these aggregate constants for its tested shapes; a version match alone
-is not that qualification. These are importer limits, not arbitrary proxy allowances.
+span upper bound** and **4096 spans including the root** by default,
+independently of the existing 8 MiB per-value policy. `--max-trace-bytes` and
+`--max-trace-spans` can raise those admission limits up to absolute caps of
+2 GiB and 32,768 spans. The local PostgreSQL qualification below supports only
+the default aggregate constants for its tested shapes; a version match alone
+is not that qualification, and raised limits require separate capacity
+validation. These are importer limits, not arbitrary proxy allowances.
 The counter derives JSON escape expansion (including historical JSON-looking
 strings' extra layer), protobuf field framing, IDs and fixed SDK fields. It
 counts strings in small chunks, rejects non-finite/unsupported values and deep

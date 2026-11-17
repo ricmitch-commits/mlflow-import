@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from mlflow_import.mlflow.reconciliation import (
     CandidateContract,
     OwnedTraceCandidate,
 )
+from mlflow_import.storage import Store, disk_collections
 from tests.support.fake_gateway import (
     FakeLiveSpan,
     FakeMlflowClient,
@@ -61,6 +63,32 @@ def _checked_gateway(client: FakeMlflowClient, *, dry_run: bool = False, search_
 
 def test_production_builder_does_not_expose_version_transport() -> None:
     assert "version_transport" not in inspect.signature(build_gateway).parameters
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_session_cache_scope_releases_payload_and_preserves_invocation_state(fake_mlflow_client, fail):
+    gateway = _checked_gateway(fake_mlflow_client)
+    authorization = gateway._preflight
+    original = gateway._artifact_checks
+    foreign = gateway._foreign_conflicts
+    store = Store()
+    try:
+        with disk_collections(store):
+            with pytest.raises(RuntimeError) if fail else nullcontext():
+                with gateway.session_resources():
+                    assert gateway._artifact_checks.store is store
+                    assert gateway._session_objects.store is store
+                    assert gateway._trace_experiments.store is store
+                    assert gateway.confirmed_retirements.store is store
+                    gateway._candidate_payload = object()
+                    if fail:
+                        raise RuntimeError("session failed")
+        assert gateway._candidate_payload is None
+        assert gateway._artifact_checks is original
+        assert gateway._foreign_conflicts is foreign
+        assert gateway._preflight is authorization
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("field", ["start_time_ns", "end_time_ns", "child_start", "child_end"])

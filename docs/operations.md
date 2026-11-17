@@ -33,6 +33,20 @@ no target writes or writer-lock acquisition. Sources are read-only; no credentia
 tables or excluded access/share columns are exported. SQLite input stays in one
 read transaction; selected file streams receive stability checks.
 
+Imports use a discover-first, session-at-a-time lifecycle for both explicit
+sources and default roots. The complete filtered selection and read-only
+validation finish before writes. The immutable source snapshot and sanitized
+schedule stay on disk; execution then finishes one selected session before
+starting the next, including recovery, trace verification and artifact uploads.
+Each session has a disposable planning store, replay index, mapping context and
+gateway verification/write caches. Its sanitized outcomes enter the separately
+owned report before its execution scope exits and its planning store is closed
+and removed, including after an item failure. Selected zero-turn sessions still
+perform tombstone reconciliation. The writer lock and timeout cover the whole
+invocation. Releasing session objects makes their memory reusable by Python;
+the process's resident memory need not immediately decrease, and peak memory
+still depends on the largest active trace and SDK buffers.
+
 Source discovery evaluates attributable header metadata before freezing bodies.
 Claude mode/cwd preludes and fork-context sidecars, and Gemini's qualified
 persisted project-registry lookup, are described in
@@ -70,13 +84,26 @@ imports as independent sessions when they share the same qualified identity.
 ## Trace resource preflight
 
 Both dry-run and normal mode project and admit every selected trace before
-target mutation, including recovery. The provisional aggregate envelope is
+target mutation, including recovery. The default aggregate envelope is
 64 MiB of conservatively bounded serialized spans, 4096 total spans (root
 included), and 2 MiB of control metadata. Half the control envelope is reserved
 for bounded late attempt/instance/map/session decorations; the actual request
 is checked again at creation. Oversized traces fail with
 `trace_resource_envelope_exceeded`; source values are not silently truncated
-to make the aggregate fit.
+to make the aggregate fit. The safe error names the offending session and turn
+(`session <id> turn <index> (<turn_key>): ...`) and attaches the measured span
+count/bytes when that measurement stays within its bounded diagnostic ceiling
+(currently 2 GiB and 32,768 spans). The measurement consumes the request
+without retaining its admitted child DTOs. With `--log-level DEBUG`, each
+admitted turn's byte, span and control counts are also written to stderr.
+
+`--max-trace-bytes` and `--max-trace-spans` explicitly raise the per-trace
+admission limits up to absolute caps of 2 GiB and 32,768 spans; defaults stay
+64 MiB and 4096. A trace admitted under raised limits stores its actual
+size/count proof and remains readable by later default invocations within the
+absolute caps. Raising the limits is an explicit capacity decision: the
+qualified server profile covers only the default envelope, so large traces can
+exhaust importer, MLflow or PostgreSQL memory.
 
 `trace_resource_profile_unverified` means a stored trace lacks the new writer's
 recognized creation-time resource proof. Full payload retrieval, unchanged

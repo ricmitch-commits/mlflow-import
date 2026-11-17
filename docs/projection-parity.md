@@ -88,6 +88,17 @@ and cache read `76928` remain in the retained accounting. Native cache and all
 cost columns are NULL even for recorded cost zero. The root span is
 `opencode_conversation`; native trace name is `opencode` via the `mlflow.traceName`
 tag, and absent client request ID is NULL.
+
+OpenCode child spans also reproduce the plugin's exact tree and payload shapes:
+flat `llm_call` (`LLM`) and `tool_<tool>` (`TOOL`) children of
+`opencode_conversation`, no synthetic reasoning/text/step/patch children, no
+lifecycle events, and no nesting under `llm_call`. LLM inputs carry the
+plugin's cumulative reconstructed conversation; LLM outputs use the
+plugin's assistant-message shape; tool inputs/outputs/attributes and measured
+tool intervals match the plugin. Per-span source/accounting provenance remains
+on the trace root and canonical artifacts. A turn above the plugin's
+1000-message fetch window uses the importer's bounded linear activity
+projection because the plugin has no reference behavior for that size.
 Native session and parent IDs are bare, while qualified source identity stays
 immutable in tags/artifacts. Previews select the last nonempty user/assistant
 text, newline-join parts (including synthetic user text), omit whitespace-only

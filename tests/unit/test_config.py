@@ -156,6 +156,8 @@ def test_import_config_fields_match_the_contract() -> None:
         "output",
         "log_level",
         "timeout_seconds",
+        "trace_max_bytes",
+        "trace_max_spans",
     ]
 
 
@@ -176,6 +178,51 @@ def test_parse_config_applies_defaults(restrictive_tmp_path: Path, monkeypatch: 
     assert config.dry_run is False
     assert config.output == "human"
     assert config.log_level == "INFO"
+    assert config.trace_max_bytes == 64 * 1024 * 1024
+    assert config.trace_max_spans == 4096
+
+
+def test_parse_config_accepts_explicit_trace_limits(
+    restrictive_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(restrictive_tmp_path))
+
+    config = parse_config(
+        [
+            "import",
+            "--experiment-name",
+            "exp",
+            "--max-trace-bytes",
+            str(96 * 1024 * 1024),
+            "--max-trace-spans",
+            "8192",
+        ]
+    )
+
+    assert config.trace_max_bytes == 96 * 1024 * 1024
+    assert config.trace_max_spans == 8192
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--max-trace-bytes", "0"],
+        ["--max-trace-bytes", "invalid"],
+        ["--max-trace-bytes", str(2 * 1024 * 1024 * 1024 + 1)],
+        ["--max-trace-spans", "0"],
+        ["--max-trace-spans", "invalid"],
+        ["--max-trace-spans", "32769"],
+    ],
+)
+def test_parse_config_rejects_invalid_trace_limits(
+    restrictive_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(restrictive_tmp_path))
+
+    with pytest.raises(ConfigurationError) as error:
+        parse_config(["import", "--experiment-name", "exp", *arguments])
+
+    assert error.value.code == "invalid_trace_envelope_limit"
 
 
 def test_parse_config_discovers_claude_session_source(

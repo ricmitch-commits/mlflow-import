@@ -344,10 +344,10 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
                 assert span.attributes.get(key) == value, (child.source_key, key)
             assert span.span_id in span_ids
 
-    # Structural spot checks over the richest turn (turn 1): the model-call
-    # result is an LLM span under the root, and its reasoning/tool/text
-    # parts nest UNDER the model span — not flat under the root. (The
-    # root-input prompt's own text part stays a child of the root.)
+    # Structural spot checks over the richest turn (turn 1): the
+    # @mlflow/opencode plugin vocabulary is flat under the root. Only the
+    # model call and tool call become spans; reasoning/text parts stay in
+    # the artifact.
     first = expected.requests[0]
     trace_id = imported.trace_ids_by_key[first.root_tags["opencode.turn_key"]]
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
@@ -357,24 +357,19 @@ def test_nested_model_tool_content_spans_and_events(imported: ImportedSession, e
     }
     model_span = spans_by_source["session_message:msg-synthetic-a1"]
     tool_span = spans_by_source["session_message:msg-synthetic-a1#content-1"]
-    reasoning = spans_by_source["session_message:msg-synthetic-a1#content-0"]
-    answer_text = spans_by_source["session_message:msg-synthetic-a1#content-2"]
-    prompt_text = spans_by_source["session_message:msg-synthetic-u1#content-0"]
     assert model_span.name == "llm_call"
     assert model_span.span_type == "LLM"
     assert model_span.parent_id == root.span_id
-    assert tool_span.name == "bash"
+    assert model_span.attributes["model"] == "synthetic-model"
+    assert model_span.attributes["provider"] == "synthetic-provider"
+    assert tool_span.name == "tool_bash"
     assert tool_span.span_type == "TOOL"
-    assert tool_span.parent_id == model_span.span_id
+    assert tool_span.parent_id == root.span_id
     assert tool_span.inputs == {"command": "ls synthetic"}
-    assert tool_span.outputs == "synthetic file list"
-    assert reasoning.name == "reasoning part"
-    assert reasoning.span_type == "event"
-    assert reasoning.parent_id == model_span.span_id
-    assert answer_text.name == "text part"
-    assert answer_text.span_type == "UNKNOWN"
-    assert answer_text.parent_id == model_span.span_id
-    assert prompt_text.parent_id == root.span_id
+    assert tool_span.outputs == {"result": "synthetic file list", "title": ""}
+    assert "session_message:msg-synthetic-a1#content-0" not in spans_by_source
+    assert "session_message:msg-synthetic-a1#content-2" not in spans_by_source
+    assert "session_message:msg-synthetic-u1#content-0" not in spans_by_source
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +436,8 @@ def test_token_and_cost_metadata(imported: ImportedSession, expected: ExpectedMa
         "input_tokens": 120,
         "output_tokens": 80,
         "total_tokens": 212,
-        "cache_read_input_tokens": 40,
-        "cache_creation_input_tokens": 4,
+        "cache_read_tokens": 40,
+        "cache_write_tokens": 4,
     }
     assert model_span.attributes["mlflow.llm.cost"] == {"total_cost": 0.0025}
     assert model_span.attributes["mlflow.llm.model"] == "synthetic-model"
@@ -451,10 +446,12 @@ def test_token_and_cost_metadata(imported: ImportedSession, expected: ExpectedMa
     fifth = expected.requests[4]
     trace_id = imported.trace_ids_by_key[fifth.root_tags["opencode.turn_key"]]
     trace = imported.client.get_trace(trace_id, display=False, flush=True)
-    agent_span = next(span for span in trace.data.spans if span.parent_id is not None and span.span_type == "AGENT")
-    assert agent_span.span_type == "AGENT"
-    assert "opencode.tokens.input" not in agent_span.attributes
-    assert "opencode.cost" not in agent_span.attributes
+    plain_span = next(span for span in trace.data.spans if span.parent_id is not None and span.span_type == "LLM")
+    assert plain_span.attributes["model"] == "unknown"
+    assert plain_span.attributes["provider"] == "unknown"
+    assert "mlflow.chat.tokenUsage" not in plain_span.attributes
+    assert "opencode.tokens.input" not in plain_span.attributes
+    assert "opencode.cost" not in plain_span.attributes
 
 
 # ---------------------------------------------------------------------------

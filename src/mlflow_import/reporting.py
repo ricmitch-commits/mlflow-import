@@ -546,11 +546,16 @@ def iter_human(result: ImportResult) -> Iterator[str]:
     if not isinstance(sessions, list):
         sessions = []
     for session in sessions:
+        session_id = session.get("session_id")
         if session.get("error") is not None:
-            yield f"session error ({session['error']['code']}): the session could not be completed"
+            yield f"session error ({session['error']['code']}) for {session_id}: the session could not be completed"
         for turn in session.get("turns", []):
-            if turn.get("error_code"):
-                yield f"item error ({turn['error_code']}): the item could not be completed"
+            if not turn.get("error_code"):
+                continue
+            turn_key = turn.get("turn_key")
+            turn_index = turn.get("turn_index")
+            location = f"session {session_id} turn {turn_index} ({turn_key})"
+            yield f"item error ({turn['error_code']}) for {location}: the item could not be completed"
 
 
 def _section(report: Mapping[str, object], name: str) -> Mapping[str, object]:

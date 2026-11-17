@@ -11,15 +11,20 @@ import pytest
 from mlflow_import.errors import ItemImportError
 from mlflow_import.mlflow.capabilities import CapabilityRequest
 from mlflow_import.mlflow.gateway import MlflowGateway, PublicTraceApi
+from mlflow_import.mlflow.mapping import EventSpec
 from mlflow_import.mlflow.reconciliation import CandidateContract, OwnedTraceCandidate
 from mlflow_import.mlflow.trace_envelope import (
     MAX_TRACE_SERIALIZED_SPAN_BYTES,
     MAX_TRACE_SPANS,
     PROOF_TAG_KEYS,
     TRACE_RESOURCE_BYTES_TAG,
+    TRACE_RESOURCE_PROFILE,
+    TRACE_RESOURCE_PROFILE_TAG,
     TRACE_RESOURCE_SPANS_TAG,
     SpanBudget,
+    TraceEnvelopeLimits,
     admit_trace,
+    measure_trace,
     require_trace_proof,
 )
 from tests.support.fake_gateway import child_spec, fake_version_transport, trace_spec
@@ -27,14 +32,80 @@ from tests.support.fake_gateway import child_spec, fake_version_transport, trace
 pytestmark = pytest.mark.unit
 
 
-def checked_gateway(client, *, real_api=False):
+def checked_gateway(client, *, real_api=False, trace_limits=None):
     gateway = MlflowGateway(
         client,
         trace_api=PublicTraceApi() if real_api else client.trace_api,
         version_transport=fake_version_transport,
+        trace_limits=trace_limits,
     )
     assert gateway.probe(CapabilityRequest()).is_compatible
     return gateway
+
+
+def test_measure_trace_matches_retaining_admission():
+    request = trace_spec(children=[child_spec("c", inputs={"messages": ["x" * 4096]})])
+    envelope = admit_trace(request)
+    measurement = measure_trace(request)
+    assert measurement.serialized_span_upper_bound == envelope.serialized_span_upper_bound
+    assert measurement.span_count == envelope.span_count
+    assert measurement.control_metadata_upper_bound == envelope.control_metadata_upper_bound
+
+
+def test_measure_trace_reports_partial_candidate_byte_diagnostics():
+    request = trace_spec(root_inputs={"payload": "x" * 4096})
+    with pytest.raises(ItemImportError) as error:
+        measure_trace(request, max_bytes=1024)
+    assert error.value.diagnostics["candidate_span_bytes"] > 1024
+    assert "serialized span bytes" in str(error.value)
+
+
+def test_admission_accounts_event_specs_without_span_type_init_field():
+    event = EventSpec(
+        source_key="event",
+        name="event",
+        parent_source_key=None,
+        inputs={"payload": "x"},
+        attributes={"kind": "event"},
+        tags={},
+        start_time_ns=1,
+        outputs=None,
+        status="OK",
+        end_time_ns=2,
+    )
+    envelope = admit_trace(trace_spec(child_specs=lambda: iter([event])))
+    [accounted] = list(envelope.request.child_specs())
+    assert isinstance(accounted, EventSpec)
+    assert accounted.source_key == "event"
+    assert accounted.inputs == {"payload": "x"}
+
+
+def test_span_count_failure_reports_budget_diagnostics():
+    budget = SpanBudget(max_spans=1)
+    budget.account_spec(child_spec("a"))
+    with pytest.raises(ItemImportError) as error:
+        budget.account_spec(child_spec("b"))
+    assert error.value.diagnostics["span_count"] == 1
+    assert error.value.diagnostics["span_limit"] == 1
+    assert "span count" in str(error.value)
+
+
+def test_explicit_limits_raise_span_admission():
+    request = trace_spec(child_specs=lambda: (child_spec(str(index)) for index in range(MAX_TRACE_SPANS)))
+    with pytest.raises(ItemImportError):
+        admit_trace(request)
+    envelope = admit_trace(request, limits=TraceEnvelopeLimits(max_spans=MAX_TRACE_SPANS + 1))
+    assert envelope.span_count == MAX_TRACE_SPANS + 1
+
+
+def test_gateway_uses_configured_trace_limits(fake_mlflow_client):
+    request = trace_spec(children=[child_spec("a"), child_spec("b")])
+    rejected = checked_gateway(fake_mlflow_client, trace_limits=TraceEnvelopeLimits(max_spans=2))
+    with pytest.raises(ItemImportError):
+        rejected.create_trace(request)
+    accepted = checked_gateway(fake_mlflow_client, trace_limits=TraceEnvelopeLimits(max_spans=3))
+    created = accepted.create_trace(request)
+    assert created.trace_id
 
 
 def test_incremental_exact_byte_boundary_and_root_inclusive_count():
@@ -53,6 +124,21 @@ def test_incremental_exact_byte_boundary_and_root_inclusive_count():
     assert envelope.serialized_span_upper_bound <= MAX_TRACE_SERIALIZED_SPAN_BYTES
     with pytest.raises(ItemImportError):
         admit_trace(replace(request, child_specs=lambda: (child_spec(str(i)) for i in range(MAX_TRACE_SPANS))))
+
+
+def test_stored_proof_above_default_envelope_remains_verifiable():
+    info = SimpleNamespace(
+        tags={
+            TRACE_RESOURCE_PROFILE_TAG: TRACE_RESOURCE_PROFILE,
+            TRACE_RESOURCE_BYTES_TAG: str(96 * 1024 * 1024),
+            TRACE_RESOURCE_SPANS_TAG: "5000",
+        },
+        trace_metadata={},
+    )
+    assert require_trace_proof(info) == (96 * 1024 * 1024, 5000)
+    info.tags[TRACE_RESOURCE_SPANS_TAG] = "40000"
+    with pytest.raises(ItemImportError):
+        require_trace_proof(info)
 
 
 def test_old_2105_span_gigabyte_shape_stops_before_full_walk_or_mutation(fake_mlflow_client):

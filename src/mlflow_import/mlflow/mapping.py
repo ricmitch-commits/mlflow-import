@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -108,6 +109,7 @@ from mlflow_import.content.fingerprint import (
 from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
 from mlflow_import.identity import harness_name
 from mlflow_import.mlflow.reconciliation import ARTIFACT_PATH_TAG
+from mlflow_import.mlflow.trace_envelope import MAX_TRACE_SERIALIZED_SPAN_BYTES, MAX_TRACE_SPANS
 from mlflow_import.source.model import SessionHeader, SourceRecord, TurnSummary
 from mlflow_import.source.model_identity import extract_model_identity
 from mlflow_import.source.outcomes import (
@@ -183,6 +185,8 @@ _LLM_SPAN_TYPE = "LLM"
 _AGENT_SPAN_TYPE = "AGENT"
 _TOOL_SPAN_TYPE = "TOOL"
 _CONTENT_SPAN_TYPE = "UNKNOWN"
+_OPENCODE_PLUGIN_MESSAGE_LIMIT = 1000
+"""The live ``@mlflow/opencode`` session snapshot fetch limit."""
 
 _MESSAGE_TABLES = frozenset({"message", "session_message", "jsonl_message"})
 _LIFECYCLE_TABLES = SESSION_EVENT_TABLES - {"todo"}
@@ -222,6 +226,8 @@ class MappingContext:
     experiment_id: str
     source_database_fingerprint: str | None = None
     inline_limit_bytes: int | None = None
+    trace_max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES
+    trace_max_spans: int = MAX_TRACE_SPANS
     logical_turn_count: int | None = None
     source_message_count: int | None = None
     source_part_count: int | None = None
@@ -1189,7 +1195,25 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         start_time_ns=start_ns,
         end_time_ns=end_ns,
         child_specs=(
-            (lambda: _shared_child_specs(turn, activity, inline_limit))
+            (
+                lambda: (
+                    _opencode_plugin_child_specs(
+                        turn,
+                        activity,
+                        inline_limit,
+                        context.trace_max_bytes,
+                        context.trace_max_spans,
+                    )
+                    if harness == "opencode"
+                    else _shared_child_specs(
+                        turn,
+                        activity,
+                        inline_limit,
+                        context.trace_max_bytes,
+                        context.trace_max_spans,
+                    )
+                )
+            )
             if activity is not None
             else (lambda: _iter_child_specs(turn, inline_limit))
         ),
@@ -1359,11 +1383,17 @@ def _claude_preview(value: str) -> str:
     return encoded[: _CLAUDE_PREVIEW_UNITS * 2].decode("utf-16-le", "replace")
 
 
-def _shared_child_specs(turn: ReplayTurn, activity: object, inline_limit: int) -> Iterator[SpanSpec | EventSpec]:
+def _shared_child_specs(
+    turn: ReplayTurn,
+    activity: object,
+    inline_limit: int,
+    max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES,
+    max_spans: int = MAX_TRACE_SPANS,
+) -> Iterator[SpanSpec | EventSpec]:
     from mlflow_import.content.activity import Activity, iter_activity_specs
 
     assert isinstance(activity, Activity)
-    for spec in iter_activity_specs(activity, turn):
+    for spec in iter_activity_specs(activity, turn, max_bytes=max_bytes, max_spans=max_spans):
         if spec.span_type == "LLM" and "mlflow.llm.cost" not in spec.attributes:
             spec = replace(spec, attributes={**spec.attributes, "mlflow.llm.cost": {}})
         if spec.span_type in {"AGENT", "LLM", "TOOL"}:
@@ -1378,14 +1408,396 @@ def _shared_child_specs(turn: ReplayTurn, activity: object, inline_limit: int) -
         yield _bound_child(spec, inline_limit)
 
 
-def _scan_turn(turn: ReplayTurn) -> _TurnScan:
-    """One streaming pass for the timing fallback and the failure signal.
+def _opencode_plugin_child_specs(
+    turn: ReplayTurn,
+    activity: object,
+    inline_limit: int,
+    max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES,
+    max_spans: int = MAX_TRACE_SPANS,
+) -> Iterator[SpanSpec | EventSpec]:
+    """Project one OpenCode turn exactly like the ``@mlflow/opencode`` plugin.
 
-    Collects source-derived start/end instants from turn records and timed
-    session events, plus whether the turn's root result carries an explicit
-    error part (the explicit-failure signal); records are consumed one at a
-    time and released.
+    The live plugin emits a flat tree: one ``llm_call`` LLM span and one
+    ``tool_<name>`` TOOL span per assistant message/tool part, both
+    children of ``opencode_conversation``. Text, reasoning, step-marker,
+    patch and lifecycle records stay in the artifact instead of becoming
+    extra spans. LLM inputs carry the plugin's cumulative reconstructed
+    conversation (not the importer's linear delta); LLM/tool payloads,
+    attributes, names, and timing follow the plugin as well. Richer
+    accounting remains on the trace root and in the canonical artifacts.
     """
+    from mlflow_import.content.activity import Activity, iter_activity_specs
+
+    assert isinstance(activity, Activity)
+    # The live plugin fetches at most 1000 messages per session snapshot. Larger
+    # turns have no plugin reference; keep the importer's bounded linear
+    # projection (and its memory envelope) instead of synthesizing O(n²)
+    # cumulative histories the plugin itself would never process.
+    if sum(1 for record in turn.iter_records() if _is_message_container(record)) > _OPENCODE_PLUGIN_MESSAGE_LIMIT:
+        yield from _shared_child_specs(turn, activity, inline_limit, max_bytes, max_spans)
+        return
+    base_specs: dict[str, SpanSpec] = {}
+    for spec in iter_activity_specs(activity, turn, max_bytes=max_bytes, max_spans=max_spans):
+        if isinstance(spec, SpanSpec):
+            base_specs.setdefault(spec.source_key, spec)
+
+    for spec in _opencode_plugin_specs(turn, base_specs, inline_limit):
+        if spec.span_type in {"AGENT", "LLM", "TOOL"}:
+            from mlflow_import.errors import ItemImportError
+
+            if any(
+                value is not None and len(canonical_json(value)) > inline_limit for value in (spec.inputs, spec.outputs)
+            ):
+                raise ItemImportError(
+                    "payload_too_large", "a complete structured activity value exceeds the qualified envelope"
+                )
+        yield cast(SpanSpec, _bound_child(spec, inline_limit))
+
+
+def _opencode_plugin_specs(
+    turn: ReplayTurn,
+    base_specs: Mapping[str, SpanSpec],
+    inline_limit: int,
+) -> Iterator[SpanSpec]:
+    """Yield the plugin-shaped LLM/TOOL spans for one OpenCode turn."""
+    messages = _opencode_messages(turn)
+    if not messages:
+        return
+    last_user = _opencode_last_user_index(messages)
+    start_index = 0 if last_user is None else last_user + 1
+    for index in range(start_index, len(messages)):
+        record, parts = messages[index]
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        if _opencode_role(decoded, record) != "assistant":
+            continue
+        text_parts = [(value, child) for value, child in parts if _opencode_part_type(value) == "text"]
+        tool_parts = [(value, child) for value, child in parts if _opencode_part_type(value) == "tool"]
+        reasoning_parts = [(value, child) for value, child in parts if _opencode_part_type(value) == "reasoning"]
+        if not (text_parts or tool_parts or reasoning_parts):
+            continue
+
+        key = SourceIdentity.of(record).key
+        base = base_specs.get(key)
+        model_id, provider_id, model_identity = _opencode_model(decoded)
+        attributes: dict[str, object] = {
+            "model": model_id,
+            "provider": provider_id,
+            "opencode.model": model_identity,
+        }
+        usage = _opencode_token_usage(decoded.get("tokens"))
+        if usage is not None:
+            attributes["mlflow.chat.tokenUsage"] = usage
+        if base is not None:
+            from mlflow_import.content.input_context import INPUT_CONTEXT_ATTRIBUTE
+
+            for name in (
+                "mlflow_import.source_key",
+                "mlflow_import.invocation_id",
+                "mlflow_import.source_keys",
+                "mlflow_import.accounting",
+                "mlflow.llm.cost",
+                "mlflow.llm.model",
+                "mlflow.llm.provider",
+                INPUT_CONTEXT_ATTRIBUTE,
+            ):
+                if name in base.attributes:
+                    attributes[name] = base.attributes[name]
+
+        text = "\n".join(str(value.get("text") or "") for value, _ in text_parts)
+        reasoning = (
+            "\n\n".join(str(value.get("text") or "") for value, _ in reasoning_parts) if reasoning_parts else None
+        )
+        message: dict[str, object] = {"role": "assistant", "content": text or None}
+        if reasoning:
+            message["reasoning"] = reasoning
+        if tool_parts:
+            message["tool_calls"] = [
+                {
+                    "id": str(value.get("callID") or value.get("call_id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(value.get("tool") or "unknown"),
+                        "arguments": _opencode_tool_arguments(value, child),
+                    },
+                }
+                for value, child in tool_parts
+            ]
+        time = decoded.get("time")
+        time_map = time if isinstance(time, Mapping) else {}
+        start_ns = _js_timestamp_ns(time_map.get("created"))
+        if start_ns is None:
+            start_ns = record.timestamp.nanoseconds if record.timestamp is not None else None
+        end_ns = _js_timestamp_ns(time_map.get("completed"))
+        if end_ns is None:
+            end_ns = record.completion_timestamp.nanoseconds if record.completion_timestamp is not None else start_ns
+        yield SpanSpec(
+            source_key=key,
+            name="llm_call",
+            span_type=_LLM_SPAN_TYPE,
+            parent_source_key=None,
+            inputs={
+                "model": f"{provider_id}/{model_id}",
+                "messages": _opencode_conversation(messages, index),
+            },
+            attributes=MappingProxyType(attributes),
+            tags={},
+            start_time_ns=start_ns,
+            outputs={"choices": [{"message": message}]},
+            status="OK",
+            end_time_ns=end_ns,
+        )
+
+        for ordinal, (value, child) in enumerate(tool_parts):
+            decoded_tool = value
+            state = decoded_tool.get("state")
+            state_map = state if isinstance(state, Mapping) else {}
+            tool_name = _optional_str(decoded_tool.get("tool")) or "unknown"
+            call_id = _optional_str(decoded_tool.get("callID")) or _optional_str(decoded_tool.get("call_id")) or ""
+            status = _optional_str(state_map.get("status")) or "unknown"
+            tool_key = SourceIdentity.of(child).key if child is not None else f"{key}:tool:{ordinal}"
+            tool_attributes: dict[str, object] = {
+                "tool_name": tool_name,
+                "tool_id": call_id,
+                "status": status,
+            }
+            tool_base = base_specs.get(tool_key)
+            if tool_base is not None and "mlflow_import.source_key" in tool_base.attributes:
+                tool_attributes["mlflow_import.source_key"] = tool_base.attributes["mlflow_import.source_key"]
+            outputs: object | None = None
+            if status == "completed":
+                outputs = {
+                    "result": state_map.get("output") or "",
+                    "title": state_map.get("title") or "",
+                }
+            elif status == "error":
+                outputs = {"error": state_map.get("error") or "Unknown error"}
+            tool_start, tool_end = _opencode_tool_times(state_map, child or record)
+            yield SpanSpec(
+                source_key=tool_key,
+                name=f"tool_{tool_name}",
+                span_type=_TOOL_SPAN_TYPE,
+                parent_source_key=None,
+                inputs=_opencode_tool_input(value, child) or {},
+                attributes=MappingProxyType(tool_attributes),
+                tags={},
+                start_time_ns=tool_start,
+                outputs=outputs,
+                status="OK",
+                end_time_ns=max(tool_start, tool_end) if tool_start is not None and tool_end is not None else tool_end,
+            )
+
+
+def _opencode_messages(
+    turn: ReplayTurn,
+) -> list[tuple[SourceRecord, list[tuple[Mapping[str, object], SourceRecord | None]]]]:
+    """Group turn records into message containers and their ordered parts."""
+    records = tuple(turn.iter_records())
+    parents_with_parts = {
+        record.parent_source_id
+        for record in records
+        if record.parent_source_id is not None
+        and (record.source_table == "part" or record.derived_child_ordinal is not None)
+    }
+    messages: list[tuple[SourceRecord, list[tuple[Mapping[str, object], SourceRecord | None]]]] = []
+    for record in records:
+        if _is_message_container(record):
+            decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+            content = decoded.get("content", decoded.get("parts"))
+            parts: list[tuple[Mapping[str, object], SourceRecord | None]] = []
+            if record.source_id not in parents_with_parts:
+                if isinstance(content, str):
+                    parts.append(({"type": "text", "text": content}, None))
+                elif isinstance(content, list):
+                    parts.extend(
+                        (item if isinstance(item, Mapping) else {"type": "text", "text": item}, None)
+                        for item in content
+                    )
+                elif isinstance(decoded.get("text"), str):
+                    parts.append(({"type": "text", "text": decoded["text"]}, None))
+            messages.append((record, parts))
+            continue
+        if record.source_table != "part" and record.derived_child_ordinal is None:
+            continue
+        parent_id = record.parent_source_id
+        if parent_id is None:
+            continue
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        for index in range(len(messages) - 1, -1, -1):
+            message, parts = messages[index]
+            if message.source_id == parent_id:
+                parts.append((decoded, record))
+                break
+    return messages
+
+
+def _opencode_last_user_index(
+    messages: list[tuple[SourceRecord, list[tuple[Mapping[str, object], SourceRecord | None]]]],
+) -> int | None:
+    for index in range(len(messages) - 1, -1, -1):
+        record = messages[index][0]
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        if _opencode_role(decoded, record) == "user":
+            return index
+    return None
+
+
+def _opencode_role(decoded: Mapping[str, object], record: SourceRecord) -> str:
+    role = decoded.get("role")
+    if isinstance(role, str) and role:
+        return role
+    return record.classification or ""
+
+
+def _opencode_part_type(value: Mapping[str, object]) -> str:
+    part_type = value.get("type")
+    return part_type if isinstance(part_type, str) else ""
+
+
+def _opencode_model(decoded: Mapping[str, object]) -> tuple[str, str, str]:
+    model_id = _optional_str(decoded.get("modelID"))
+    provider_id = _optional_str(decoded.get("providerID"))
+    identity = extract_model_identity(decoded)
+    if model_id is None and identity is not None:
+        if "/" in identity:
+            provider_part, _, model_part = identity.partition("/")
+            provider_id = provider_id or provider_part or None
+            model_id = model_part or None
+        else:
+            model_id = identity
+    return model_id or "unknown", provider_id or "unknown", identity or "unknown/unknown"
+
+
+def _opencode_token_usage(tokens: object) -> dict[str, int] | None:
+    if not isinstance(tokens, Mapping):
+        return None
+    input_tokens = tokens.get("input")
+    output_tokens = tokens.get("output")
+    reasoning_tokens = tokens.get("reasoning")
+    input_tokens = input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) else 0
+    output_tokens = output_tokens if isinstance(output_tokens, int) and not isinstance(output_tokens, bool) else 0
+    reasoning_tokens = (
+        reasoning_tokens if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool) else 0
+    )
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens + reasoning_tokens,
+    }
+    cache = tokens.get("cache")
+    if isinstance(cache, Mapping):
+        read = cache.get("read")
+        write = cache.get("write")
+        if isinstance(read, int) and not isinstance(read, bool) and read:
+            usage["cache_read_tokens"] = read
+        if isinstance(write, int) and not isinstance(write, bool) and write:
+            usage["cache_write_tokens"] = write
+    return usage
+
+
+def _opencode_tool_input(value: Mapping[str, object], record: SourceRecord | None) -> object | None:
+    """The source-ordered tool input, preferring raw JSON key order."""
+    if record is not None and record.raw_json:
+        try:
+            raw = json.loads(record.raw_json)
+        except ValueError:
+            raw = None
+        if isinstance(raw, Mapping):
+            state = raw.get("state")
+            if isinstance(state, Mapping) and "input" in state:
+                return cast(object | None, state["input"])
+    state = value.get("state")
+    state_map = state if isinstance(state, Mapping) else {}
+    return cast(object | None, state_map.get("input"))
+
+
+def _opencode_tool_arguments(value: Mapping[str, object], record: SourceRecord | None) -> str:
+    tool_input = _opencode_tool_input(value, record)
+    return json.dumps(
+        {} if tool_input is None else tool_input,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=False,
+    )
+
+
+def _js_timestamp_ns(value: object) -> int | None:
+    """``Math.floor(ms * 1e6)`` in IEEE-754 double precision, like the plugin."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    instant = int(float(value) * 1_000_000)
+    return instant if 0 <= instant < 1 << 64 else None
+
+
+def _opencode_tool_times(state: Mapping[str, object], record: SourceRecord) -> tuple[int | None, int | None]:
+    interval = state.get("time")
+    if isinstance(interval, Mapping):
+        start, end = interval.get("start"), interval.get("end")
+        if (
+            isinstance(start, int)
+            and not isinstance(start, bool)
+            and isinstance(end, int)
+            and not isinstance(end, bool)
+            and end >= start
+        ):
+            return _js_timestamp_ns(start), _js_timestamp_ns(end)
+    start_ns = record.timestamp.nanoseconds if record.timestamp is not None else None
+    end_ns = record.completion_timestamp.nanoseconds if record.completion_timestamp is not None else start_ns
+    return start_ns, end_ns
+
+
+def _opencode_conversation(
+    messages: list[tuple[SourceRecord, list[tuple[Mapping[str, object], SourceRecord | None]]]],
+    end_index: int,
+) -> list[dict[str, object]]:
+    """The plugin's cumulative reconstructed conversation before ``end_index``."""
+    result: list[dict[str, object]] = []
+    for index in range(end_index):
+        record, parts = messages[index]
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        role = _opencode_role(decoded, record)
+        if role == "user":
+            text_parts = [
+                str(value.get("text"))
+                for value, _ in parts
+                if _opencode_part_type(value) == "text" and value.get("text")
+            ]
+            if text_parts:
+                result.append({"role": "user", "content": "\n".join(text_parts)})
+            continue
+        if role != "assistant":
+            continue
+        text_parts = [
+            str(value.get("text")) for value, _ in parts if _opencode_part_type(value) == "text" and value.get("text")
+        ]
+        reasoning_parts = [
+            str(value.get("text"))
+            for value, _ in parts
+            if _opencode_part_type(value) == "reasoning" and value.get("text")
+        ]
+        if text_parts or reasoning_parts:
+            assistant: dict[str, object] = {"role": "assistant", "content": "\n".join(text_parts)}
+            if reasoning_parts:
+                assistant["reasoning"] = "\n\n".join(reasoning_parts)
+            result.append(assistant)
+        for value, _ in parts:
+            if _opencode_part_type(value) != "tool":
+                continue
+            state = value.get("state")
+            state_map = state if isinstance(state, Mapping) else {}
+            if state_map.get("status") != "completed":
+                continue
+            result.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": value.get("callID") or value.get("call_id"),
+                    "content": state_map.get("output") or "",
+                }
+            )
+    return result
+
+
+def _scan_turn(turn: ReplayTurn) -> _TurnScan:
+    """One streaming pass for the timing fallback and the failure signal."""
     root_identity = turn.summary.root_result_source_id
     scan = _TurnScan()
 

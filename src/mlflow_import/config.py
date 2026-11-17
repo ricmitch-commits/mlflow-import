@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import cast
 
 from mlflow_import.errors import ConfigurationError
+from mlflow_import.mlflow.trace_envelope import (
+    ABSOLUTE_MAX_TRACE_BYTES,
+    ABSOLUTE_MAX_TRACE_SPANS,
+    MAX_TRACE_SERIALIZED_SPAN_BYTES,
+    MAX_TRACE_SPANS,
+)
 from mlflow_import.source.model import iso_fractional_ns
 from mlflow_import.sources import detect_harness, get_adapter
 
@@ -67,9 +73,21 @@ class ImportConfig:
     output: str = DEFAULT_OUTPUT
     log_level: str = DEFAULT_LOG_LEVEL
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    trace_max_bytes: int = MAX_TRACE_SERIALIZED_SPAN_BYTES
+    trace_max_spans: int = MAX_TRACE_SPANS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timeout_seconds", _validate_timeout_seconds(self.timeout_seconds))
+        object.__setattr__(
+            self,
+            "trace_max_bytes",
+            _validate_trace_limit("--max-trace-bytes", self.trace_max_bytes, ABSOLUTE_MAX_TRACE_BYTES),
+        )
+        object.__setattr__(
+            self,
+            "trace_max_spans",
+            _validate_trace_limit("--max-trace-spans", self.trace_max_spans, ABSOLUTE_MAX_TRACE_SPANS),
+        )
 
     @property
     def harness(self) -> str | None:
@@ -168,6 +186,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         default=DEFAULT_TIMEOUT_SECONDS,
         help="finite positive invocation wall-clock budget in seconds (default: 600)",
+    )
+    import_command.add_argument(
+        "--max-trace-bytes",
+        help=(
+            "per-trace serialized span-byte limit "
+            f"(default: {MAX_TRACE_SERIALIZED_SPAN_BYTES}; maximum: {ABSOLUTE_MAX_TRACE_BYTES})"
+        ),
+    )
+    import_command.add_argument(
+        "--max-trace-spans",
+        help=(
+            "per-trace span-count limit including the root "
+            f"(default: {MAX_TRACE_SPANS}; maximum: {ABSOLUTE_MAX_TRACE_SPANS})"
+        ),
     )
     import_command.add_argument(
         "--output",
@@ -287,6 +319,18 @@ def config_from_arguments(args: argparse.Namespace) -> ImportConfig:
         output=args.output,
         log_level=args.log_level,
         timeout_seconds=timeout_seconds,
+        trace_max_bytes=_parse_trace_limit(
+            "--max-trace-bytes",
+            args.max_trace_bytes,
+            ABSOLUTE_MAX_TRACE_BYTES,
+            MAX_TRACE_SERIALIZED_SPAN_BYTES,
+        ),
+        trace_max_spans=_parse_trace_limit(
+            "--max-trace-spans",
+            args.max_trace_spans,
+            ABSOLUTE_MAX_TRACE_SPANS,
+            MAX_TRACE_SPANS,
+        ),
     )
     object.__setattr__(config, "_from_time_ns", _bound_nanoseconds(config.from_time, args.from_time))
     object.__setattr__(config, "_to_time_ns", _bound_nanoseconds(config.to_time, args.to_time))
@@ -371,6 +415,28 @@ def _parse_time_bound(flag: str, value: str | None) -> datetime | None:
         ) from None
     except ConfigurationError as error:
         raise ConfigurationError(error.code, f"{flag} {error.safe_message}") from error
+
+
+def _parse_trace_limit(flag: str, value: str | None, absolute: int, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value.strip())
+    except (TypeError, ValueError):
+        raise ConfigurationError(
+            "invalid_trace_envelope_limit",
+            f"{flag} must be a positive integer no greater than {absolute}",
+        ) from None
+    return _validate_trace_limit(flag, parsed, absolute)
+
+
+def _validate_trace_limit(flag: str, value: int, absolute: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > absolute:
+        raise ConfigurationError(
+            "invalid_trace_envelope_limit",
+            f"{flag} must be a positive integer no greater than {absolute}",
+        )
+    return value
 
 
 def _parse_min_user_turns(value: str | None) -> int | None:

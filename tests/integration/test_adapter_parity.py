@@ -432,18 +432,16 @@ def test_opencode_part_usage_cost_native_fields_and_immutable_metadata(live_serv
     assert trace.info.tags["mlflow.source.git.commit"] == "abc"
     assert trace.info.trace_metadata["parent_session_id"] == "parent"
     (model,) = [span for span in trace.data.spans if span.span_type == "LLM"]
-    assert model.attributes["mlflow.chat.tokenUsage"] == {
-        **trace.info.token_usage,
-        "cache_read_input_tokens": 20,
-        "cache_creation_input_tokens": 0,
-    }
+    # The plugin reads usage from the assistant message envelope; part-level
+    # usage still drives the trace-level native totals.
+    assert "mlflow.chat.tokenUsage" not in model.attributes
     assert model.attributes["mlflow.llm.cost"] == {"total_cost": 0.25}
     assert model.attributes["mlflow_import.accounting"]["origin"] == "persisted"
     assert model.attributes["mlflow_import.accounting"]["method"] == "unknown"
-    assert [
-        part["text"] for part in model.outputs["choices"][0]["message"]["content"] if part.get("type") == "text"
-    ] == ["literal answer"]
-    assert any(span.span_type == "TOOL" and span.outputs == "tool answer" for span in trace.data.spans)
+    assert model.outputs["choices"][0]["message"]["content"] == "literal answer"
+    tool = next(span for span in trace.data.spans if span.span_type == "TOOL")
+    assert tool.name == "tool_shell"
+    assert tool.outputs == {"result": "tool answer", "title": ""}
 
 
 def test_codex_explicit_session_export_native_readback(live_server, tmp_path):
@@ -1401,11 +1399,10 @@ def test_opencode_multiple_steps_and_measured_tool_interval(live_server, tmp_pat
     assert trace.info.token_usage == {"input_tokens": 30, "output_tokens": 3, "total_tokens": 38}
     assert trace.info.cost == {"total_cost": 0.3}
     models = [span for span in trace.data.spans if span.span_type == "LLM"]
-    assert len(models) == 2
-    assert sorted(model.attributes["mlflow.llm.cost"]["total_cost"] for model in models) == [0.1, 0.2]
+    assert len(models) == 1
     tool = next(span for span in trace.data.spans if span.span_type == "TOOL")
+    assert tool.name == "tool_read"
     assert (tool.start_time_ns, tool.end_time_ns) == (1002000000, 1004000000)
-    assert tool.attributes["mlflow_import.timing"] == "measured"
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex", "pi", "gemini"])

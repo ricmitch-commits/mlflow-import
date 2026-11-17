@@ -229,8 +229,8 @@ def test_json_looking_tool_result_imports_and_reuses_artifact_identity(local_str
         trace_id = turn_entries(first.report)[0]["trace_id"]
         trace = local_string_server.client.get_trace(trace_id, display=False)
         tool = next(span for span in trace.data.spans if span.span_type == "TOOL")
-        assert tool.outputs == output
-        assert isinstance(tool.outputs, str)
+        assert tool.outputs == {"result": output, "title": ""}
+        assert isinstance(tool.outputs["result"], str)
         tags = trace.info.tags
         repository = get_artifact_repository(
             local_string_server.client.get_experiment(trace.info.experiment_id).artifact_location,

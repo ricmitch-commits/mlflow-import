@@ -95,7 +95,9 @@ from mlflow_import.mlflow.capabilities import (
     probe_capabilities,
 )
 from mlflow_import.mlflow.trace_envelope import (
+    DEFAULT_TRACE_ENVELOPE_LIMITS,
     PROOF_TAG_KEYS,
+    TraceEnvelopeLimits,
     admit_trace,
     assert_returned_trace,
     require_trace_proof,
@@ -792,6 +794,7 @@ def build_gateway(
     tracking_uri: str | None = None,
     *,
     dry_run: bool = False,
+    trace_limits: TraceEnvelopeLimits | None = None,
 ) -> MlflowGateway:
     """Build the production gateway over a real client for one target.
 
@@ -803,7 +806,11 @@ def build_gateway(
     Production construction deliberately exposes no version-transport
     override: its capability probe always performs the real HTTP attestation.
     """
-    return MlflowGateway(MlflowClient(tracking_uri=tracking_uri), dry_run=dry_run)
+    return MlflowGateway(
+        MlflowClient(tracking_uri=tracking_uri),
+        dry_run=dry_run,
+        trace_limits=trace_limits,
+    )
 
 
 class MlflowGateway:
@@ -825,9 +832,11 @@ class MlflowGateway:
         search_page_size: int = 100,
         version_transport: VersionTransport | None = None,
         read_retry_policy: RetryPolicy | None = None,
+        trace_limits: TraceEnvelopeLimits | None = None,
     ) -> None:
         self._client = client
         self._read_retry_policy = read_retry_policy if read_retry_policy is not None else RetryPolicy()
+        self._trace_limits = trace_limits if trace_limits is not None else DEFAULT_TRACE_ENVELOPE_LIMITS
         self._trace_api = trace_api if trace_api is not None else PublicTraceApi()
         self._sink = TraceArtifactSink(client, artifact_repository_factory, self._read_retry_policy)
         self._dry_run = dry_run
@@ -894,6 +903,24 @@ class MlflowGateway:
         self._resource_budget = budget
         self._preflight = None
         self._preflight_dry_run = None
+
+    @contextmanager
+    def session_resources(self) -> Iterator[None]:
+        """Bind disposable verification/write caches to the current session store.
+
+        Read-only planning's foreign-conflict inventory remains available across
+        sessions. Capability authorization belongs to the invocation and lock.
+        """
+        names = ("_artifact_checks", "_session_objects", "_trace_experiments", "confirmed_retirements")
+        previous = {name: getattr(self, name) for name in names}
+        try:
+            for name in names:
+                setattr(self, name, DiskMap())
+            yield
+        finally:
+            self._candidate_payload = None
+            for name, value in previous.items():
+                setattr(self, name, value)
 
     # -- experiment resolution -------------------------------------------------
 
@@ -993,7 +1020,7 @@ class MlflowGateway:
         NoOp sentinel fails loudly instead of silently losing the trace.
         """
         self._require_mutation_allowed()
-        spec = admit_trace(spec).request
+        spec = admit_trace(spec, limits=self._trace_limits).request
         validate_required_metadata(spec)
         validate_source_timing(spec)
         if spec.historical and type(self._trace_api) is PublicTraceApi:

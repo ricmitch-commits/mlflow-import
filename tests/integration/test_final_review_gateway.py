@@ -39,7 +39,14 @@ def test_live_child_failure_ends_and_rolls_back_known_partial_trace(live_server,
         sessions=[("partial", 1000)],
         messages=[
             ("u", "partial", "user", 1, '{"content":[{"type":"text","text":"prompt"}]}'),
-            ("a", "partial", "assistant", 2, '{"content":[{"type":"text","text":"reply"}]}'),
+            (
+                "a",
+                "partial",
+                "assistant",
+                2,
+                '{"content":[{"type":"text","text":"reply"},{"type":"tool","tool":"bash",'
+                '"callID":"call","state":{"status":"completed","input":{},"output":"ok"}}]}',
+            ),
         ],
     )
 
