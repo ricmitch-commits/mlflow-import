@@ -1150,6 +1150,11 @@ class MlflowGateway:
             (spec.native_cost, "mlflow.trace.cost"),
         ):
             observed = dict(analytics or {})
+            if key == "mlflow.trace.cost" and spec.trace_name == "claude_code_conversation" and not observed:
+                # The reference integration records cost on the LLM spans and
+                # lets MLflow aggregate the trace columns. Do not publish an
+                # authoritative all-null cost that would suppress that rollup.
+                continue
             keys = (
                 ("input_cost", "output_cost", "total_cost")
                 if key == "mlflow.trace.cost"
@@ -1456,7 +1461,14 @@ class MlflowGateway:
                 duration = (expected.end_time_ns - expected.start_time_ns) // 1_000_000
                 if info.execution_duration != duration:
                     raise ItemImportError("trace_verification_failed", "the native duration differs")
-            for value, actual in ((expected.native_usage, info.token_usage), (expected.native_cost, info.cost)):
+            for name, value, actual in (
+                ("usage", expected.native_usage, info.token_usage),
+                ("cost", expected.native_cost, info.cost),
+            ):
+                if name == "cost" and expected.trace_name == "claude_code_conversation" and not value:
+                    # Span-derived cost is aggregated by the server for the
+                    # native Claude projection when the importer has no basis.
+                    continue
                 normalized = {key: item for key, item in (actual or {}).items() if item is not None}
                 if normalized != dict(value or {}):
                     raise ItemImportError("trace_verification_failed", "the native usage or cost differs")

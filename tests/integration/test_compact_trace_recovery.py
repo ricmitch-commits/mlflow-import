@@ -28,7 +28,6 @@ from mlflow_import.contracts import RedactionMode
 from mlflow_import.errors import ItemImportError
 from mlflow_import.mlflow.attempts import AttemptJournal
 from mlflow_import.mlflow.gateway import build_gateway
-from mlflow_import.mlflow.mapping import SourceIdentity
 from mlflow_import.mlflow.trace_envelope import (
     ABSOLUTE_MAX_TRACE_BYTES,
     ABSOLUTE_MAX_TRACE_SPANS,
@@ -115,39 +114,14 @@ def test_compact_production_mapper_complete_linear_source(tmp_path, calls):
 def test_compact_production_contexts_resolve_source_values_within_each_scope(tmp_path):
     with mapped_scoped_source(tmp_path) as (turn, request):
         children = list(request.child_specs())
-        models = [child for child in children if INPUT_CONTEXT_ATTRIBUTE in child.attributes]
-        assert len(models) == 4
-        scopes = {model.attributes[INPUT_CONTEXT_ATTRIBUTE]["scope"] for model in models}
-        assert len(scopes) == 2 and "" in scopes
-        records = {SourceIdentity.of(record).key: record for record in turn.iter_records()}
-        for scope in scopes:
-            calls = [model for model in models if model.attributes[INPUT_CONTEXT_ATTRIBUTE]["scope"] == scope]
-            prefix, foreign = ("CHILD:", "PRIMARY:") if scope else ("PRIMARY:", "CHILD:")
-            assert len(calls) == 2
-            assert calls[0].inputs["messages"] == [{"role": "user", "content": prefix + "PROMPT"}]
-            assert foreign.encode() not in canonical_json([call.inputs for call in calls])
-            assert prefix.encode() + b"RESULT" in canonical_json(calls[1].inputs)
-            assert prefix.encode() + b"QUERY" in canonical_json(calls[1].inputs)
-            previous = None
-            for call in calls:
-                descriptor = call.attributes[INPUT_CONTEXT_ATTRIBUTE]
-                assert descriptor["previous_context_id"] == previous
-                previous = descriptor["context_id"]
-                for ref in descriptor["delta"]:
-                    source_record = records[ref["source_key"]]
-                    assert str(source_record.raw_columns.get("subagent") or "") == scope
-                    assert source_record.occurrence_id == ref["occurrence_id"]
-                    message = call.inputs["messages"][ref["message_index"]]
-                    # Resolve prompt/result values independently from the stored
-                    # occurrence, rather than merely trusting the map validator.
-                    for marker in (prefix + "PROMPT", prefix + "RESULT"):
-                        if marker.encode() in canonical_json(message):
-                            assert marker.encode() in canonical_json(source_record.decoded_value)
-        agents = {child.source_key: child for child in children if child.span_type == "AGENT"}
-        nested = next(call for call in models if call.attributes[INPUT_CONTEXT_ATTRIBUTE]["scope"])
-        assert nested.parent_source_key in agents
-        tool_keys = {child.source_key for child in children if child.span_type == "TOOL"}
-        assert agents[nested.parent_source_key].parent_source_key in tool_keys
+        # Native Claude projection reads only the main transcript: the
+        # associated subagent sidecar and tool-only model invocations are not
+        # emitted as model/agent spans, so no input-context descriptors ride
+        # this trace. The main handoff tool span remains.
+        assert not [child for child in children if INPUT_CONTEXT_ATTRIBUTE in child.attributes]
+        assert [(child.name, child.span_type) for child in children] == [("tool_Task", "TOOL")]
+        assert all(child.span_type != "LLM" for child in children)
+        assert all(child.span_type != "AGENT" for child in children)
 
 
 @pytest.fixture(params=["sqlite", "postgres"])

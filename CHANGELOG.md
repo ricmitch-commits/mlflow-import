@@ -8,6 +8,12 @@ project's versions are anchored to its own release commits.
 
 ### Changed
 
+- Claude Code child spans now reproduce the `mlflow.claude_code` reference:
+  flat `llm`/`tool_<name>` children under `claude_code_conversation`, reference
+  prompt/response payloads and previews, native message deltas, token buckets,
+  tool results, and timing; associated subagent sidecars and non-span transcript
+  records stay in canonical artifacts. Trace cost columns populate from the
+  emitted LLM spans when no importer cost basis exists.
 - OpenCode child spans now reproduce the `@mlflow/opencode` reference exactly:
   flat `llm_call`/`tool_<name>` children under `opencode_conversation`, the
   plugin's cumulative reconstructed conversation inputs and payload shapes, and

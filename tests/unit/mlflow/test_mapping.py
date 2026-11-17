@@ -282,9 +282,15 @@ def test_trace_name_uses_canonical_session_harness(harness: str, source_schema: 
     spec = map_turn_to_trace(turn, _context(source_schema=source_schema))
     request = spec.to_create_request()
 
-    assert spec.trace_name == harness
-    assert request.trace_name == harness
-    assert spec.name == request.name == ("opencode_conversation" if source_schema == "legacy" else "opencode turn 1")
+    if harness == "claude":
+        assert spec.trace_name == request.trace_name == "claude_code_conversation"
+        assert spec.name == request.name == "claude_code_conversation"
+    else:
+        assert spec.trace_name == harness
+        assert request.trace_name == harness
+        assert (
+            spec.name == request.name == ("opencode_conversation" if source_schema == "legacy" else "opencode turn 1")
+        )
 
 
 def test_event_spec_converts_with_the_event_span_type() -> None:

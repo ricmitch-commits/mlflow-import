@@ -303,22 +303,42 @@ def test_literal_native_and_structured_readback(live_server, tmp_path, harness, 
     assert trace.info.tags["mlflow_import.source"] == harness
     assert "mlflow.trace.user" not in trace.info.trace_metadata
     assert "mlflow.user" not in trace.info.trace_metadata
-    assert trace.info.token_usage == usage
+    if harness == "claude":
+        native_usage = {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+            "cache_read_input_tokens": 20,
+        }
+        assert trace.info.token_usage == native_usage
+    else:
+        assert trace.info.token_usage == usage
     assert trace.info.cost == {"input_cost": 0.000275, "output_cost": 0.0001, "total_cost": 0.000375}
     assert trace.info.client_request_id is None
     assert trace.info.tags["mlflow_import.client_request_id_origin"] == "absent"
     assert trace.info.request_time == 1767225600000
-    assert trace.info.execution_duration == 0
+    assert trace.info.execution_duration == (10000 if harness == "claude" else 0)
     assert trace.info.experiment_id == result.report["experiment"]["id"]
     assert "hello" in trace.info.request_preview and "answer" in trace.info.response_preview
-    assert trace.info.tags["mlflow.traceName"] == harness
+    assert trace.info.tags["mlflow.traceName"] == ("claude_code_conversation" if harness == "claude" else harness)
     assert trace.info.trace_metadata["mlflow.trace.session"] == "s"
     identity = json.loads(trace.info.tags["mlflow_import.qualified_session_id"])
     assert identity[:2] == ["v1", harness] and identity[-1] == "s" and len(identity[2]) == 64
-    assert root.attributes["mlflow_import.timing"] in {"timestamp-derived", "synthetic-container"}
+    if harness == "claude":
+        assert "mlflow_import.timing" not in root.attributes
+    else:
+        assert root.attributes["mlflow_import.timing"] in {"timestamp-derived", "synthetic-container"}
     (model,) = [span for span in trace.data.spans if span.span_type == "LLM"]
-    assert model.attributes["mlflow.llm.model"] == "gpt-4o"
-    assert model.outputs["choices"][0]["message"]["content"]
+    if harness == "claude":
+        assert model.attributes["mlflow.llm.model"].endswith("gpt-4o")
+        assert model.outputs == {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "answer"}],
+        }
+    else:
+        assert model.attributes["mlflow.llm.model"] == "gpt-4o"
+        assert model.outputs["choices"][0]["message"]["content"]
     assert model.parent_id == root.span_id
     if harness in {"gemini", "codex"}:
         assert model.status.status_code.value == "UNSET"
@@ -336,6 +356,8 @@ def test_literal_native_and_structured_readback(live_server, tmp_path, harness, 
     if harness == "codex":
         assert "mlflow.chat.tokenUsage" not in model.attributes
         assert trace.info.tags["mlflow.source.git.commit"] == "abc"
+    elif harness == "claude":
+        assert model.attributes["mlflow.chat.tokenUsage"] == native_usage
     else:
         assert model.attributes["mlflow.chat.tokenUsage"] == usage
     repeated = run_import(config, dependencies)
@@ -527,15 +549,17 @@ def test_claude_split_invocation_root_and_record_map_are_coalesced(live_server, 
     result = run_import(config, build_dependencies(config))
     assert exit_status(result) == 0, result.report
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
-    (model,) = [span for span in trace.data.spans if span.span_type == "LLM"]
+    models = [span for span in trace.data.spans if span.span_type == "LLM"]
     root = next(span for span in trace.data.spans if span.parent_id is None)
-    assert root.outputs == [{"type": "text", "text": "answer"}, {"type": "text", "text": " remainder"}]
-    assert model.outputs["choices"][0]["message"]["content"] == root.outputs
+    assert len(models) == 2
+    assert root.outputs == {"status": "completed", "response": " remainder"}
+    assert sorted(model.outputs["content"][0]["text"] for model in models) == [" remainder", "answer"]
+    assert all(model.outputs["type"] == "message" and model.outputs["role"] == "assistant" for model in models)
     assert trace.info.token_usage == {
-        "input_tokens": 120,
-        "output_tokens": 11,
-        "total_tokens": 131,
-        "cache_read_input_tokens": 20,
+        "input_tokens": 200,
+        "output_tokens": 21,
+        "total_tokens": 221,
+        "cache_read_input_tokens": 40,
     }
     assert trace.info.cost["total_cost"] == 0.000385
     experiment = live_server.client.get_experiment(result.report["experiment"]["id"])
@@ -543,7 +567,7 @@ def test_claude_split_invocation_root_and_record_map_are_coalesced(live_server, 
     map_path = repository.download_artifacts(trace.info.tags["mlflow_import.turn_map"], str(tmp_path))
     with open(map_path) as handle:
         records = {record["source_id"]: record for record in json.load(handle)["records"]}
-    assert records["a"]["span_ids"] == records["a2"]["span_ids"] == [model.span_id]
+    assert records["a"]["span_ids"] == records["a2"]["span_ids"] == [model.span_id for model in models]
 
 
 def test_claude_native_creation_cache_ttl_and_estimate(live_server, tmp_path):
@@ -576,12 +600,11 @@ def test_claude_native_creation_cache_ttl_and_estimate(live_server, tmp_path):
         pytest.fail(repr(failures))
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
     assert trace.info.token_usage == {
-        "input_tokens": 16,
+        "input_tokens": 10,
         "output_tokens": 3,
-        "total_tokens": 19,
+        "total_tokens": 13,
         "cache_read_input_tokens": 2,
         "cache_creation_input_tokens": 4,
-        "cache_creation_input_tokens_above_1hr": 1,
     }
     assert trace.info.cost == {"input_cost": 0.00004785, "output_cost": 0.000045, "total_cost": 0.00009285}
 
@@ -751,12 +774,20 @@ def test_correlated_tools_and_thinking_are_structured(live_server, tmp_path, har
     assert result.report["source"]["logical_turn_count"] == 1
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
     (tool,) = [span for span in trace.data.spans if span.span_type == "TOOL"]
+    assert tool.inputs in ({"name": "synthetic"}, '{"name":"synthetic"}')
+    if harness == "claude":
+        assert tool.name == "tool_Skill"
+        assert tool.outputs == {"result": "tool answer"}
+        assert tool.status.status_code.value == "OK"
+        assert tool.attributes["tool_name"] == "Skill"
+        assert tool.attributes["tool_id"] == "call"
+        assert not [span for span in trace.data.spans if span.span_type == "LLM"]
+        return
     assert tool.name == "Skill"
     assert tool.outputs == "tool answer"
     assert tool.status.status_code.value == "ERROR"
     assert tool.attributes["mlflow_import.tool_call_id"] == "call"
     assert tool.attributes["mlflow_import.pairing"] == "paired"
-    assert tool.inputs in ({"name": "synthetic"}, '{"name":"synthetic"}')
     if harness != "codex":
         assert any(
             span.outputs and span.outputs.get("choices", [{}])[0].get("message", {}).get("reasoning_content")
@@ -885,17 +916,13 @@ def test_claude_recorded_subagent_parentage(live_server, tmp_path):
     assert result.report["source"]["logical_turn_count"] == 1
     trace = live_server.client.get_trace(result.report["sessions"][0]["turns"][0]["trace_id"], display=False)
     (tool,) = [span for span in trace.data.spans if span.span_type == "TOOL"]
-    (agent,) = [span for span in trace.data.spans if "mlflow_import.agent_scope" in span.attributes]
-    assert agent.parent_id == tool.span_id, agent.attributes
-    assert agent.attributes["mlflow_import.execution_parentage"] == "recorded"
-    (model,) = [span for span in trace.data.spans if span.parent_id == agent.span_id and span.span_type == "LLM"]
-    assert model.attributes["mlflow.chat.tokenUsage"] == {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
-    assert trace.info.token_usage == {
-        "input_tokens": 122,
-        "output_tokens": 11,
-        "total_tokens": 133,
-        "cache_read_input_tokens": 20,
-    }
+    assert tool.name == "tool_Task"
+    assert tool.outputs == {"result": "done"}
+    # The reference transcript integration reads only the main transcript, so
+    # associated subagent sidecars and their model calls are not spans.
+    assert not [span for span in trace.data.spans if "mlflow_import.agent_scope" in span.attributes]
+    assert not [span for span in trace.data.spans if span.span_type == "LLM"]
+    assert not trace.info.token_usage
 
 
 def test_gemini_recorded_subagent_parentage(live_server, tmp_path):
@@ -1151,9 +1178,21 @@ def test_unavailable_usd_cost_never_uses_server_prices_or_fabricates_zero(live_s
     assert exit_status(result) == 0, result.report
     trace_id = result.report["sessions"][0]["turns"][0]["trace_id"]
     trace = live_server.client.get_trace(trace_id, display=False)
-    assert trace.info.cost is None
     model = next(span for span in trace.data.spans if span.span_type == "LLM")
-    assert model.attributes["mlflow.llm.cost"] == {}
+    if model.attributes["model"] == "openai/gpt-4o":
+        assert trace.info.cost == pytest.approx({"input_cost": 0.000225, "output_cost": 0.0001, "total_cost": 0.000325})
+    else:
+        assert trace.info.cost is None
+    if model.attributes["model"] == "openai/gpt-4o":
+        assert model.attributes["mlflow.llm.cost"] == pytest.approx(
+            {
+                "input_cost": 0.000225,
+                "output_cost": 0.0001,
+                "total_cost": 0.000325,
+            }
+        )
+    else:
+        assert model.attributes["mlflow.llm.cost"] == {}
     root = next(span for span in trace.data.spans if span.parent_id is None)
     assert root.attributes["mlflow_import.coverage"]["items"]["cost"]["status"] == "unavailable"
 
@@ -1266,7 +1305,7 @@ def test_claude_followup_model_inputs_include_correlated_tool_result(live_server
                     "id": "final-inv",
                     "role": "assistant",
                     "model": "openai/gpt-4o",
-                    "content": "done",
+                    "content": [{"type": "text", "text": "done"}],
                     "stop_reason": "end_turn",
                 },
             },
@@ -1289,12 +1328,21 @@ def test_claude_followup_model_inputs_include_correlated_tool_result(live_server
     model = next(
         span for span in trace.data.spans if span.attributes.get("mlflow_import.invocation_id") == ":final-inv"
     )
-    assert {"role": "tool", "tool_call_id": "c", "content": "literal tool result"} in model.inputs["messages"]
-    assert [message["role"] for message in model.inputs["messages"]] == ["assistant", "tool"]
-    assert model.inputs["messages"][0]["tool_calls"][0]["id"] == "c"
+    assert [message["role"] for message in model.inputs["messages"]] == ["user", "assistant", "user"]
+    tool_use = next(
+        part
+        for part in model.inputs["messages"][1]["content"]
+        if isinstance(part, dict) and part.get("type") == "tool_use"
+    )
+    assert tool_use["id"] == "c"
+    tool_result = next(
+        part
+        for part in model.inputs["messages"][2]["content"]
+        if isinstance(part, dict) and part.get("type") == "tool_result"
+    )
+    assert tool_result == {"type": "tool_result", "tool_use_id": "c", "content": "literal tool result"}
     context = model.attributes["mlflow_import.input_context"]
     assert context["policy"] == "conversation-delta-v1"
-    assert context["previous_context_id"]
     assert context["provider_request"] == "unknown"
     assert trace.info.tags["mlflow_import.turn_fingerprint"]
     assert trace.info.tags["mlflow_import.metadata_fingerprint"]

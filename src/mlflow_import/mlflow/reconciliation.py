@@ -1019,16 +1019,27 @@ def _upload_bundle(
             ownership = decode_ownership(created.verified_tags, created.verified_metadata)
             from mlflow_import.identity import harness_name
 
-            children = iter_activity_specs(activity, replay)
-            if harness_name(replay.session_header) == "opencode":
-                # The OpenCode plugin projection emits fewer children than the
-                # shared activity graph (no part/step/lifecycle spans); only
-                # bind the identities the request actually created.
-                children = (child for child in children if child.source_key in created.span_ids_by_source)
+            harness = harness_name(replay.session_header)
+            accounting: Mapping[str, Any] = activity.provenance
+            if harness == "claude":
+                from mlflow_import.content.artifacts import resolve_inline_limit
+                from mlflow_import.mlflow.mapping import _claude_child_specs, _claude_provenance
+
+                # The native Claude projection owns the emitted span set; the
+                # activity graph retains every assistant fragment and subagent.
+                children = _claude_child_specs(replay, activity, resolve_inline_limit(None))
+                accounting = _claude_provenance(replay, activity)
+            else:
+                children = iter_activity_specs(activity, replay)
+                if harness == "opencode":
+                    # The OpenCode plugin projection emits fewer children than
+                    # the shared activity graph (no part/step/lifecycle spans);
+                    # only bind the identities the request actually created.
+                    children = (child for child in children if child.source_key in created.span_ids_by_source)
             value = build_turn_map(
                 replay,
                 children=children,
-                accounting=activity.provenance,
+                accounting=accounting,
                 ownership=ownership,
                 trace_id=created.trace_id,
                 root_span_id=created.root_span_id,
