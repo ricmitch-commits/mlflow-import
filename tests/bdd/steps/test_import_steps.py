@@ -837,10 +837,14 @@ def _mapped_specs(scenario_context: dict[str, object]) -> list:
 
 def _children_by_source(scenario_context: dict[str, object], index: int) -> dict[str, object]:
     specs = _mapped_specs(scenario_context)
-    return {
-        str(child.attributes.get("mlflow_import.source_id", child.source_key)): child
-        for child in specs[index - 1].child_specs()
-    }
+    children: dict[str, object] = {}
+    for child in specs[index - 1].child_specs():
+        source_id = child.attributes.get("mlflow_import.source_id")
+        if source_id is None:
+            source_key = str(child.source_key)
+            source_id = source_key.partition(":")[2] or source_key
+        children[str(source_id)] = child
+    return children
 
 
 @given("the synthetic six-turn session fixture")

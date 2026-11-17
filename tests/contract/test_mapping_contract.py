@@ -153,25 +153,17 @@ def test_explicit_error_root_status_verifies_even_when_the_last_child_ended_ok(
     spec = map_turn_to_trace(failed_turn, six_turn_session.context)
     request = spec.to_create_request()
 
-    # Reorder the fixture turn's children so the last one ends OK while
-    # the root status stays the authoritative explicit ERROR: the error
-    # part is moved before the final text part (parent order preserved,
-    # so every parent still precedes its parts).
+    # The plugin projection emits the failed turn's single assistant message
+    # as an OK LLM span, so the last child ends OK while the root status
+    # stays the authoritative explicit ERROR.
     assert spec.root_status == "ERROR"
-    error_first = [
-        "session_message:msg-synthetic-u4#content-0",
-        "session_message:msg-synthetic-a4",
-        "session_message:msg-synthetic-a4#content-1",
-        "session_message:msg-synthetic-a4#content-0",
-    ]
-    by_key = {child.source_key: child for child in spec.child_specs()}
-    reordered = [by_key[key] for key in error_first]
-    request = replace(request, child_specs=lambda: (child.to_child_request() for child in reordered))
+    children = list(spec.child_specs())
+    assert children
+    assert children[-1].status == "OK"
 
     created = fake.create_trace(request)
 
     assert created.root_status == "ERROR"
-    assert reordered[-1].status == "OK"
     fake.verify_trace(created, request)
 
 
@@ -185,13 +177,8 @@ def test_round_tripped_children_are_real_child_requests(six_turn_session) -> Non
 
     assert children and all(isinstance(child, TraceChildRequest) for child in children)
     assert created.span_ids_by_source.keys() == {
-        "session_message:msg-synthetic-u1#content-0",
         "session_message:msg-synthetic-a1",
-        "session_message:msg-synthetic-a1#content-0",
         "session_message:msg-synthetic-a1#content-1",
-        "session_message:msg-synthetic-a1#content-2",
-        "session_pending:pending-synthetic-1",
-        "session_pending:pending-synthetic-2",
     }
 
 

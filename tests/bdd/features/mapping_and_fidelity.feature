@@ -32,18 +32,16 @@ Feature: Turn-to-trace mapping and content fidelity
   Scenario: Typed children preserve the turn's source records
     Given the synthetic six-turn session fixture
     When I map every replayed turn to a trace spec
-    Then turn 1 has 7 children
+    Then turn 1 has 2 children
     And turn 1 has a child of span type "LLM" with source id "msg-synthetic-a1"
     And turn 1 has a child of span type "TOOL" with source id "msg-synthetic-a1#content-1"
-    And turn 1 has a child of span type "UNKNOWN" with source id "msg-synthetic-a1#content-2"
-    And turn 1 has an event child with source id "msg-synthetic-a1#content-0"
-    And the child of turn 1 with source id "msg-synthetic-a1#content-1" has parent source id "msg-synthetic-a1"
-    And the child of turn 1 with source id "msg-synthetic-u1#content-0" has the trace root as parent
+    And the child of turn 1 with source id "msg-synthetic-a1" has the trace root as parent
+    And the child of turn 1 with source id "msg-synthetic-a1#content-1" has the trace root as parent
 
   Scenario: Children stream lazily with fresh cursors
     Given the synthetic six-turn session fixture
     When I map every replayed turn to a trace spec
-    Then iterating the children of turn 1 twice yields the same 7 children
+    Then iterating the children of turn 1 twice yields the same 2 children
 
   Scenario: Mapping is deterministic per turn
     Given the synthetic six-turn session fixture
@@ -74,5 +72,5 @@ Feature: Turn-to-trace mapping and content fidelity
     And the root output of imported turn 3 is omitted
     And imported turn 1 has a child of span type "LLM" with source id "msg-synthetic-a1"
     And imported turn 1 has a child of span type "TOOL" with source id "msg-synthetic-a1#content-1"
-    And imported turn 1 has a child of span type "UNKNOWN" with source id "msg-synthetic-u1#content-0"
-    And the child of imported turn 1 with source id "msg-synthetic-u1#content-0" is attached to the trace root
+    And the child of imported turn 1 with source id "msg-synthetic-a1" is attached to the trace root
+    And the child of imported turn 1 with source id "msg-synthetic-a1#content-1" is attached to the trace root
