@@ -469,8 +469,11 @@ user turn. Correlate tool calls/results by source call IDs, including failed
 calls and multiple calls in one model response. Populate MLflow-compatible
 structured chat inputs/outputs and model/provider attributes so conversations,
 reasoning content, and tool interactions are renderable, not just raw artifacts.
-Exact plugin span names are not required; equivalent types, hierarchy, content,
-and attribution are. Missing parentage or execution timing stays explicitly
+For OpenCode, the `@mlflow/opencode` plugin's span vocabulary is the
+reference: a flat `llm_call`/`tool_<name>` tree under `opencode_conversation`
+with the plugin's cumulative inputs and payloads. Other harnesses may use
+equivalent types, hierarchy, content, and attribution; exact plugin span names
+are not required. Missing parentage or execution timing stays explicitly
 unknown rather than being fabricated.
 
 ### 8.5 Lossless artifacts

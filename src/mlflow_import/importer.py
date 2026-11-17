@@ -32,8 +32,8 @@ phase order is strict and binding:
     mutation — discovery and replay read the same snapshot, so a mismatch
     is an internal inconsistency, never permission to import an
     unplanned payload;
-12. reconciliation writes through Task 11's plan/apply with per-item
-    failure isolation;
+12. reconciliation writes through Task 11's plan/apply, one selected
+    session per disposable execution store, with per-item failure isolation;
 13. the versioned report.
 
 No MLflow mutation occurs before every pre-write check passes, and the
@@ -70,7 +70,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, MutableMapping
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from itertools import chain as iter_chain
 from pathlib import Path
@@ -86,7 +86,7 @@ from mlflow_import.content.fingerprint import (
 )
 from mlflow_import.content.redaction import DeterministicRedactor, RedactionReport
 from mlflow_import.contracts import IDENTITY_REDACTOR, RedactionMode
-from mlflow_import.errors import ConfigurationError, ImporterError
+from mlflow_import.errors import ConfigurationError, ImporterError, ItemImportError
 from mlflow_import.locking import ImportLock, acquire_import_lock, resolve_lock_root
 from mlflow_import.mlflow.capabilities import CapabilityReport, CapabilityRequest, require_capabilities
 from mlflow_import.mlflow.gateway import (
@@ -488,6 +488,8 @@ class _MappingContexts:
         experiment_id: str,
         inline_limit_bytes: int | None,
         redaction_mode: RedactionMode,
+        trace_max_bytes: int,
+        trace_max_spans: int,
     ) -> None:
         self._adapter = adapter
         self._turn_counts = DiskMap((scan.session_id, scan.logical_turn_count) for scan in scans)
@@ -495,6 +497,8 @@ class _MappingContexts:
         self._experiment_id = experiment_id
         self._inline_limit_bytes = inline_limit_bytes
         self._redaction_mode = redaction_mode
+        self._trace_max_bytes = trace_max_bytes
+        self._trace_max_spans = trace_max_spans
         self._cache: dict[str, MappingContext] = {}
         self._generations: dict[str, str] = {}
 
@@ -525,6 +529,8 @@ class _MappingContexts:
             catalog_version=self._snapshot.schema_description.catalog_version,
             source_database_fingerprint=self._snapshot.fingerprint,
             inline_limit_bytes=self._inline_limit_bytes,
+            trace_max_bytes=self._trace_max_bytes,
+            trace_max_spans=self._trace_max_spans,
             logical_turn_count=self._turn_counts.get(session_id),
             source_message_count=message_count,
             source_part_count=part_count,
@@ -1457,14 +1463,97 @@ def _run_normal(
     _record_experiment(builder, experiment)
     assert experiment.experiment_id is not None, "a normal-mode resolution always yields an experiment id"
 
-    # Phase 12: reconciliation writes with per-session mapping contexts.
+    # Phase 12: the complete selection and read-only checks are now frozen.
+    # Partition once on disk, then run each session in a disposable store.
+    # Only sanitized report DTOs and retirement IDs escape a session's scope.
+    sessions = _partition_reconciliation_plan(plan)
+    retired_ids: DiskMap[str, bool] = DiskMap()
+    failed_items = 0
+    reconciliation_started = _debug_phase_started(config, "reconciliation")
+    for session_id, session_plan in sessions.items():
+        with closing(Store()) as scratch, disk_collections(scratch):
+            failed_items += _import_session(
+                config,
+                dependencies,
+                builder,
+                gateway,
+                snapshot,
+                reader.for_session(session_id),
+                session_plan,
+                experiment_id=experiment.experiment_id,
+                capability=capability,
+                redaction_mode=redaction_mode,
+                staging=staging,
+                pricing_basis_for=pricing_basis_for,
+                retired_ids=retired_ids,
+            )
+    _debug_phase_completed(
+        config,
+        "reconciliation",
+        reconciliation_started,
+        sessions=len(sessions),
+    )
+    builder.set_retired_traces(len(retired_ids))
+    return ImportResult(dry_run=False, report=builder.build(), failed_items=failed_items)
+
+
+def _partition_reconciliation_plan(plan: ReconciliationPlan) -> DiskMap[str, ReconciliationPlan]:
+    """Index prevalidated actions by session without rescanning the whole plan per session."""
+    sessions: DiskMap[str, ReconciliationPlan] = DiskMap()
+    for scan in plan.session_scans:
+        if scan.selected:
+            sessions[scan.session_id] = ReconciliationPlan(session_scans=[scan])
+    for name in ("imports", "updates", "retirements", "results"):
+        for action in getattr(plan, name):
+            identity = action.turn or action.trace
+            assert identity is not None, "planned actions carry a source identity"
+            session = sessions.get(identity.session_id)
+            if session is None:
+                session = ReconciliationPlan()
+                sessions[identity.session_id] = session
+            getattr(session, name).append(action)
+    return sessions
+
+
+def _import_session(
+    config: ImportConfig,
+    dependencies: ImportDependencies,
+    builder: ReportBuilder,
+    gateway: MlflowGateway,
+    snapshot: SourceSnapshot,
+    reader: DiscoveryPlanReader,
+    planned: ReconciliationPlan,
+    *,
+    experiment_id: str,
+    capability: CapabilityReport,
+    redaction_mode: RedactionMode,
+    staging: Path,
+    pricing_basis_for: Callable[[str], Mapping[str, dict[str, Any]]] | None,
+    retired_ids: MutableMapping[str, bool],
+) -> int:
+    """Import one session; no replay, request or verification state escapes this frame.
+
+    The caller owns and closes the current scratch store after this returns,
+    including on failure. The discovery snapshot and final report have separate
+    invocation-wide owners.
+    """
+    plan = ReconciliationPlan(
+        imports=DiskList(planned.imports),
+        updates=DiskList(planned.updates),
+        retirements=DiskList(planned.retirements),
+        results=DiskList(planned.results),
+        session_scans=DiskList(planned.session_scans),
+    )
+    replay = dependencies.replay_builder(snapshot)
     contexts = _MappingContexts(
         adapter=dependencies.replay_adapter_factory(snapshot),
         scans=reader.iter_session_scans(),
         snapshot=snapshot,
-        experiment_id=experiment.experiment_id,
+        experiment_id=experiment_id,
         inline_limit_bytes=capability.max_inline_payload_bytes,
         redaction_mode=redaction_mode,
+        trace_max_bytes=config.trace_max_bytes,
+        trace_max_spans=config.trace_max_spans,
     )
     reconciliation = dependencies.reconciliation_dependencies(
         gateway=gateway,
@@ -1473,7 +1562,6 @@ def _run_normal(
         redaction_mode=redaction_mode,
         staging_directory=staging,
     )
-    reconciliation_started = _debug_phase_started(config, "reconciliation")
 
     def replay_session(session_id: str) -> ReplayTurn:
         header = NormalizedSnapshotAdapter(snapshot).session_header(session_id)
@@ -1485,28 +1573,21 @@ def _run_normal(
         reconciliation,
         conflict_policy=config.on_conflict,
         replay_session=replay_session,
-        experiment_id=experiment.experiment_id,
+        experiment_id=experiment_id,
         pricing_basis_for=pricing_basis_for,
     )
-    apply_reconciliation(
-        plan, gateway, reconciliation, dependencies.retry_policy, session_wide=isinstance(gateway, MlflowGateway)
-    )
-    _debug_phase_completed(
-        config,
-        "reconciliation",
-        reconciliation_started,
-        actions=len(plan.results),
-    )
+    with gateway.session_resources() if isinstance(gateway, MlflowGateway) else nullcontext():
+        apply_reconciliation(
+            plan, gateway, reconciliation, dependencies.retry_policy, session_wide=isinstance(gateway, MlflowGateway)
+        )
 
     failed_items = _record_normal_results(builder, plan, reader.iter_turns())
-    retired_ids: DiskMap[str, bool] = DiskMap()
     for result in plan.results:
         for trace_id in result.retired_trace_ids:
             retired_ids[trace_id] = True
     for trace_id in plan.confirmed_retirements:
         retired_ids[trace_id] = True
-    builder.set_retired_traces(len(retired_ids))
-    return ImportResult(dry_run=False, report=builder.build(), failed_items=failed_items)
+    return failed_items
 
 
 def _preflight_trace_envelopes(
@@ -1527,9 +1608,13 @@ def _preflight_trace_envelopes(
     from mlflow_import.content.accounting import pricing_bases
     from mlflow_import.content.turn_map import validate_turn_map_admission
     from mlflow_import.mlflow.capabilities import PINNED_MAX_INLINE_PAYLOAD_BYTES
-    from mlflow_import.mlflow.trace_envelope import admit_trace
+    from mlflow_import.mlflow.trace_envelope import TraceEnvelopeLimits, admit_trace
     from mlflow_import.retry import check_budget
 
+    limits = TraceEnvelopeLimits(
+        max_bytes=config.trace_max_bytes,
+        max_spans=config.trace_max_spans,
+    )
     contexts = _MappingContexts(
         adapter=dependencies.replay_adapter_factory(snapshot),
         scans=reader.iter_session_scans(),
@@ -1537,19 +1622,118 @@ def _preflight_trace_envelopes(
         experiment_id=(experiment.experiment_id or "") if experiment is not None else "",
         inline_limit_bytes=PINNED_MAX_INLINE_PAYLOAD_BYTES,
         redaction_mode=RedactionMode.REDACTED if config.redact else RedactionMode.VERBATIM,
+        trace_max_bytes=config.trace_max_bytes,
+        trace_max_spans=config.trace_max_spans,
     )
     token = pricing_bases.set({})
     try:
         for entry in reader.iter_turns():
             check_budget()
             pricing_bases.set(pricing_basis_for(entry.session_id) if pricing_basis_for is not None else {})
-            frozen_replay = replay(entry)
-            context = contexts.context_for(entry.session_id)
-            request = dependencies.mapper(frozen_replay, context)
-            admitted = admit_trace(request, reserve_late_control=True)
-            validate_turn_map_admission(frozen_replay, admitted.request, context.redaction_mode)
+            request: TraceCreateRequest | None = None
+            frozen_replay: ReplayTurn | None = None
+            context: MappingContext | None = None
+            try:
+                frozen_replay = replay(entry)
+                context = contexts.context_for(entry.session_id)
+                request = dependencies.mapper(frozen_replay, context)
+                admitted = admit_trace(request, reserve_late_control=True, limits=limits)
+                validate_turn_map_admission(frozen_replay, admitted.request, context.redaction_mode)
+            except ItemImportError as error:
+                _attach_preflight_trace_measurement(
+                    request,
+                    frozen_replay,
+                    context,
+                    dependencies.mapper,
+                    error,
+                )
+                _debug_preflight_turn_failure(config, entry, error)
+                raise _preflight_turn_error(entry, error) from error
+            else:
+                _debug_preflight_turn(config, entry, admitted)
     finally:
         pricing_bases.reset(token)
+
+
+def _preflight_turn_error(entry: DiscoveryTurnEntry, error: ItemImportError) -> ItemImportError:
+    wrapped = ItemImportError(
+        error.code,
+        f"session {entry.session_id} turn {entry.turn_index} ({entry.turn_key}): {error.safe_message}",
+        error.exit_status,
+    )
+    wrapped.diagnostics = dict(error.diagnostics)
+    return wrapped
+
+
+def _attach_preflight_trace_measurement(
+    request: TraceCreateRequest | None,
+    frozen_replay: ReplayTurn | None,
+    context: MappingContext | None,
+    mapper: Callable[[ReplayTurn, MappingContext], TraceCreateRequest],
+    error: ItemImportError,
+) -> None:
+    from mlflow_import.mlflow.trace_envelope import (
+        DIAGNOSTIC_MAX_TRACE_BYTES,
+        DIAGNOSTIC_MAX_TRACE_CONTROL_BYTES,
+        DIAGNOSTIC_MAX_TRACE_SPANS,
+        measure_trace,
+    )
+
+    diagnostic_request = request
+    if frozen_replay is not None and context is not None:
+        try:
+            diagnostic_context = replace(
+                context,
+                trace_max_bytes=DIAGNOSTIC_MAX_TRACE_BYTES,
+                trace_max_spans=DIAGNOSTIC_MAX_TRACE_SPANS,
+            )
+            diagnostic_request = mapper(frozen_replay, diagnostic_context)
+        except ItemImportError as measurement_error:
+            diagnostics = dict(error.diagnostics)
+            diagnostics.setdefault("measurement_error", measurement_error.code)
+            error.diagnostics = diagnostics
+            return
+    if diagnostic_request is None:
+        return
+    try:
+        measurement = measure_trace(
+            diagnostic_request,
+            max_bytes=DIAGNOSTIC_MAX_TRACE_BYTES,
+            max_spans=DIAGNOSTIC_MAX_TRACE_SPANS,
+            max_control_bytes=DIAGNOSTIC_MAX_TRACE_CONTROL_BYTES,
+        )
+    except ItemImportError as measurement_error:
+        diagnostics = dict(error.diagnostics)
+        diagnostics.setdefault("measurement_error", measurement_error.code)
+        error.diagnostics = diagnostics
+        return
+    diagnostics = dict(error.diagnostics)
+    diagnostics.setdefault("measured_span_count", measurement.span_count)
+    diagnostics.setdefault("measured_span_bytes", measurement.serialized_span_upper_bound)
+    diagnostics.setdefault("measured_control_bytes", measurement.control_metadata_upper_bound)
+    error.diagnostics = diagnostics
+
+
+def _debug_preflight_turn(config: ImportConfig, entry: DiscoveryTurnEntry, admitted: Any) -> None:
+    if config.log_level != "DEBUG":
+        return
+    _write_debug(
+        "mlflow-import: preflight turn "
+        f"session={entry.session_id} turn={entry.turn_index} "
+        f"bytes={admitted.serialized_span_upper_bound} spans={admitted.span_count} "
+        f"control={admitted.control_metadata_upper_bound}"
+    )
+
+
+def _debug_preflight_turn_failure(config: ImportConfig, entry: DiscoveryTurnEntry, error: ItemImportError) -> None:
+    if config.log_level != "DEBUG":
+        return
+    diagnostics = " ".join(f"{key}={value}" for key, value in sorted(error.diagnostics.items()))
+    suffix = f" {diagnostics}" if diagnostics else ""
+    _write_debug(
+        "mlflow-import: preflight turn failed "
+        f"session={entry.session_id} turn={entry.turn_index} code={error.code}{suffix}"
+    )
 
 
 def _prepare_pricing_bases(
@@ -2060,7 +2244,16 @@ def build_dependencies(config: ImportConfig) -> ImportDependencies:
     """
 
     def gateway_factory(dry_run: bool) -> MlflowGateway:
-        return build_gateway(config.tracking_uri, dry_run=dry_run)
+        from mlflow_import.mlflow.trace_envelope import TraceEnvelopeLimits
+
+        return build_gateway(
+            config.tracking_uri,
+            dry_run=dry_run,
+            trace_limits=TraceEnvelopeLimits(
+                max_bytes=config.trace_max_bytes,
+                max_spans=config.trace_max_spans,
+            ),
+        )
 
     def lock_factory(tracking_endpoint: str, experiment_name: str) -> AbstractContextManager[ImportLock]:
         return acquire_import_lock(tracking_endpoint, experiment_name, resolve_lock_root())

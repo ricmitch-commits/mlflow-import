@@ -88,6 +88,17 @@ and cache read `76928` remain in the retained accounting. Native cache and all
 cost columns are NULL even for recorded cost zero. The root span is
 `opencode_conversation`; native trace name is `opencode` via the `mlflow.traceName`
 tag, and absent client request ID is NULL.
+
+OpenCode child spans also reproduce the plugin's exact tree and payload shapes:
+flat `llm_call` (`LLM`) and `tool_<tool>` (`TOOL`) children of
+`opencode_conversation`, no synthetic reasoning/text/step/patch children, no
+lifecycle events, and no nesting under `llm_call`. LLM inputs carry the
+plugin's cumulative reconstructed conversation; LLM outputs use the
+plugin's assistant-message shape; tool inputs/outputs/attributes and measured
+tool intervals match the plugin. Per-span source/accounting provenance remains
+on the trace root and canonical artifacts. A turn above the plugin's
+1000-message fetch window uses the importer's bounded linear activity
+projection because the plugin has no reference behavior for that size.
 Native session and parent IDs are bare, while qualified source identity stays
 immutable in tags/artifacts. Previews select the last nonempty user/assistant
 text, newline-join parts (including synthetic user text), omit whitespace-only
@@ -102,6 +113,28 @@ times use validated epoch milliseconds; malformed/boolean/out-of-range values
 retain the adapter's normalized fallback. Native session/parent metadata is
 limited to 250 characters, historical/qualified creation tags to 4096, and native
 client request IDs to 50; the metadata limit does not constrain tag-only facts.
+
+### Claude Code reference projection
+
+`mlflow.claude_code.tracing` is the reference for Claude turns. The importer
+emits the same flat tree under `claude_code_conversation`: one `llm` (`LLM`)
+span for each text-bearing assistant transcript entry that has no tool use, and
+one `tool_<name>` (`TOOL`) span per tool use. Thinking-only, attachment, queue,
+hook, API-request, and associated subagent-sidecar records remain in the
+canonical artifacts instead of becoming spans. LLM inputs carry the reference
+algorithm's observed message delta (including recorded request-shape blobs and
+queue-enqueued steer messages); LLM outputs use the Anthropic assistant-message
+shape; tool inputs/results, source-derived timing, token usage (non-cached input,
+output, separate cache buckets), and the reference proportional tool durations
+match. The root payload is `{"prompt": ...}` and
+`{"status": "completed", "response": ...}`. Native trace name and root name are
+`claude_code_conversation`; trace-level usage is the aggregate of the emitted
+LLM spans. Trace cost is likewise left to MLflow's span aggregation when the
+importer has no cost basis, so the native `input_cost`/`output_cost`/`total_cost`
+trace columns populate from the LLM spans instead of being pinned to null.
+Import provenance (source identity, accounting, coverage, and the turn map)
+stays on root attributes/artifacts; the spans themselves retain only the
+additional source/turn-map identity attributes required for recovery.
 
 ## Usage and costs
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
@@ -42,6 +43,7 @@ from mlflow_import.source.snapshot import (
     create_normalized_snapshot,
 )
 from mlflow_import.sources import Adapter
+from mlflow_import.storage import current_store
 from tests.support.fake_gateway import FakeMlflowGateway
 from tests.support.fake_source import ScriptedExporter
 from tests.support.fake_turn import fake_record
@@ -113,6 +115,55 @@ def test_normal_run_imports_every_selected_turn(import_dependencies, config):
     ]
     assert len(import_dependencies.lock_factory.releases) == len(import_dependencies.lock_factory.acquisitions)
     assert import_dependencies.gateway.mutations
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_sessions_release_execution_state_before_importing_next(config, restrictive_tmp_path, monkeypatch, fail_first):
+    import mlflow_import.importer as importer
+
+    sessions = [
+        (name, DEFAULT_SESSION_CREATED_MS + index) for index, name in enumerate(("first", "second", "excluded"))
+    ]
+    source = build_current_source_db(
+        restrictive_tmp_path,
+        sessions=sessions,
+        messages=[
+            (f"{session}-{role}", session, role, seq, payload)
+            for session in ("first", "second")
+            for role, seq, payload in (("user", 1, UNIT_PROMPT_JSON), ("assistant", 2, UNIT_REPLY_JSON))
+        ],
+    )
+    dependencies = build_import_fakes(restrictive_tmp_path=restrictive_tmp_path)
+    dependencies.gateway.fail_next_trace_verification = int(fail_first)
+    apply = importer.apply_reconciliation
+    stores = []
+    replay_indexes = []
+    imported_sessions = []
+
+    def observe_session(plan, gateway, reconciliation, policy, **kwargs):
+        # The previous execution frame and its SQLite store are gone before
+        # this session can issue its first target operation.
+        assert all(store._closed and not store.root.exists() for store in stores)
+        assert all(reference() is None for reference in replay_indexes)
+        assert plan._store is current_store()
+        stores.append(plan._store)
+        replay_indexes.append(weakref.ref(reconciliation.replay.__self__))
+        imported_sessions.append([scan.session_id for scan in plan.session_scans])
+        return apply(plan, gateway, reconciliation, policy, **kwargs)
+
+    monkeypatch.setattr(importer, "apply_reconciliation", observe_session)
+    result = run_import(replace(config, db_path=source, min_user_turns=0), dependencies)
+
+    assert exit_status(result) == int(fail_first)
+    assert imported_sessions == [["first"], ["second"]]
+    assert len({id(store) for store in stores}) == 2
+    assert all(store._closed and not store.root.exists() for store in stores)
+    assert all(reference() is None for reference in replay_indexes)
+    # Rendering after scratch cleanup proves report collections have independent ownership.
+    sessions = json.loads(render_json(result))["sessions"]
+    assert [session["selected"] for session in sessions] == [True, True, False]
+    assert sessions[0]["turns"][0]["action"] == ("failed" if fail_first else "imported")
+    assert sessions[1]["turns"][0]["action"] == "imported"
 
 
 def test_rerun_converges_with_unchanged_skips(import_dependencies, config):

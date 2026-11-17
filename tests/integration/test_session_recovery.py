@@ -15,6 +15,42 @@ from tests.support.import_fakes import build_current_source_db
 pytestmark = pytest.mark.integration
 
 
+def test_multiple_sessions_reconcile_and_rerun_after_execution_store_cleanup(live_server, tmp_path):
+    source = build_current_source_db(
+        tmp_path,
+        sessions=[("first", 1000), ("second", 2000), ("empty", 3000)],
+        messages=[
+            (f"{session}-{role}", session, role, seq, json.dumps({"text": f"synthetic {role}"}))
+            for session in ("first", "second")
+            for role, seq in (("user", 1), ("assistant", 2))
+        ],
+    )
+    config = ImportConfig(unique_experiment_name("session-lifecycle"), source, tracking_uri=live_server.uri)
+    dependencies = build_dependencies(config)
+    first = run_import(config, dependencies)
+    assert exit_status(first) == 0, first.report
+    assert [session["session_id"] for session in first.report["sessions"]] == ["first", "second", "empty"]
+    assert first.report["summary"]["turns_imported"] == 2
+
+    # Each run's report must survive the destruction of every session store.
+    original_ids = [session["turns"][0]["trace_id"] for session in first.report["sessions"] if session["turns"]]
+    again = run_import(config, dependencies)
+    assert exit_status(again) == 0, again.report
+    assert again.report["summary"]["unchanged_turns"] == 2
+    assert [session["turns"][0]["trace_id"] for session in again.report["sessions"] if session["turns"]] == original_ids
+
+    with sqlite3.connect(source) as connection:
+        connection.execute("UPDATE session_message SET data=? WHERE id='first-assistant'", ('{"text":"edited"}',))
+        connection.execute("DELETE FROM session_message WHERE session_id='second'")
+    updated = run_import(config, dependencies)
+    assert exit_status(updated) == 0, updated.report
+    assert updated.report["summary"]["turns_updated"] == 1
+    assert updated.report["summary"]["retired_traces"] == 2
+    traces = live_server.client.search_traces(locations=[updated.report["experiment"]["id"]], include_spans=False)
+    assert len(traces) == 1
+    assert not set(original_ids) & {trace.trace_id for trace in traces}
+
+
 def test_later_turn_failure_preserves_entire_prior_session_and_filtered_pending(live_server, tmp_path):
     source = build_current_source_db(
         tmp_path,

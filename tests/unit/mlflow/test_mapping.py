@@ -282,9 +282,15 @@ def test_trace_name_uses_canonical_session_harness(harness: str, source_schema: 
     spec = map_turn_to_trace(turn, _context(source_schema=source_schema))
     request = spec.to_create_request()
 
-    assert spec.trace_name == harness
-    assert request.trace_name == harness
-    assert spec.name == request.name == ("opencode_conversation" if source_schema == "legacy" else "opencode turn 1")
+    if harness == "claude":
+        assert spec.trace_name == request.trace_name == "claude_code_conversation"
+        assert spec.name == request.name == "claude_code_conversation"
+    else:
+        assert spec.trace_name == harness
+        assert request.trace_name == harness
+        assert (
+            spec.name == request.name == ("opencode_conversation" if source_schema == "legacy" else "opencode turn 1")
+        )
 
 
 def test_event_spec_converts_with_the_event_span_type() -> None:
@@ -1779,29 +1785,26 @@ def test_six_turn_children_cover_the_typed_record_shapes(six_turn_session) -> No
     children = {child.source_key: child for child in specs[0].child_specs()}
 
     assert set(children) == {
-        "session_message:msg-synthetic-u1#content-0",
         "session_message:msg-synthetic-a1",
-        "session_message:msg-synthetic-a1#content-0",
         "session_message:msg-synthetic-a1#content-1",
-        "session_message:msg-synthetic-a1#content-2",
-        "session_pending:pending-synthetic-1",
-        "session_pending:pending-synthetic-2",
     }
     assert children["session_message:msg-synthetic-a1"].span_type == "LLM"
     assert children["session_message:msg-synthetic-a1"].name == "llm_call"
-    assert children["session_message:msg-synthetic-a1#content-1"].span_type == "TOOL"
-    assert children["session_message:msg-synthetic-a1#content-2"].span_type != EVENT_SPAN_TYPE
-    assert isinstance(children["session_message:msg-synthetic-a1#content-0"], EventSpec)
-    assert (
-        children["session_message:msg-synthetic-a1#content-1"].parent_source_key == "session_message:msg-synthetic-a1"
-    )
-    assert children["session_message:msg-synthetic-u1#content-0"].parent_source_key is None
+    assert children["session_message:msg-synthetic-a1"].parent_source_key is None
+    tool = children["session_message:msg-synthetic-a1#content-1"]
+    assert tool.span_type == "TOOL"
+    assert tool.name == "tool_bash"
+    assert tool.parent_source_key is None
+    assert tool.outputs == {"result": "synthetic file list", "title": ""}
 
+    # Plain assistant text and an error part still project to the plugin's
+    # LLM vocabulary; only text/tool/reasoning parts produce spans.
     plain = {child.source_key: child for child in specs[4].child_specs()}
-    assert plain["session_message:msg-synthetic-a5"].span_type == "AGENT"
+    assert plain["session_message:msg-synthetic-a5"].span_type == "LLM"
 
     failed = {child.source_key: child for child in specs[3].child_specs()}
-    assert failed["session_message:msg-synthetic-a4#content-1"].status == "ERROR"
+    assert failed["session_message:msg-synthetic-a4"].span_type == "LLM"
+    assert failed["session_message:msg-synthetic-a4"].status == "OK"
 
 
 def test_six_turn_metadata_carries_session_and_database_identity(six_turn_session) -> None:

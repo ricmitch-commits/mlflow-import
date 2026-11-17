@@ -367,6 +367,25 @@ def test_human_output_reports_failures_and_errors(import_dependencies, config) -
     assert "1 failed" in text
 
 
+def test_human_output_identifies_failed_session_and_turn() -> None:
+    builder = ReportBuilder(dry_run=False, experiment_name="failed-item", redaction_mode=RedactionMode.VERBATIM)
+    builder.add_turn(
+        TurnResult(
+            session_id="ses-failed",
+            turn_key="turn-failed",
+            turn_index=7,
+            action="failed",
+            error_code="trace_resource_envelope_exceeded",
+        )
+    )
+    result = ImportResult(dry_run=False, report=builder.build())
+
+    text = render_human(result)
+
+    assert "session error (trace_resource_envelope_exceeded) for ses-failed" in text
+    assert "item error (trace_resource_envelope_exceeded) for session ses-failed turn 7 (turn-failed)" in text
+
+
 def test_human_output_reports_dry_run_errors_as_failed() -> None:
     builder = ReportBuilder(dry_run=True, experiment_name="dry-run-error", redaction_mode=RedactionMode.VERBATIM)
     builder.add_error("prewrite_failed", "the pre-write checks failed")

@@ -700,7 +700,7 @@ def test_duplicate_root_keeps_unique_typed_fields_visible_to_real_adapters(tmp_p
     ],
 )
 def test_realistic_model_aliases_drive_selection_and_llm_mapping(tmp_path, generation, model):
-    data = json.dumps({"role": "assistant", **model})
+    data = json.dumps({"role": "assistant", "content": [{"type": "text", "text": "answer"}], **model})
     if generation == "legacy":
         path = legacy_source(
             tmp_path,

@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this
 project's versions are anchored to its own release commits.
 
+## [Unreleased]
+
+### Changed
+
+- Claude Code child spans now reproduce the `mlflow.claude_code` reference:
+  flat `llm`/`tool_<name>` children under `claude_code_conversation`, reference
+  prompt/response payloads and previews, native message deltas, token buckets,
+  tool results, and timing; associated subagent sidecars and non-span transcript
+  records stay in canonical artifacts. Trace cost columns populate from the
+  emitted LLM spans when no importer cost basis exists.
+- OpenCode child spans now reproduce the `@mlflow/opencode` reference exactly:
+  flat `llm_call`/`tool_<name>` children under `opencode_conversation`, the
+  plugin's cumulative reconstructed conversation inputs and payload shapes, and
+  no synthesized reasoning/text/step/patch/lifecycle spans. Richer accounting
+  remains on the trace root and canonical artifacts. Turns above the plugin's
+  1000-message fetch window keep the bounded linear fallback.
+
 ## [0.1.0] — 2026-10-22
 
 First release: the complete one-shot import pipeline from an OpenCode

@@ -138,7 +138,10 @@ def test_completion_survives_adapter_snapshot_replay_and_mapping(tmp_path: Path)
                 2,
                 1_772_000_002_000,
                 1_772_000_002_500,
-                {"content": [], "time": {"completed": 1_772_000_003_000}},
+                {
+                    "content": [{"type": "text", "text": "answer"}],
+                    "time": {"completed": 1_772_000_003_000},
+                },
             ),
             # This row is deliberately untimed and must not erase the known
             # completion of the preceding assistant result.
@@ -160,7 +163,6 @@ def test_completion_survives_adapter_snapshot_replay_and_mapping(tmp_path: Path)
 
     child = next(child for child in children if child.source_key.endswith(":assistant-1"))
     assert child.end_time_ns == 1_772_000_003_000_000_000
-    assert child.attributes["opencode.completion_timestamp_ns"] == 1_772_000_003_000_000_000
     assert request.end_time_ns == 1_772_000_003_000_000_000
 
 
@@ -288,7 +290,7 @@ def test_non_finite_sqlite_timestamp_is_a_warning_without_a_timestamp(tmp_path: 
     assert normalize_epoch_ms(float("nan")) == (None, ("malformed_source_value",))
 
 
-def test_explicit_error_and_lifecycle_outcomes_are_not_lost_and_success_supersedes(tmp_path: Path) -> None:
+def test_later_success_supersedes_prior_explicit_error(tmp_path: Path) -> None:
     source = _current_db(
         tmp_path / "outcomes.db",
         [
@@ -324,7 +326,9 @@ def test_explicit_error_and_lifecycle_outcomes_are_not_lost_and_success_supersed
         children = {child.source_key: child for child in request.child_specs()}
 
     assert request.root_status == "OK"
-    assert children["session_message:assistant-error"].status == "ERROR"
+    # An error-only assistant message has no plugin LLM/tool content, so it
+    # remains in the artifact without becoming a child span.
+    assert children == {}
 
 
 def test_all_failure_signals_survive_adapter_snapshot_replay_mapping_and_fake_gateway(tmp_path: Path) -> None:
@@ -391,10 +395,15 @@ def test_all_failure_signals_survive_adapter_snapshot_replay_mapping_and_fake_ga
 
     assert request.root_status == "ERROR"
     assert request.root_tags["opencode.outcome"] == "lifecycle_failed"
-    assert children["session_message:assistant-error"].status == "ERROR"
+    model = children["session_message:assistant-error"]
+    assert model.span_type == "LLM"
+    assert model.status == "OK"
     tool = next(child for child in children.values() if child.span_type == "TOOL")
-    assert tool.status == "ERROR"
-    assert children["session_pending:pending-failed"].status == "ERROR"
+    assert tool.name == "tool_bash"
+    assert tool.status == "OK"
+    assert tool.attributes["status"] == "failed"
+    assert tool.outputs is None
+    assert not any(child.source_key.startswith("session_pending:") for child in children.values())
     assert created.root_status == "ERROR"
 
 
@@ -444,8 +453,7 @@ def test_lifecycle_records_map_as_children_once_in_the_artifact(tmp_path: Path) 
         document = json.loads(destination.getvalue())
 
     pending_children = [child for child in children if child.source_key.endswith(":pending-1")]
-    assert len(pending_children) == 1
-    assert pending_children[0].parent_source_key is None
+    assert pending_children == []
     locations = [
         record["source_id"]
         for section in ("session_records", "turn_records", "unassigned_records")
@@ -478,13 +486,14 @@ def test_colliding_message_and_part_ids_keep_qualified_parent_lineage(tmp_path: 
         created = gateway.create_trace(request)
         gateway.verify_trace(created, request)
 
-    assert {child.source_key for child in children} >= {"message:shared-id", "part:shared-id"}
-    part = next(child for child in children if child.source_key == "part:shared-id")
-    assert part.parent_source_key == "message:shared-id"
-    assert set(created.span_ids_by_source) >= {"message:shared-id", "part:shared-id"}
+    assert {child.source_key for child in children} == {"message:shared-id"}
+    model = next(child for child in children if child.source_key == "message:shared-id")
+    assert model.span_type == "LLM"
+    assert model.parent_source_key is None
+    assert set(created.span_ids_by_source) >= {"message:shared-id"}
 
 
-def test_legacy_session_scoped_todo_maps_as_a_root_event(tmp_path: Path) -> None:
+def test_legacy_session_scoped_todo_stays_in_the_artifact(tmp_path: Path) -> None:
     source = _legacy_collision_db(tmp_path / "legacy-scoped.db")
     connection = sqlite3.connect(source)
     try:
@@ -514,8 +523,7 @@ def test_legacy_session_scoped_todo_maps_as_a_root_event(tmp_path: Path) -> None
         request = map_turn_to_trace(turn, _context(snapshot.fingerprint)).to_create_request()
         children = list(request.child_specs())
 
-    todo = next(child for child in children if child.source_key.startswith("todo:"))
-    assert todo.parent_source_key is None
+    assert not any(child.source_key.startswith("todo:") for child in children)
 
 
 def test_uploaded_artifact_carries_exact_mapped_provenance(six_turn_session, tmp_path: Path) -> None:
@@ -748,7 +756,8 @@ def test_later_success_supersedes_pending_assistant_outcome(tmp_path: Path) -> N
     assert summary.root_result_source_id == "assistant-success"
     assert summary.terminal_outcome == "assistant_result"
     assert request.root_status == "OK"
-    assert children["session_message:assistant-pending"].status == "UNSET"
+    # Empty assistant envelopes have no plugin content and therefore no span.
+    assert children == {}
 
 
 @pytest.mark.parametrize("generation", ["current", "legacy"])

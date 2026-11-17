@@ -423,12 +423,25 @@ def chat_message(call: Invocation, children: Mapping[str, list[SourceRecord]]) -
     return message
 
 
-def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
+def activity_specs(
+    activity: Activity,
+    turn: ReplayTurn,
+    *,
+    max_bytes: int | None = None,
+    max_spans: int | None = None,
+) -> list[Any]:
     """Emit AGENT/LLM/TOOL specs with complete structured content and provenance."""
     from mlflow_import.mlflow.mapping import SourceIdentity, SpanSpec, _common_attributes
-    from mlflow_import.mlflow.trace_envelope import MAX_TRACE_SPANS, SpanBudget
+    from mlflow_import.mlflow.trace_envelope import (
+        MAX_TRACE_SERIALIZED_SPAN_BYTES,
+        MAX_TRACE_SPANS,
+        SpanBudget,
+    )
 
-    budget = SpanBudget(max_spans=MAX_TRACE_SPANS - 1)
+    budget = SpanBudget(
+        max_bytes=MAX_TRACE_SERIALIZED_SPAN_BYTES if max_bytes is None else max_bytes,
+        max_spans=(MAX_TRACE_SPANS if max_spans is None else max_spans) - 1,
+    )
 
     class SpecGraph(list[Any]):
         def append(self, item: Any) -> None:
@@ -939,7 +952,13 @@ def activity_specs(activity: Activity, turn: ReplayTurn) -> list[Any]:
     return ordered
 
 
-def iter_activity_specs(activity: Activity, turn: ReplayTurn) -> Iterator[Any]:
+def iter_activity_specs(
+    activity: Activity,
+    turn: ReplayTurn,
+    *,
+    max_bytes: int | None = None,
+    max_spans: int | None = None,
+) -> Iterator[Any]:
     """Stream plain activity; retain a graph only for actual execution links.
 
     A turn with 100k ordinary assistant envelopes does not need 100k model-call
@@ -955,7 +974,7 @@ def iter_activity_specs(activity: Activity, turn: ReplayTurn) -> Iterator[Any]:
         for record in activity.records
     )
     if not plain:
-        yield from activity_specs(activity, turn)
+        yield from activity_specs(activity, turn, max_bytes=max_bytes, max_spans=max_spans)
         return
     from dataclasses import replace
 

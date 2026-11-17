@@ -20,12 +20,26 @@ from mlflow_import.mlflow import reconciliation as rec
 from mlflow_import.mlflow.attempts import AttemptJournal
 from mlflow_import.mlflow.gateway import OwnedTrace, build_gateway
 from mlflow_import.retry import RetryPolicy
+from mlflow_import.storage import DiskList, DiskMap
 from tests.integration import import_runner
 from tests.integration.import_runner import run_real_import, turn_entries
 from tests.integration.server import live_mlflow_server, unique_experiment_name
 from tests.support.import_fakes import build_current_source_db
 
 pytestmark = [pytest.mark.integration, pytest.mark.profile]
+
+
+def _materialize(value):
+    """Copy a lazy planning-store value before its store is closed."""
+    if isinstance(value, DiskMap):
+        return {key: _materialize(item) for key, item in value.items()}
+    if isinstance(value, DiskList):
+        return tuple(_materialize(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _materialize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(_materialize(item) for item in value)
+    return value
 
 
 @pytest.fixture(scope="module")
@@ -128,10 +142,10 @@ def test_prepared_map_generation_preserves_immutable_artifacts(
     def journal_publish(journal, state, values):
         nonlocal interrupted
         if state == "prepared":
-            prepared.update(values)
+            prepared.update({key: _materialize(value) for key, value in values.items()})
         if state == "ready_to_retire":
             for key in ("attempt_id", "desired", "prior_ids", "session_object", "pricing_bases"):
-                assert values[key] == prepared[key]
+                assert _materialize(values[key]) == prepared[key]
             journal.validate({**values, "state": state, "schema_version": "mlflow-import.attempt.v1"})
             if phase == "seed":
                 if seed == "valid_winner_with_loser":

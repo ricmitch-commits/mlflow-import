@@ -52,8 +52,14 @@ OpenCode native trace info follows the `@mlflow/opencode` 0.4.0 reference:
 bare session/parent IDs, semantic assistant completion time, plain-text previews,
 input/output/reasoning totals, available cache counters, and available persisted
 USD costs. Unavailable cache lifetimes and cost breakdowns remain NULL rather
-than estimated. Richer source accounting remains in spans and canonical
-artifacts. Native client request IDs
+than estimated. OpenCode child spans use the reference plugin vocabulary
+exactly: flat `llm_call` and `tool_<name>` children under
+`opencode_conversation`, the plugin's cumulative reconstructed conversation
+inputs, and its tool payload shapes. Reasoning/text/step/patch/lifecycle records
+remain in the canonical artifacts instead of becoming extra spans; richer
+accounting remains on the trace root and in artifacts. Turns above the plugin's
+1000-message fetch window keep the importer's bounded linear fallback. Native
+client request IDs
 are source-only; operation keys and qualified identity live in initial ownership
 tags. See [projection parity](docs/projection-parity.md) for the exact contract.
 
@@ -175,6 +181,8 @@ mlflow-import --experiment-name NAME [options]
 | `--redact` | Mask secrets and user identity in session/trace values, metadata, errors, and artifacts, including native MLflow user fields. Without it, permitted source content and available user metadata are uploaded verbatim; use it for shared or production tracking servers. |
 | `--dry-run` | Validate, filter, and plan without mutating anything in MLflow. |
 | `--timeout-seconds SECONDS` | Finite positive invocation wall-clock budget, including discovery, preflight, recovery, and writing (default: `600`; fractional seconds accepted). |
+| `--max-trace-bytes BYTES` | Per-trace serialized span-byte admission limit (default: `67108864`; maximum: `2147483648`). Raising it is an explicit server-capacity decision. |
+| `--max-trace-spans N` | Per-trace span-count admission limit including the root (default: `4096`; maximum: `32768`). |
 | `--output human\|json` | Result format (default: `human`). |
 | `--log-level DEBUG\|INFO\|WARNING\|ERROR` | Log verbosity (default: `INFO`). `DEBUG` prints live phase/count progress to stderr; the final result remains on stdout. |
 
