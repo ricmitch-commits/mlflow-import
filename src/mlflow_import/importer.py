@@ -1766,7 +1766,10 @@ def _prepare_pricing_bases(
         if experiment is not None and experiment.experiment_id is not None:
             prefix = source_prefix(header, mode).rsplit("/", 1)[0]
             states = DiskList(AttemptJournal(gateway, experiment.experiment_id, prefix).attempts())
-            if sum("complete" not in state and "aborted" not in state for state in states) > 1:
+            if (
+                sum("complete" not in state and "aborted" not in state and "discarded" not in state for state in states)
+                > 1
+            ):
                 raise ConfigurationError("attempt_state_conflict", "multiple unfinished attempts require recovery")
             selected = _select_pricing_basis(states, gateway, config.on_conflict)
         selected = freeze_pricing_bases(

@@ -1190,6 +1190,7 @@ def map_turn_to_trace(turn: ReplayTurn, context: MappingContext) -> TraceSpec:
         # span attributes also prevents MLflow from inventing JSON previews.
         root_input = None if root_input in ({}, []) else root_input
         root_output = None if root_output in ({}, []) else root_output
+        root_attributes["mlflow_import.accounting"] = _opencode_plugin_provenance(turn, activity)
     trace_name = "claude_code_conversation" if harness == "claude" else harness
     trace_display_name = (
         "claude_code_conversation"
@@ -1926,6 +1927,47 @@ def _opencode_plugin_child_specs(
         yield cast(SpanSpec, _bound_child(spec, inline_limit))
 
 
+def _opencode_plugin_provenance(turn: ReplayTurn, activity: object) -> Mapping[str, object]:
+    """Accounting limited to the invocations the plugin-shaped spans represent.
+
+    Empty/pending envelopes and invocations outside the exported turn segment
+    have no plugin span, so the trace root and turn-map accounting must not
+    claim them; the canonical artifacts retain the complete observation set.
+    """
+    from mlflow_import.content.accounting import invocation_key
+    from mlflow_import.content.activity import Activity
+
+    provenance = activity.provenance if isinstance(activity, Activity) else {}
+    invocations = provenance.get("invocations")
+    if not isinstance(invocations, Mapping):
+        return provenance
+    messages = _opencode_messages(turn)
+    if len(messages) > _OPENCODE_PLUGIN_MESSAGE_LIMIT:
+        # The bounded fallback emits every activity spec, so nothing is dropped.
+        return provenance
+    last_user = _opencode_last_user_index(messages)
+    start_index = 0 if last_user is None else last_user + 1
+    represented: set[str] = set()
+    for record, parts in messages[start_index:]:
+        decoded = record.decoded_value if isinstance(record.decoded_value, Mapping) else {}
+        if _opencode_role(decoded, record) != "assistant":
+            continue
+        if not any(_opencode_part_type(value) in {"text", "tool", "reasoning"} for value, _ in parts):
+            continue
+        represented.add(invocation_key(record))
+    filtered = dict(provenance)
+    filtered["invocations"] = {key: value for key, value in invocations.items() if key in represented}
+    for name in ("usage_aggregation", "cost_aggregation"):
+        value = filtered.get(name)
+        if isinstance(value, Mapping):
+            updated = dict(value)
+            missing = updated.get("missing_invocations")
+            if isinstance(missing, list):
+                updated["missing_invocations"] = [item for item in missing if item in represented]
+            filtered[name] = updated
+    return filtered
+
+
 def _opencode_plugin_specs(
     turn: ReplayTurn,
     base_specs: Mapping[str, SpanSpec],
@@ -1946,6 +1988,8 @@ def _opencode_plugin_specs(
         tool_parts = [(value, child) for value, child in parts if _opencode_part_type(value) == "tool"]
         reasoning_parts = [(value, child) for value, child in parts if _opencode_part_type(value) == "reasoning"]
         if not (text_parts or tool_parts or reasoning_parts):
+            # Empty (aborted, error, or pending) envelopes have no plugin content
+            # and emit no span; the trace accounting excludes their invocation.
             continue
 
         key = SourceIdentity.of(record).key

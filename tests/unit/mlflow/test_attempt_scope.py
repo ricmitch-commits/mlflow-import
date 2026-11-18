@@ -155,6 +155,21 @@ def test_transition_chain_cannot_change_prepared_scope(tmp_path, field, value):
     assert target.deleted == []
 
 
+def test_discarded_state_is_terminal_after_an_unverifiable_ready(tmp_path):
+    journal, _, ready = _ready(tmp_path)
+    prepared = next(journal.attempts())["prepared"]
+
+    journal.publish("discarded", prepared)
+
+    (states,) = list(journal.attempts())
+    assert set(states) == {"prepared", "ready_to_retire", "discarded"}
+    assert states["discarded"] == {**prepared, "state": "discarded"}
+    with pytest.raises(ItemImportError):
+        journal.validate_chain({**states, "complete": {**ready, "state": "complete"}})
+    with pytest.raises(ItemImportError):
+        journal.validate_chain({**states, "aborted": {**prepared, "state": "aborted"}})
+
+
 def test_state_reference_envelope_is_checked_before_materializing_id_sets(tmp_path, monkeypatch):
     from mlflow_import.mlflow import attempts
 

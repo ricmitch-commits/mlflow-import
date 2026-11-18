@@ -16,7 +16,7 @@ from mlflow_import.errors import ItemImportError
 if TYPE_CHECKING:
     from mlflow_import.mlflow.gateway import MlflowGateway
 
-STATES = frozenset({"prepared", "ready_to_retire", "complete", "aborted"})
+STATES = frozenset({"prepared", "ready_to_retire", "complete", "aborted", "discarded"})
 MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_STATE_REFERENCES = 65_536
 
@@ -206,7 +206,11 @@ class AttemptJournal:
             deleted.add(retirement["trace_id"])
 
     def validate_chain(self, states: Mapping[str, dict[str, Any]]) -> None:
-        if "prepared" not in states or ("aborted" in states and ("complete" in states or "ready_to_retire" in states)):
+        if (
+            "prepared" not in states
+            or ("aborted" in states and ("complete" in states or "ready_to_retire" in states))
+            or ("discarded" in states and ("complete" in states or "aborted" in states))
+        ):
             raise _invalid()
         prepared = states["prepared"]
         for name, state in states.items():
@@ -343,7 +347,7 @@ class AttemptJournal:
         if (
             re.fullmatch(
                 re.escape(self.prefix)
-                + r"/[a-f0-9]{32}/(?:prepared|ready_to_retire|complete|aborted)-[a-f0-9]{64}\.json",
+                + r"/[a-f0-9]{32}/(?:prepared|ready_to_retire|complete|aborted|discarded)-[a-f0-9]{64}\.json",
                 path,
             )
             is None
@@ -383,7 +387,11 @@ class AttemptJournal:
                 if state in states and states[state] != value:
                     raise ItemImportError("attempt_state_conflict", "an attempt contains conflicting state records")
                 states[state] = value
-            if "prepared" not in states or ("complete" in states and "aborted" in states):
+            if (
+                "prepared" not in states
+                or ("complete" in states and "aborted" in states)
+                or ("discarded" in states and ("complete" in states or "aborted" in states))
+            ):
                 raise ItemImportError("attempt_state_conflict", "an attempt has an invalid transition chain")
             if "complete" in states and "ready_to_retire" not in states:
                 raise ItemImportError("attempt_state_conflict", "a completed attempt has no verified ready state")

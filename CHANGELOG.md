@@ -6,6 +6,25 @@ project's versions are anchored to its own release commits.
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode plugin-shaped traces no longer claim accounting invocations that
+  emit no span (empty, aborted, pending, or error assistant envelopes), which
+  made reader verification reject an otherwise complete session with
+  `replacement_verification_failed`. The canonical artifacts keep the full
+  observation; the trace root and turn-map accounting now bind only represented
+  plugin invocations.
+- Turn maps reject an accounting/input-context mismatch before any trace is
+  created (`turn_map_binding_failed`) instead of failing after staging.
+- Replacement verification now precedes `ready_to_retire` publication, so a
+  defective batch remains `prepared` and is retried normally.
+- A checksum-valid `ready_to_retire` batch that no longer verifies its own
+  recorded replacements is now recovered: the attempt is marked `discarded`
+  (terminal, audit-preserving) and only its exact staged replacement traces are
+  removed, after attempt/ownership checks and only when every recorded
+  retirement still exists. Recovery then re-imports the session in the same
+  invocation without touching prior verified traces.
+
 ### Changed
 
 - Claude Code child spans now reproduce the `mlflow.claude_code` reference:

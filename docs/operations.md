@@ -201,10 +201,16 @@ workflow; it does not copy or move reference traces between experiments.
 A session publishes a bound `prepared` journal, stages tagged traces and shared
 artifacts, verifies the complete replacement set and manifest, publishes
 `ready_to_retire`, retires authorized exact IDs, and publishes `complete`.
-`aborted` records rejected pre-ready work. A source change before ready aborts only
-new staging; a verified ready batch finishes before reconciling changed input.
-Prior verified traces survive failed staging. Partial deletions resume with
-confirmed counts, including empty/zero-turn completion.
+Replacement verification now runs before `ready_to_retire` is published, so a
+defective batch stays `prepared` and can be aborted normally. `aborted` records
+rejected pre-ready work. `discarded` records a published ready batch that no
+longer verifies its own recorded replacements; its exact staged replacement
+traces are removed only after attempt/ownership checks pass and only when every
+recorded retirement still exists, so prior verified work is never abandoned.
+The recorded `ready_to_retire` object remains as audit evidence. A source change
+before ready aborts only new staging; a verified ready batch finishes before
+reconciling changed input. Prior verified traces survive failed staging. Partial
+deletions resume with confirmed counts, including empty/zero-turn completion.
 
 Retry the invocation after resolving the safe reported failure. Filters do not
 authorize deletion of unrelated work; pending recovery excluded by selection is
@@ -213,7 +219,10 @@ authority: source/namespace/attempt/instance/chain, manifest, replacement and ta
 identity checks must all pass. Old unbound in-flight artifacts fail with
 `attempt_state_invalid`; follow the non-destructive
 [operator procedure](temporary-resources.md#old-unbound-in-flight-journals).
-There is no automatic trust upgrade or destructive repair command.
+There is no automatic trust upgrade for unqualified journal formats; the only
+automatic discard applies to a checksum-valid ready batch that fails its own
+recorded replacement verification, and it removes only that attempt's staged
+replacement traces.
 
 An OS advisory lock serializes local writers per tracking endpoint/experiment.
 Multi-host writers need external serialization. Retries share finite invocation
