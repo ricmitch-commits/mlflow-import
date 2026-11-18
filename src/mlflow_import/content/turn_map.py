@@ -40,6 +40,7 @@ def build_turn_map(
 
     targets: dict[str, list[str]] = {}
     contexts: list[dict[str, Any]] = []
+    context_invocations: set[str] = set()
     for child in children:
         span_id = span_ids_by_source.get(child.source_key)
         if INPUT_CONTEXT_ATTRIBUTE in child.attributes and span_id is None:
@@ -56,13 +57,21 @@ def build_turn_map(
         for key in aliases:
             targets.setdefault(key, []).append(span_id)
         if INPUT_CONTEXT_ATTRIBUTE in child.attributes:
+            descriptor = child.attributes[INPUT_CONTEXT_ATTRIBUTE]
+            invocation = descriptor.get("invocation_id") if isinstance(descriptor, Mapping) else None
+            if not isinstance(invocation, str) or not invocation:
+                raise ItemImportError(
+                    "turn_map_binding_failed", "a projected input context has no recorded invocation identity"
+                )
+            context_invocations.add(invocation)
             contexts.append(
                 {
                     "source_key": child.source_key,
                     "span_id": span_id,
-                    "descriptor": child.attributes[INPUT_CONTEXT_ATTRIBUTE],
+                    "descriptor": descriptor,
                 }
             )
+    _require_context_bindings(accounting, context_invocations)
     first_record = next(replay.iter_records(), None)
     if first_record is not None:
         targets[SourceIdentity.of(first_record).key] = [root_span_id]
@@ -97,6 +106,32 @@ def build_turn_map(
         # No mutable session-generation or late artifact-placement pointer.
         "records": StreamingArray(records()),
     }
+
+
+def _require_context_bindings(accounting: Mapping[str, Any], context_invocations: set[str]) -> None:
+    """Reject a map whose accounting names an invocation no emitted span binds.
+
+    This is the write-side counterpart of the reader's input-context check: the
+    projected span set and its accounting provenance must describe the same
+    model invocations. Aggregate parents may legitimately omit a child span.
+    """
+    invocations = accounting.get("invocations") if isinstance(accounting, Mapping) else None
+    if not isinstance(invocations, Mapping):
+        raise ItemImportError("turn_map_binding_failed", "the projected accounting has no invocation index")
+    required = set(invocations)
+    aggregated = {
+        child
+        for observation in invocations.values()
+        if isinstance(observation, Mapping)
+        for child in observation.get("aggregate_children") or ()
+        if isinstance(child, str)
+    }
+    missing = required - aggregated - context_invocations
+    unexpected = context_invocations - required
+    if missing or unexpected:
+        error = ItemImportError("turn_map_binding_failed", "the projected accounting does not match its input contexts")
+        error.diagnostics = {"missing_invocations": len(missing), "unexpected_invocations": len(unexpected)}
+        raise error
 
 
 def iter_turn_map_json(value: Mapping[str, Any]) -> Iterator[bytes]:

@@ -2104,7 +2104,7 @@ class MlflowGateway:
             if item.is_dir:
                 journal = AttemptJournal(self, experiment_id, item.path)
                 for states in journal.attempts():
-                    if "complete" not in states and "aborted" not in states:
+                    if "complete" not in states and "aborted" not in states and "discarded" not in states:
                         yield str(states["prepared"]["session_id"])
 
     def trace_exists(self, trace_id: str) -> bool:

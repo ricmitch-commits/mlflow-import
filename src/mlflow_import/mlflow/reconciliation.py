@@ -1032,9 +1032,13 @@ def _upload_bundle(
             else:
                 children = iter_activity_specs(activity, replay)
                 if harness == "opencode":
+                    from mlflow_import.mlflow.mapping import _opencode_plugin_provenance
+
                     # The OpenCode plugin projection emits fewer children than
-                    # the shared activity graph (no part/step/lifecycle spans);
-                    # only bind the identities the request actually created.
+                    # the shared activity graph (no part/step/lifecycle spans,
+                    # no empty envelopes); bind only the identities the request
+                    # actually created and the accounting it actually claims.
+                    accounting = _opencode_plugin_provenance(replay, activity)
                     children = (child for child in children if child.source_key in created.span_ids_by_source)
             value = build_turn_map(
                 replay,
@@ -1098,6 +1102,14 @@ class _AmbiguousCreateConflict(ItemImportError):
         )
 
 
+class _ReadyVerificationFailed(ItemImportError):
+    """A published ready batch failed replacement verification before retirement."""
+
+    def __init__(self, error: ImporterError) -> None:
+        super().__init__(error.code, error.safe_message, error.exit_status)
+        self.diagnostics = dict(error.diagnostics)
+
+
 def apply_reconciliation(
     plan: ReconciliationPlan,
     gateway: MlflowGateway,
@@ -1141,7 +1153,11 @@ def _select_pricing_basis(
     attempts: list[dict[str, Any]], gateway: MlflowGateway, policy: str
 ) -> Mapping[str, dict[str, Any]]:
     """Select by instance and stable IDs before payload fingerprint comparison."""
-    pending = DiskList(states for states in attempts if "complete" not in states and "aborted" not in states)
+    pending = DiskList(
+        states
+        for states in attempts
+        if "complete" not in states and "aborted" not in states and "discarded" not in states
+    )
     if len(pending) > 1:
         raise ItemImportError("attempt_state_conflict", "multiple unfinished pricing attempts require recovery")
     if pending:
@@ -1276,7 +1292,11 @@ def _apply_sessions_with_basis(
             for chunk in iter_canonical_json(desired_values):
                 desired_digest.update(chunk)
             desired = desired_digest.hexdigest()
-            pending = DiskList(states for states in states_list if "complete" not in states and "aborted" not in states)
+            pending = DiskList(
+                states
+                for states in states_list
+                if "complete" not in states and "aborted" not in states and "discarded" not in states
+            )
             if len(pending) > 1:
                 raise ItemImportError("attempt_state_conflict", "multiple unfinished attempts require recovery")
             if pending:
@@ -1284,10 +1304,17 @@ def _apply_sessions_with_basis(
                 prepared = states["prepared"]
                 journal.last_attempt_id = prepared["attempt_id"]
                 if "ready_to_retire" in states:
-                    _finish_ready(journal, states["ready_to_retire"], gateway, plan.confirmed_retirements)
+                    discarded = False
+                    try:
+                        _finish_ready(journal, states["ready_to_retire"], gateway, plan.confirmed_retirements)
+                    except _ReadyVerificationFailed:
+                        if not _discard_invalid_ready(journal, states, gateway):
+                            raise
+                        discarded = True
                     foreign = DiskList(item for item in foreign if gateway.trace_exists(item["trace_id"]))
                     if (
-                        dependencies.conflict_policy == "duplicate"
+                        not discarded
+                        and dependencies.conflict_policy == "duplicate"
                         and prepared.get("policy") == "duplicate"
                         and prepared["desired"] == desired
                     ):
@@ -1594,8 +1621,14 @@ def _apply_sessions_with_basis(
                     replacements,
                     plan.confirmed_retirements,
                 )
+            else:
+                # Verify the complete replacement set BEFORE publishing ready: an
+                # unverifiable batch must stay prepared so the next invocation can
+                # abort and retry it instead of resuming a permanent dead end.
+                for reference in replacements:
+                    gateway.verify_replacement_reference(reference)
             ready = journal.publish("ready_to_retire", ready_values)
-            _finish_ready(journal, ready, gateway, plan.confirmed_retirements)
+            _finish_ready(journal, ready, gateway, plan.confirmed_retirements, verify_replacements=False)
             plan.results.extend(
                 replace(
                     result,
@@ -1751,7 +1784,9 @@ def _apply_empty_session(
         prefix = session_prefix(replay, dependencies.redaction_mode)
         journal = AttemptJournal(gateway, experiment_id, prefix.rsplit("/", 1)[0])
         pending = DiskList(
-            states for states in journal.attempts() if "complete" not in states and "aborted" not in states
+            states
+            for states in journal.attempts()
+            if "complete" not in states and "aborted" not in states and "discarded" not in states
         )
         if len(pending) > 1:
             raise ItemImportError("attempt_state_conflict", "multiple unfinished attempts require recovery")
@@ -1864,7 +1899,7 @@ def _annotate_attempt(plan: ReconciliationPlan, session_id: str, journal: Any, s
         states = next(states for states in journal.attempts() if states["prepared"]["attempt_id"] == attempt_id)
     except Exception:
         return  # Preserve the original error if the diagnostic read itself fails.
-    state = next(name for name in ("complete", "aborted", "ready_to_retire", "prepared") if name in states)
+    state = next(name for name in ("complete", "aborted", "discarded", "ready_to_retire", "prepared") if name in states)
     values = dict(attempt_id=attempt_id, import_instance_id=states["prepared"]["instance_id"], attempt_state=state)
     plan.session_attempts[session_id] = values
     cast(DiskList[ReconciliationAction], plan.results).update_from(start, lambda result: replace(result, **values))
@@ -1875,8 +1910,14 @@ def _finish_ready(
     ready: Mapping[str, object],
     gateway: MlflowGateway,
     confirmed: MutableMapping[str, str] | None = None,
+    *,
+    verify_replacements: bool = True,
 ) -> None:
-    """Reverify the recorded remote replacement set before any exact-ID delete."""
+    """Reverify the recorded remote replacement set before any exact-ID delete.
+
+    ``verify_replacements=False`` is used only by the caller that just verified
+    the same captured set immediately before publishing ``ready``.
+    """
     from typing import Any, cast
 
     state = cast(Any, journal)
@@ -1889,8 +1930,16 @@ def _finish_ready(
         path, checksum, size = cast(list[Any], ready["session_object"])
         gateway.verify_experiment_file(state.experiment_id, path, checksum, size)
     replacements = cast(list[dict[str, object]], ready["replacements"])
-    for reference in replacements:
-        gateway.verify_replacement_reference(reference)
+    if verify_replacements:
+        try:
+            for reference in replacements:
+                gateway.verify_replacement_reference(reference)
+        except ImporterError as error:
+            # Only a recorded-content mismatch proves the batch itself is invalid;
+            # transport/read exhaustion must fail closed without discarding work.
+            if error.code in {"replacement_verification_failed", "artifact_verification_failed"}:
+                raise _ReadyVerificationFailed(error) from error
+            raise
     for retirement in cast(list[dict[str, Any]], ready["retirements"]):
         gateway.authorize_retirement(state.experiment_id, retirement, ready)
     for retirement in cast(list[dict[str, Any]], ready["retirements"]):
@@ -1919,6 +1968,61 @@ def _finish_ready(
             prefix="mlflow_import.attempt_state",
         )
     state.publish("complete", ready)
+
+
+def _discard_invalid_ready(
+    journal: Any,
+    states: Mapping[str, dict[str, Any]],
+    gateway: MlflowGateway,
+) -> bool:
+    """Abandon a ready batch whose own replacements no longer verify.
+
+    Retirement runs only after every replacement verifies, so a verification
+    failure means this pass deleted nothing. Discarding removes only the exact
+    traces this attempt created and is refused (returning ``False``) whenever a
+    recorded retirement is already gone, so unrelated prior work is never
+    abandoned. The recorded ready state remains as audit evidence.
+    """
+    from mlflow_import.compatibility import decode_ownership
+
+    prepared = states["prepared"]
+    ready = states["ready_to_retire"]
+    attempt_id = str(prepared["attempt_id"])
+    experiment_id = str(journal.experiment_id)
+    for retirement in cast(list[Mapping[str, Any]], ready["retirements"]):
+        if not gateway.trace_exists(str(retirement["trace_id"])):
+            return False
+    replacements = cast(list[Mapping[str, Any]], ready["replacements"])
+    for reference in replacements:
+        metadata = reference["metadata"]
+        trace_id = str(reference["trace_id"])
+        if not isinstance(metadata, Mapping) or not metadata.get(OWNERSHIP_TURN_KEY):
+            return False
+        try:
+            info = gateway.trace_info(trace_id, experiment_id)
+        except Exception:
+            return False
+        if (
+            info.experiment_id != experiment_id
+            or info.tags.get("mlflow_import.attempt_id") != attempt_id
+            or info.tags.get("mlflow_import.attempt_state") not in {"staged", "complete"}
+            or decode_ownership(info.tags, info.trace_metadata) != metadata
+        ):
+            return False
+    for reference in replacements:
+        metadata = cast(Mapping[str, str], reference["metadata"])
+        trace_id = str(reference["trace_id"])
+        gateway.retire_trace(
+            experiment_id,
+            trace_id,
+            session_id=str(prepared["session_id"]),
+            turn_key=metadata[OWNERSHIP_TURN_KEY],
+            expected_metadata=metadata,
+        )
+        if gateway.trace_exists(trace_id):
+            return False
+    journal.publish("discarded", prepared)
+    return True
 
 
 def _verify_all_candidates(

@@ -258,6 +258,7 @@ def decode_result(value: Mapping[str, Any]) -> DecodedResult:
             "ready_to_retire",
             "complete",
             "aborted",
+            "discarded",
         }:
             invalid()
         if item.get("error_code") is not None and not re.fullmatch(r"[a-z][a-z0-9_]*", item["error_code"]):

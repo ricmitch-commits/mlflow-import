@@ -34,3 +34,6 @@ mlartifacts/
 .agents
 
 skills-lock.json
+
+# Local investigation notes (contain host/session-specific data)
+/issues.md

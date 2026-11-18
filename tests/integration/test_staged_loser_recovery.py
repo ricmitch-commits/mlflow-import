@@ -324,6 +324,85 @@ def test_prepared_staged_loser_default_source_recovery(staged_local_server, tmp_
     assert unchanged.report["sessions"][0]["turns"][0]["trace_id"] == winner
 
 
+def test_unverifiable_ready_batch_is_discarded_and_reimported(staged_local_server, tmp_path, monkeypatch):
+    server = staged_local_server
+    source = build_current_source_db(
+        tmp_path,
+        sessions=[("discard-recovery", 1000)],
+        messages=[
+            ("u", "discard-recovery", "user", 1, '{"text":"synthetic prompt"}'),
+            ("a", "discard-recovery", "assistant", 2, '{"text":"original reply"}'),
+        ],
+    )
+    monkeypatch.setattr("mlflow_import.sources.ADAPTERS", {"opencode": Adapter("opencode", True)})
+    monkeypatch.setattr(Adapter, "default_locations", lambda self: (source,))
+    config = ImportConfig(unique_experiment_name("discard-recovery"), source, tracking_uri=server.uri)
+    object.__setattr__(config, "_discover_defaults", True)
+    object.__setattr__(config, "_on_conflict", "overwrite")
+    dependencies = build_dependencies(config)
+
+    first = run_import(config, dependencies)
+    assert exit_status(first) == 0, render_json(first)
+    prior_ids = {turn["trace_id"] for session in first.report["sessions"] for turn in session["turns"]}
+    assert len(prior_ids) == 1
+    with sqlite3.connect(source) as connection:
+        connection.execute("UPDATE session_message SET data=? WHERE id='a'", ('{"text":"changed reply"}',))
+
+    states: list[str] = []
+    replacements: list[str] = []
+    publish = AttemptJournal.publish
+
+    def seed_publish(journal, state, values):
+        result = publish(journal, state, values)
+        states.append(state)
+        if state == "ready_to_retire":
+            replacements.extend(item["trace_id"] for item in values["replacements"])
+            raise ItemImportError("injected_interruption", "synthetic interruption")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AttemptJournal, "publish", seed_publish)
+        seeded = run_import(config, dependencies)
+    assert exit_status(seeded) == 1, seeded.report
+    assert states == ["prepared", "ready_to_retire"]
+    (old_replacement,) = replacements
+    assert server.client.get_trace(old_replacement, display=False).info.tags["mlflow_import.attempt_state"] == "staged"
+
+    discarded: list[dict[str, object]] = []
+
+    def recovery_publish(journal, state, values):
+        if state == "discarded":
+            discarded.append(dict(values))
+        return publish(journal, state, values)
+
+    def recovery_factory(dry_run):
+        gateway = dependencies.gateway_factory(dry_run)
+        verify = gateway.verify_replacement_reference
+
+        def checked(reference):
+            if reference["trace_id"] == old_replacement:
+                raise ItemImportError("replacement_verification_failed", "synthetic recorded mismatch")
+            return verify(reference)
+
+        gateway.verify_replacement_reference = checked
+        return gateway
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AttemptJournal, "publish", recovery_publish)
+        recovered = run_import(config, replace(dependencies, gateway_factory=recovery_factory))
+
+    assert exit_status(recovered) == 0, recovered.report
+    assert len(discarded) == 1
+    assert discarded[0]["attempt_id"] != recovered.report["sessions"][0]["turns"][0]["attempt_id"]
+    turn = recovered.report["sessions"][0]["turns"][0]
+    assert turn["attempt_state"] == "complete"
+    assert turn["trace_id"] not in {old_replacement, *prior_ids}
+    assert recovered.report["summary"]["retired_traces"] == 1
+    experiment_id = recovered.report["experiment"]["id"]
+    traces = server.client.search_traces(locations=[experiment_id], include_spans=False)
+    assert {trace.trace_id for trace in traces} == {turn["trace_id"]}
+
+
 def _check_abort_recovery(server, source, config, dependencies, prior_ids, captured, monkeypatch, fault):
     _, path, injected = fault.split("_", 2)
     with sqlite3.connect(source) as connection:
